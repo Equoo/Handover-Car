@@ -1,0 +1,22 @@
+use bincode::{Encode, Decode};
+
+#[derive(Debug, Encode, Decode)]
+pub enum Message {
+	SlaveAnnounce {
+		id: String,
+	},
+	SlaveLocation {
+		id: String,
+		latitude: f32,
+		altitude: f32,
+	},
+	MasterSubscribe {
+		slave_id: String,
+	},
+	MasterInput {
+		slave_id: String,
+		motor_right: f32,
+		motor_left: f32,
+	},
+}
+
