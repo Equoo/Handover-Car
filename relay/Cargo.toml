@@ -15,6 +15,10 @@ path = "src/master.rs"
 name = "server"
 path = "src/server.rs"
 
+[[bin]]
+name = "inputs"
+path = "src/inputs.rs"
+
 [dependencies]
 tokio = { version = "1.48.0", features = ["full"] }
 tokio-macros = "2.6.0"
@@ -22,3 +26,8 @@ laminar = "0.5"
 serde = { version = "1.0.228", features = ["derive"] }
 bincode = {version = "2.0.1", features = ["serde"] }
 crossbeam-channel = "0.5.15"
+pasts = "0.8"
+stick = "0.13.0"
+bluest = "0.6.9"
+anyhow = "1.0.100"
+futures-lite = "2.6.1"
