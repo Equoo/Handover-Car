@@ -27,7 +27,6 @@ fn video_pipe(id: String, clients: Arc<Mutex<HashMap<String, SocketAddr>>>) -> R
                 subscribes.insert(src);
                 continue;
             }
-            println!("Receive {} byte video data", amt);
             for adr in &subscribes {
                 socket.send_to(&buf[..amt], adr);
             }
@@ -63,12 +62,13 @@ fn handle_message(
             }
             if let Some(targets) = subscribes.lock().unwrap().get(&id) {
                 let msg = Message::SlaveAnnounce {
-                    id,
+                    id: id.clone(),
                     send,
                     server_receive: receive,
                     server_send: metric_now(),
                 };
                 for target in targets {
+                    println!("Send ping from {} to {:?}", &id, target);
                     sender.send(Packet::unreliable(
                         *target,
                         bincode::encode_to_vec(msg.clone(), bincode::config::standard()).unwrap(),
@@ -87,11 +87,9 @@ fn handle_message(
                 .lock()
                 .unwrap()
                 .get(slave_id)
-                .map(|v| {
-                    v.iter()
-                        .find(|v| v.to_owned().to_owned() == peer)
-                        .ok_or::<Option<SocketAddr>>(None)
-                })
+                .unwrap()
+                .iter()
+                .find(|v| v.to_owned().to_owned() == peer)
                 .is_none()
             {
                 subscribes

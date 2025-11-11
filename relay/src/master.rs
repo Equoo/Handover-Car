@@ -7,6 +7,7 @@ use std::net::{SocketAddr, UdpSocket};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 mod messages;
 use crate::messages::Message;
@@ -21,13 +22,29 @@ fn handle_message(msg: Message) -> Result<()> {
             send,
             server_receive,
             server_send,
-        } => {}
+        } => {
+            let now_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos();
+
+            let elapsed_total = now_ns as i128 - send as i128;
+            let elapsed_slave = server_receive as i128 - send as i128;
+            let elapsed_master = now_ns as i128 - server_send as i128;
+
+            println!(
+                "One-way latency: total={:.3} ms, Slave→Server={:.3} ms, Server→Master={:.3} ms",
+                elapsed_total as f64 / 1_000_000.0,
+                elapsed_slave as f64 / 1_000_000.0,
+                elapsed_master as f64 / 1_000_000.0
+            );
+        }
         _ => {}
     }
     Ok(())
 }
 
-async fn receive_messages(receiver: Receiver<SocketEvent>) {
+fn receive_messages(receiver: Receiver<SocketEvent>) {
     let server = SERVER.parse().unwrap();
     let bincode_config = bincode::config::standard();
 
@@ -105,12 +122,10 @@ fn receive_video(server: SocketAddr, slave: String) -> Result<()> {
         match socket.recv_from(&mut buf) {
             Ok((amt, src)) => {
                 received_video = true;
-                println!("RECIVE VIDEO {}", amt);
                 socket.send_to(&buf[..amt], "127.0.0.1:7654".parse::<SocketAddr>().unwrap());
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if !received_video && last.elapsed().as_millis() > 100 {
-                    println!(" SEND PING");
                     let buf = [1];
                     socket.send_to(&buf, server_video);
                     last = Instant::now();
