@@ -76,6 +76,32 @@ fn handle_message(
                 }
             }
         }
+        Message::MasterSubscribe { ref slave_id } => {
+            if subscribes.lock().unwrap().get(slave_id).is_none() {
+                subscribes
+                    .lock()
+                    .unwrap()
+                    .insert(slave_id.clone(), Vec::new());
+            }
+            if subscribes
+                .lock()
+                .unwrap()
+                .get(slave_id)
+                .map(|v| {
+                    v.iter()
+                        .find(|v| v.to_owned().to_owned() == peer)
+                        .ok_or::<Option<SocketAddr>>(None)
+                })
+                .is_none()
+            {
+                subscribes
+                    .lock()
+                    .unwrap()
+                    .get_mut(slave_id)
+                    .unwrap()
+                    .push(peer);
+            }
+        }
         Message::MasterInput {
             ref slave_id,
             motor_right,

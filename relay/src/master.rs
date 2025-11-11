@@ -131,6 +131,14 @@ async fn main() -> Result<()> {
     let receiver = socket.get_event_receiver();
     let sender = socket.get_packet_sender();
 
+    let message: Message = Message::MasterSubscribe {
+        slave_id: "1".to_string(),
+    };
+    sender.send(Packet::reliable_unordered(
+        server,
+        bincode::encode_to_vec(&message, bincode::config::standard()).unwrap(),
+    ))?;
+
     let message: Message = Message::MasterInput {
         slave_id: "1".to_string(),
         motor_right: 12.0,
@@ -145,7 +153,7 @@ async fn main() -> Result<()> {
     // let _blue = bluetooth_input::new().await;
 
     loop {
-        sender.send(Packet::reliable_unordered(
+        sender.send(Packet::unreliable(
             server,
             bincode::encode_to_vec(&message, bincode::config::standard()).unwrap(),
         ))?;
