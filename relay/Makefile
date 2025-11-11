@@ -1,4 +1,3 @@
 
 %:
-	export PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig
-	cargo run --bin $@
+	PKG_CONFIG_PATH=/usr/lib/x86_64-linux-gnu/pkgconfig cargo run --bin $@

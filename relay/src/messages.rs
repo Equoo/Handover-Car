@@ -10,7 +10,13 @@ pub enum Message {
 		latitude: f32,
 		altitude: f32,
 	},
+	SlaveVideo {
+		port: i32
+	},
 	MasterSubscribe {
+		slave_id: String,
+	},
+	MasterSubscribeVideo {
 		slave_id: String,
 	},
 	MasterInput {

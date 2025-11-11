@@ -3,7 +3,7 @@ use anyhow::{Result, anyhow};
 use futures_lite::StreamExt;
 use laminar::{SocketEvent, Socket, Packet};
 use crossbeam_channel::Receiver;
-use tokio::net::unix::SocketAddr;
+use std::net::{UdpSocket, SocketAddr};
 use std::thread;
 
 mod messages;
@@ -65,10 +65,21 @@ impl bluetooth_input {
 
 }
 
+fn receive_video(server: SocketAddr, slave: String) -> Result<()> {
+	let mut socket = UdpSocket::bind("127.0.0.1:3545")?;
+	
+	loop {
+		let mut buf = [0; 2 ^ 20];
+		let (amt, src) = socket.recv_from(&mut buf)?;
+		socket.send_to(buf, "127.0.0.1:5678");
+	}
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
 	let addr = "127.0.0.1:12352";
 	let server = SERVER.parse().unwrap();
+	let slave = "rc-1";
 
 	let mut socket = Socket::bind(addr)?;
 	let receiver = socket.get_event_receiver();
@@ -82,8 +93,18 @@ async fn main() -> Result<()> {
 
 	let _thread = thread::spawn(move || socket.start_polling());
 	let _thread = thread::spawn(|| receive_messages(receiver));
+	let cl_server = server.clone();
+	let _thread = thread::spawn(|| receive_video(cl_server, slave.to_string()));
 
 	let _blue = bluetooth_input::new().await;
+
+	let message: Message = Message::MasterSubscribeVideo {
+		slave_id: slave,
+	};
+	sender.send(Packet::reliable_unordered(
+		server,
+		bincode::encode_to_vec(&message, bincode::config::standard()).unwrap(),
+	))?;
 
 	loop {
 			
