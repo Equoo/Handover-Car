@@ -4,12 +4,13 @@ use futures_lite::StreamExt;
 use laminar::{SocketEvent, Socket, Packet};
 use crossbeam_channel::Receiver;
 use std::net::{UdpSocket, SocketAddr};
+use std::time::Duration;
 use std::thread;
 
 mod messages;
 use crate::messages::Message;
 
-const SERVER: &str = "127.0.0.1:8080";
+const SERVER: &str = "37.59.106.4:9500";
 
 async fn receive_messages(receiver: Receiver<SocketEvent>) {
 	let server = SERVER.parse().unwrap();
@@ -62,31 +63,44 @@ impl bluetooth_input {
 		
 		Ok(bluetooth_input{adapter})
 	}
-
 }
 
 fn receive_video(server: SocketAddr, slave: String) -> Result<()> {
 	let mut socket = UdpSocket::bind("127.0.0.1:3545")?;
-	
+	socket.set_nonblocking(true)?;
+	let mut received_video = false;
+	let server_video: SocketAddr = format!("37.59.106.4:950{}", slave).parse().unwrap();
+
 	loop {
+		let buf = [1, 1];
+		socket.send_to(&buf, server);	
+		thread::sleep(Duration::from_millis(1));
 		let mut buf = [0; 2 ^ 20];
-		let (amt, src) = socket.recv_from(&mut buf)?;
-		socket.send_to(buf, "127.0.0.1:5678");
+		match socket.recv_from(&mut buf) {
+			Ok((amt, src)) => {
+				socket.send_to(&buf, server_video);
+			},
+			Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+				let buf = [1];
+				socket.send_to(&buf, server_video);
+			},
+			Err(e) => return Err(e.into())
+		}
 	}
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
 	let addr = "127.0.0.1:12352";
-	let server = SERVER.parse().unwrap();
-	let slave = "rc-1";
+	let server: SocketAddr = SERVER.parse().unwrap();
+	let slave = "1";
 
 	let mut socket = Socket::bind(addr)?;
 	let receiver = socket.get_event_receiver();
 	let sender = socket.get_packet_sender();
 
 	let message: Message = Message::MasterInput {
-		slave_id: "rc-1".to_string(),
+		slave_id: "1".to_string(),
 		motor_right: 12.0,
 		motor_left: 21.0,
 	};
@@ -94,28 +108,16 @@ async fn main() -> Result<()> {
 	let _thread = thread::spawn(move || socket.start_polling());
 	let _thread = thread::spawn(|| receive_messages(receiver));
 	let cl_server = server.clone();
-	let _thread = thread::spawn(|| receive_video(cl_server, slave.to_string()));
+	let _thread = thread::spawn(move || receive_video(cl_server, slave.to_string()));
 
-	let _blue = bluetooth_input::new().await;
-
-	let message: Message = Message::MasterSubscribeVideo {
-		slave_id: slave,
-	};
-	sender.send(Packet::reliable_unordered(
-		server,
-		bincode::encode_to_vec(&message, bincode::config::standard()).unwrap(),
-	))?;
+	// let _blue = bluetooth_input::new().await;
 
 	loop {
-			
-
 		sender.send(Packet::reliable_unordered(
-				server,
-				bincode::encode_to_vec(&message, bincode::config::standard()).unwrap(),
+			server,
+			bincode::encode_to_vec(&message, bincode::config::standard()).unwrap(),
 		))?;
-
-
-		
+		thread::sleep(Duration::from_millis(10));
 	}
 
 }

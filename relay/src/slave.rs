@@ -9,7 +9,7 @@ use bincode;
 mod messages;
 use crate::messages::Message;
 
-const SERVER: &str = "127.0.0.1:8080";
+const SERVER: &str = "37.59.106.4:9500";
 
 
 
@@ -28,7 +28,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 	let server = SERVER.parse().unwrap();
 
 	let ping_message: Message = Message::SlaveAnnounce {
-		id: "rc-1".to_string()
+		id: "1".to_string()
 	};
 
 	let bincode_config = bincode::config::standard();
@@ -47,10 +47,9 @@ fn main() -> Result<(), Box<dyn Error>> {
 	});
 
 
-	loop {
-
+	loop {	
+		thread::sleep(Duration::from_millis(10));
 		socket.manual_poll(Instant::now());
-
 		match socket.recv() {
 			Some(SocketEvent::Packet(packet)) => {
 				if packet.addr() == server {
