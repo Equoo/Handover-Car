@@ -240,6 +240,7 @@ name = "rc-relay"
 version = "0.1.0"
 dependencies = [
  "bincode",
+ "crossbeam-channel",
  "laminar",
  "serde",
  "tokio",

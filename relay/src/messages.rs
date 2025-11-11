@@ -1,6 +1,6 @@
 use bincode::{Encode, Decode};
 
-#[derive(Debug, Encode, Decode)]
+#[derive(Debug, Encode, Decode, Clone)]
 pub enum Message {
 	SlaveAnnounce {
 		id: String,
