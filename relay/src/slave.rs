@@ -22,7 +22,7 @@ fn handle_message(msg: Message, sender: &Sender<Packet>) -> Result<(), Box<dyn E
 
 fn main() -> Result<(), Box<dyn Error>> {
 
-	let addr = "127.0.0.1:12353";
+	let addr = "0.0.0.0:12353";
 	let mut socket = Socket::bind(addr)?;
 
 	let server = SERVER.parse().unwrap();

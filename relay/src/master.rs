@@ -66,7 +66,7 @@ impl bluetooth_input {
 }
 
 fn receive_video(server: SocketAddr, slave: String) -> Result<()> {
-	let mut socket = UdpSocket::bind("127.0.0.1:3545")?;
+	let mut socket = UdpSocket::bind("0.0.0.0:3545")?;
 	socket.set_nonblocking(true)?;
 	let mut received_video = false;
 	let server_video: SocketAddr = format!("37.59.106.4:950{}", slave).parse().unwrap();
@@ -78,7 +78,7 @@ fn receive_video(server: SocketAddr, slave: String) -> Result<()> {
 		let mut buf = [0; 2 ^ 20];
 		match socket.recv_from(&mut buf) {
 			Ok((amt, src)) => {
-				socket.send_to(&buf, server_video);
+				socket.send_to(&buf, "127.0.0.1:7654".parse::<SocketAddr>().unwrap());
 			},
 			Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
 				let buf = [1];
@@ -91,7 +91,7 @@ fn receive_video(server: SocketAddr, slave: String) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-	let addr = "127.0.0.1:12352";
+	let addr = "0.0.0.0:12352";
 	let server: SocketAddr = SERVER.parse().unwrap();
 	let slave = "1";
 
