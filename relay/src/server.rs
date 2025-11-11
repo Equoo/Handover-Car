@@ -15,7 +15,7 @@ mod messages;
 use crate::messages::Message;
 
 fn video_pipe(id: String, clients: Arc<Mutex<HashMap<String, SocketAddr>>>) -> Result<()> {
-	let mut socket = UdpSocket::bind(format!("127.0.0.1:950{}", id))?;
+	let mut socket = UdpSocket::bind(format!("0.0.0.0:950{}", id))?;
 	let mut subscribes: HashSet<SocketAddr> = HashSet::new();
 
 	loop {
@@ -26,7 +26,7 @@ fn video_pipe(id: String, clients: Arc<Mutex<HashMap<String, SocketAddr>>>) -> R
 				subscribes.insert(src);
 				continue;
 			}
-			println!("FEUR: {} bytes video", amt);
+			println!("{:?}", &buf);
 			for adr in &subscribes {
 				socket.send_to(&buf, adr);
 			}

@@ -71,9 +71,7 @@ fn receive_video(server: SocketAddr, slave: String) -> Result<()> {
 	let mut received_video = false;
 	let server_video: SocketAddr = format!("37.59.106.4:950{}", slave).parse().unwrap();
 
-	loop {
-		let buf = [1, 1];
-		socket.send_to(&buf, server);	
+	loop {	
 		thread::sleep(Duration::from_millis(1));
 		let mut buf = [0; 2 ^ 20];
 		match socket.recv_from(&mut buf) {
