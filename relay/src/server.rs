@@ -1,7 +1,6 @@
 use anyhow::Result;
 use bimap::BiHashMap;
 use bincode;
-use bluest::pairing::PairingAgent;
 use crossbeam_channel::Sender;
 use laminar::{Packet, Socket, SocketEvent};
 use std::collections::{HashMap, HashSet};

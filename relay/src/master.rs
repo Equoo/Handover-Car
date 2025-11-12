@@ -1,17 +1,91 @@
 use anyhow::{Result, anyhow};
-use bluest::Adapter;
-use crossbeam_channel::Receiver;
-use futures_lite::StreamExt;
+use crossbeam_channel::{Receiver, Sender};
 use laminar::{Packet, Socket, SocketEvent};
+use pasts::Loop;
+use std::error::Error;
 use std::net::{SocketAddr, UdpSocket};
+use std::sync::{Arc, Mutex};
+use std::task::Poll::{self, Pending, Ready};
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 use std::time::{SystemTime, UNIX_EPOCH};
+use stick::{Controller, Event, Listener};
 
 mod messages;
 use crate::messages::Message;
 use crate::messages::metric_now;
+
+type Exit = usize;
+
+struct State {
+    sender: Sender<Packet>,
+    listener: Listener,
+    controllers: Vec<Controller>,
+    rumble: (f32, f32),
+    server: SocketAddr,
+    dir: Arc<Mutex<f64>>,
+    power: Arc<Mutex<i8>>,
+    power_max: i8,
+}
+
+fn to_motor_vector(input: f64, power: i8) -> (i8, i8) {
+    // Clamp input between -1.0 and 1.0
+    let v = input.clamp(-1.0, 1.0);
+    let p = power as f64;
+
+    match v {
+        x if x == -1.0 => (-p as i8, p as i8),
+        x if x == 0.0 => (p as i8, p as i8),
+        x if x == 1.0 => (p as i8, -p as i8),
+        x if x < 0.0 => {
+            // interpolate between -1 and 0
+            let t = (x + 1.0) / 1.0;
+            let left = (-p + t * (p - -p)).round() as i8;
+            let right = p as i8;
+            (left, right)
+        }
+        x => {
+            // interpolate between 0 and 1
+            let t = x;
+            let left = p as i8;
+            let right = (p - t * (p - -p)).round() as i8;
+            (left, right)
+        }
+    }
+}
+
+impl State {
+    fn connect(&mut self, controller: Controller) -> Poll<Exit> {
+        println!(
+            "Connected p{}, id: {:016X}, name: {}",
+            self.controllers.len() + 1,
+            controller.id(),
+            controller.name(),
+        );
+        self.controllers.push(controller);
+        Pending
+    }
+
+    fn event(&mut self, id: usize, event: Event) -> Poll<Exit> {
+        let player = id + 1;
+        // println!("p{}: {}", player, event);
+        match event {
+            Event::Disconnect => {
+                self.controllers.swap_remove(id);
+            }
+            Event::JoyY(y) => {
+                *self.power.lock().unwrap() = (y * -1. * self.power_max as f64) as i8;
+            }
+            Event::CamX(x) => {
+                *self.dir.lock().unwrap() = x;
+            }
+            Event::MenuR(true) => return Ready(player),
+            _ => {}
+        }
+        Pending
+    }
+}
 
 const SERVER: &str = "37.59.106.4:9500";
 
@@ -76,39 +150,6 @@ fn receive_messages(receiver: Receiver<SocketEvent>) {
     }
 }
 
-struct bluetooth_input {
-    adapter: Adapter,
-}
-
-impl bluetooth_input {
-    pub async fn new() -> Result<bluetooth_input> {
-        let adapter = Adapter::default().await.ok_or(anyhow::anyhow!("feur"))?;
-        adapter.wait_available().await?;
-
-        let adp = adapter.clone();
-        println!("starting scan");
-        let mut scan = adp.scan(&[]).await?;
-        println!("scan started");
-        while let Some(discovered_device) = scan.next().await {
-            println!(
-                "{}{}: {:?}",
-                discovered_device
-                    .device
-                    .name()
-                    .as_deref()
-                    .unwrap_or("(unknown)"),
-                discovered_device
-                    .rssi
-                    .map(|x| format!(" ({}dBm)", x))
-                    .unwrap_or_default(),
-                discovered_device.adv_data.services
-            );
-        }
-
-        Ok(bluetooth_input { adapter })
-    }
-}
-
 fn receive_video(server: SocketAddr, slave: String) -> Result<()> {
     let mut socket = UdpSocket::bind("0.0.0.0:3466")?;
     socket.set_nonblocking(true)?;
@@ -137,7 +178,7 @@ fn receive_video(server: SocketAddr, slave: String) -> Result<()> {
 }
 
 #[tokio::main]
-async fn main() -> Result<()> {
+async fn main() -> Result<(), Box<dyn Error>> {
     let addr = "0.0.0.0:12352";
     let server: SocketAddr = SERVER.parse().unwrap();
     let slave = "1";
@@ -154,24 +195,52 @@ async fn main() -> Result<()> {
         bincode::encode_to_vec(&message, bincode::config::standard()).unwrap(),
     ))?;
 
-    let message: Message = Message::MasterInput {
-        slave_id: "1".to_string(),
-        motor_right: 12.0,
-        motor_left: 21.0,
-    };
-
     let _thread = thread::spawn(move || socket.start_polling());
     let _thread = thread::spawn(|| receive_messages(receiver));
     let cl_server = server.clone();
     let _thread = thread::spawn(move || receive_video(cl_server, slave.to_string()));
 
-    // let _blue = bluetooth_input::new().await;
+    let mut state = State {
+        listener: Listener::default(),
+        sender: sender.clone(),
+        server: server.clone(),
+        controllers: Vec::new(),
+        rumble: (0.0, 0.0),
+        dir: Arc::new(Mutex::new(0.)),
+        power: Arc::new(Mutex::new(0)),
+        power_max: 50,
+    };
 
-    loop {
-        sender.send(Packet::unreliable(
-            server,
-            bincode::encode_to_vec(&message, bincode::config::standard()).unwrap(),
-        ))?;
-        thread::sleep(Duration::from_millis(10));
-    }
+    let cl_dir = state.dir.clone();
+    let cl_power = state.power.clone();
+    let _thread = thread::spawn(move || {
+        loop {
+            let mut dir = (0 as i8, 0 as i8);
+            {
+                dir = to_motor_vector(
+                    cl_dir.lock().unwrap().clone(),
+                    cl_power.lock().unwrap().clone(),
+                );
+            }
+            println!("r: {}, l: {}", dir.1, dir.0);
+            let mut message: Message = Message::MasterInput {
+                slave_id: "1".to_string(),
+                motor_right: dir.0 as f32 * -1.,
+                motor_left: dir.1 as f32,
+            };
+            sender
+                .send(Packet::unreliable(
+                    server,
+                    bincode::encode_to_vec(&message, bincode::config::standard()).unwrap(),
+                ))
+                .unwrap();
+            thread::sleep(Duration::from_millis(50));
+        }
+    });
+
+    let player_id = Loop::new(&mut state)
+        .when(|s| &mut s.listener, State::connect)
+        .poll(|s| &mut s.controllers, State::event)
+        .await;
+    Ok(())
 }
