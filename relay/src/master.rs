@@ -208,7 +208,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         rumble: (0.0, 0.0),
         dir: Arc::new(Mutex::new(0.)),
         power: Arc::new(Mutex::new(0)),
-        power_max: 50,
+        power_max: 110,
     };
 
     let cl_dir = state.dir.clone();
