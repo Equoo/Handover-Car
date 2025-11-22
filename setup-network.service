@@ -1,0 +1,12 @@
+[Unit]
+Description=Setup 5g network
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/root/rc/setup_network
+Restart=no
+
+[Install]
+WantedBy=multi-user.target
+
