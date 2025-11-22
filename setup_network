@@ -1,0 +1,93 @@
+#!/bin/bash
+#
+# Simple auto-setup script for RM500U-CNV on DietPi
+# - unlock SIM (optional)
+# - set USB network mode to RNDIS
+# - set APN
+# - start data connection
+# - bring usb0 up and get IP via udhcpc
+#
+
+MODEM_DEV=${MODEM_DEV:-/dev/ttyUSB2}   # AT command port
+NET_IF=${NET_IF:-usb0}                # network interface created by modem
+APN=${APN:-}                  # <<< change to your real APN
+SIM_PIN=${SIM_PIN:-}                  # <<< set to e.g. 1234 if your SIM has a PIN
+
+log() {
+    echo "[$(date +%T)] $*"
+}
+
+wait_for_path() {
+    local path="$1"
+    local timeout="${2:-60}"
+    while [ ! -e "$path" ] && [ "$timeout" -gt 0 ]; do
+        sleep 1
+        timeout=$((timeout-1))
+    done
+    [ -e "$path" ]
+}
+
+send_at() {
+    local cmd="$1"
+    log "AT> $cmd"
+    printf "%s\r" "$cmd" > "$MODEM_DEV"
+    sleep 1
+}
+
+### main ###
+
+log "Waiting for modem device $MODEM_DEV ..."
+if ! wait_for_path "$MODEM_DEV" 60; then
+    log "ERROR: modem device $MODEM_DEV not found."
+    exit 1
+fi
+
+# Configure serial line
+stty -F "$MODEM_DEV" 115200 cs8 -cstopb -parenb -ixon -ixoff || true
+
+# Optional: select SIM slot 1 (change to 2 if you use slot 2)
+send_at "AT+QUIMSLOT=1"
+
+# Unlock SIM if a PIN is configured
+if [ -n "$SIM_PIN" ]; then
+    send_at "AT+CPIN=\"$SIM_PIN\""
+    # give it a bit of time to register
+    sleep 5
+fi
+
+# Put USB net into RNDIS mode (good for Linux)
+send_at "AT+QCFG=\"usbnet\",1"
+
+# Set APN
+if [ -n "$APN" ]; then
+	send_at "AT+CGDCONT=1,\"IPV4V6\",\"$APN\""
+fi
+
+# Start data connection
+send_at "AT+QNETDEVCTL=2,3,1"
+
+# Optional: check registration
+send_at "AT+CEREG?"
+
+# Wait for network interface usb0 to appear
+log "Waiting for network interface $NET_IF ..."
+if ! wait_for_path "/sys/class/net/$NET_IF" 30; then
+    log "ERROR: network interface $NET_IF not found."
+    exit 1
+fi
+
+# Bring interface up
+log "Bringing $NET_IF up ..."
+ip link set "$NET_IF" up || {
+    log "ERROR: failed to bring $NET_IF up."
+    exit 1
+}
+
+# Ask for IP via DHCP
+log "Requesting IP address on $NET_IF via udhcpc ..."
+udhcpc -n -q -i "$NET_IF"
+
+log "Current IP configuration for $NET_IF:"
+ip addr show dev "$NET_IF"
+
+log "Done."

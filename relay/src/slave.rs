@@ -146,7 +146,7 @@ async fn handle_message(
             motor_left,
             motor_right,
         } => {
-            ble.send_motors(motor_left as i8, motor_right as i8).await?;
+            //ble.send_motors(motor_left as i8, motor_right as i8).await?;
         }
         _ => {}
     }
@@ -186,13 +186,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
 
     // BLUETHOOTH TEST
     let mut ble = BluetoothInput::new().await?;
-    ble.connect().await?;
+    //ble.connect().await;//?;
 
-    for i in (0..127).step_by(20) {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
+    //for i in (0..127).step_by(20) {
+      //  tokio::time::sleep(Duration::from_millis(200)).await;
+    //}
 
-    ble.send_motors(0, 0).await?;
+    //ible.send_motors(0, 0).await?;
     // ble.disconnect().await;
     // BLUETHOOTH TEST
 

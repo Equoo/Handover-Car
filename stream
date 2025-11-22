@@ -1,0 +1,14 @@
+libcamera-vid \
+  -t 0 \
+  --codec h264 \
+  --inline \
+  --profile baseline \
+  --level 4.1 \
+  --flush \
+  --width 1280 --height 720 --framerate 60 \
+  --awb auto \
+  --shutter 20000 \
+  --bitrate 4000000 \
+  --segment 1 \
+  -o udp://reverse:14000
+
