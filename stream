@@ -1,4 +1,6 @@
-libcamera-vid \
+#! /bin/bash
+
+rpicam-vid \
   -t 0 \
   --codec h264 \
   --inline \
@@ -8,7 +10,35 @@ libcamera-vid \
   --width 1280 --height 720 --framerate 60 \
   --awb auto \
   --shutter 20000 \
-  --bitrate 4000000 \
+  --bitrate 2000000 \
   --segment 1 \
-  -o udp://reverse:14000
+  -o udp://37.59.106.4:9501
 
+# TESTED with overcloaking "safe" 1600hz default cpuutils using 5g module and relay server at NORD FRANCE
+#720p60:
+#117 ms: 1K 2M on y vois rien
+#125 ms: 20K 2M
+#133 ms: 20k 4M
+#150 ms: 20k 500K  	20K voit assez bien
+#158 ms: 100K 2M 	100K mode nuit~~
+
+#720p30
+#125 ms: 20K 2M
+
+
+
+
+#rpicam-vid --width 1280 --height 720 --framerate 60 --inline --codec h264 \
+#  --bitrate 2000000  --flush --timeout 0 --output udp://37.59.106.4:9501
+
+#v4l2-ctl -d /dev/video1 --set-fmt-video=width=1920,height=1080,pixelformat=MJPG
+
+#gst-launch-1.0 v4l2src device=/dev/video1 io-mode=mmap \
+#  ! image/jpeg,width=1280,height=720,framerate=30/1 \
+ # ! jpegdec \
+ ## ! videoconvert \
+ # ! video/x-raw,format=YUV420M,width=1280,height=720,framerate=30/1 \
+ # ! v4l2h264enc \
+ # ! h264parse config-interval=1 \
+ # ! rtph264pay pt=96 \
+ # ! udpsink host=37.59.106.4 port=5000 sync=false async=false

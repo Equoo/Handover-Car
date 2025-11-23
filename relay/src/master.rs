@@ -97,21 +97,21 @@ fn handle_message(msg: Message) -> Result<()> {
             server_receive,
             server_send,
         } => {
-            let now_ns = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-
-            let elapsed_total = now_ns as i128 - send as i128;
-            let elapsed_slave = server_receive as i128 - send as i128;
-            let elapsed_master = now_ns as i128 - server_send as i128;
-
-            println!(
-                "One-way latency: total={:.3} ms, Slave→Server={:.3} ms, Server→Master={:.3} ms",
-                elapsed_total as f64 / 1_000_000.0,
-                elapsed_slave as f64 / 1_000_000.0,
-                elapsed_master as f64 / 1_000_000.0
-            );
+            // let now_ns = SystemTime::now()
+            //     .duration_since(UNIX_EPOCH)
+            //     .unwrap()
+            //     .as_nanos();
+            //
+            // let elapsed_total = now_ns as i128 - send as i128;
+            // let elapsed_slave = server_receive as i128 - send as i128;
+            // let elapsed_master = now_ns as i128 - server_send as i128;
+            //
+            // println!(
+            //     "One-way latency: total={:.3} ms, Slave→Server={:.3} ms, Server→Master={:.3} ms",
+            //     elapsed_total as f64 / 1_000_000.0,
+            //     elapsed_slave as f64 / 1_000_000.0,
+            //     elapsed_master as f64 / 1_000_000.0
+            // );
         }
         _ => {}
     }
@@ -222,7 +222,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
                     cl_power.lock().unwrap().clone(),
                 );
             }
-            println!("r: {}, l: {}", dir.1, dir.0);
             let mut message: Message = Message::MasterInput {
                 slave_id: "1".to_string(),
                 motor_right: dir.0 as f32 * -1.,
@@ -238,9 +237,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    let player_id = Loop::new(&mut state)
-        .when(|s| &mut s.listener, State::connect)
-        .poll(|s| &mut s.controllers, State::event)
-        .await;
+    loop {
+        thread::sleep(Duration::from_millis(1000));
+    }
+
+    // let player_id = Loop::new(&mut state)
+    //     .when(|s| &mut s.listener, State::connect)
+    //     .poll(|s| &mut s.controllers, State::event)
+    //     .await;
     Ok(())
 }

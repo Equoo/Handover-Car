@@ -67,7 +67,6 @@ fn handle_message(
                     server_send: metric_now(),
                 };
                 for target in targets {
-                    println!("Send ping from {} to {:?}", &id, target);
                     sender.send(Packet::unreliable(
                         *target,
                         bincode::encode_to_vec(msg.clone(), bincode::config::standard()).unwrap(),
