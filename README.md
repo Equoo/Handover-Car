@@ -26,6 +26,13 @@ sudo apt update
 sudo apt full-upgrade
 sudo apt install raspberrypi-kernel raspberrypi-kernel-headers
 ```
+
+The control scripts needed 32bit libs:
+sudo dpkg --add-architecture armhf
+sudo apt update
+sudo apt install libc6:armhf libstdc++6:armhf
+
+
 but to test the officials:
 https://github.com/veyeimaging/raspberrypi_v4l2
 
