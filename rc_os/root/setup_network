@@ -1,0 +1,116 @@
+#!/bin/bash
+#
+# Robust auto-setup script for RM500U-CNV on DietPi
+# - unlock SIM (optional)
+# - set USB network mode to RNDIS
+# - set APN
+# - start data connection
+# - bring usb0 up and get IP via DHCP
+# - retries on failure, resets modem if needed
+#
+
+MODEM_DEV=${MODEM_DEV:-/dev/ttyUSB2}   # AT command port
+NET_IF=${NET_IF:-usb0}                 # network interface created by modem
+APN=${APN:-}                           # <<< set your real APN
+SIM_PIN=${SIM_PIN:-}                   # <<< set to e.g. 1234 if your SIM has a PIN
+MAX_RETRIES=${MAX_RETRIES:-3}          # number of retries for critical steps
+RETRY_DELAY=${RETRY_DELAY:-5}          # seconds between retries
+
+log() {
+    echo "[$(date +%T)] $*"
+}
+
+wait_for_path() {
+    local path="$1"
+    local timeout="${2:-60}"
+    while [ ! -e "$path" ] && [ "$timeout" -gt 0 ]; do
+        sleep 1
+        timeout=$((timeout-1))
+    done
+    [ -e "$path" ]
+}
+
+send_at() {
+    local cmd="$1"
+    log "AT> $cmd"
+    printf "%s\r" "$cmd" > "$MODEM_DEV"
+    sleep 1
+}
+
+modem_reset() {
+    log "Resetting 5G modem..."
+    # Use AT command reset if supported
+    send_at "AT+CFUN=1,1"
+    sleep 10
+}
+
+retry() {
+    local cmd="$1"
+    local n=0
+    until [ $n -ge $MAX_RETRIES ]
+    do
+        eval "$cmd" && return 0
+        n=$((n+1))
+        log "Command failed, retry $n/$MAX_RETRIES ..."
+        modem_reset
+        sleep $RETRY_DELAY
+    done
+    log "ERROR: command '$cmd' failed after $MAX_RETRIES retries."
+    return 1
+}
+
+### main ###
+
+log "Waiting for modem device $MODEM_DEV ..."
+retry "wait_for_path '$MODEM_DEV' 60" || exit 1
+
+# Configure serial line
+stty -F "$MODEM_DEV" 115200 cs8 -cstopb -parenb -ixon -ixoff || true
+
+# Optional: select SIM slot 1
+retry "send_at 'AT+QUIMSLOT=1'"
+
+# Unlock SIM if PIN provided
+if [ -n "$SIM_PIN" ]; then
+    retry "send_at 'AT+CPIN=\"$SIM_PIN\"'"
+    sleep 5
+fi
+
+# Set USB network mode to RNDIS
+retry "send_at 'AT+QCFG=\"usbnet\",1'"
+
+# Set APN
+if [ -n "$APN" ]; then
+    retry "send_at 'AT+CGDCONT=1,\"IPV4V6\",\"$APN\"'"
+fi
+
+# Start data connection
+retry "send_at 'AT+QNETDEVCTL=2,3,1'"
+
+# Optional: check registration
+retry "send_at 'AT+CEREG?'"
+
+# Wait for network interface to appear
+log "Waiting for network interface $NET_IF ..."
+retry "wait_for_path '/sys/class/net/$NET_IF' 30" || exit 1
+
+# Bring interface up
+ip link set "eth0" down
+retry "ip link set '$NET_IF' up" || exit 1
+
+# Ask for IP via DHCP
+if [ -n "$FIRST" ]; then
+	log "First init"
+else
+	log "Requesting IP address on $NET_IF via dhclient ..."
+	pkill -f "dhclient.*$NET_IF" 2>/dev/null || true
+	pkill -f "udhcpc.*$NET_IF" 2>/dev/null || true
+	sleep 1
+	retry "dhclient -1 -q '$NET_IF'" || exit 1
+fi
+
+log "Current IP configuration for $NET_IF:"
+ip addr show dev "$NET_IF"
+
+log "Setup completed successfully."
+log "Done."
