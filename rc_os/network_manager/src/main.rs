@@ -59,19 +59,23 @@ async fn flush_serial(port: &mut SerialStream) -> anyhow::Result<()> {
     Ok(())
 }
 
-// Detect the first likely RM500U serial port
-async fn detect_module() -> anyhow::Result<String> {
-    use glob::glob;
+const RM500U_VENDOR_ID: &str = "2c7c"; // Example VID for Quectel
+const RM500U_PRODUCT_ID: &str = "0900"; // Example PID for RM500U
 
+async fn detect_module() -> Result<String> {
     for entry in glob("/dev/ttyUSB*")? {
         let port = entry?;
-        // Quick check: try opening and sending basic AT command
-        if let Ok(mut p) = tokio_serial::new(&*port.to_string_lossy(), 115200).open_native_async() {
-            println!("FEIUR {:?}", p);
-            if send_at_command(&mut p, "AT").await.is_ok() {
-                println!("FEIUR {:?}", p);
-                return Ok(port.to_string_lossy().to_string());
-            }
+        let port_name = port.to_string_lossy();
+
+        // Read USB device symlink to find vendor/product info
+        let device_path = format!("/sys/class/tty/{}/device/../idVendor", port_name);
+        let product_path = format!("/sys/class/tty/{}/device/../idProduct", port_name);
+
+        let vid = fs::read_to_string(&device_path).unwrap_or_default();
+        let pid = fs::read_to_string(&product_path).unwrap_or_default();
+
+        if vid.trim() == RM500U_VENDOR_ID && pid.trim() == RM500U_PRODUCT_ID {
+            return Ok(port_name.to_string());
         }
     }
 
