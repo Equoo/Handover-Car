@@ -118,6 +118,7 @@ async fn detect_rndis_interface() -> anyhow::Result<Option<String>> {
         }
     }
 
+    let entries = fs::read_dir("/sys/class/net")?;
     let re = Regex::new(r"^usb[0-9]+")?;
 
     for entry in entries {
