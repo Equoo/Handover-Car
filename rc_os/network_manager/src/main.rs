@@ -54,7 +54,7 @@ async fn flush_serial(port: &mut SerialStream) -> anyhow::Result<()> {
     // Drain input buffer for 500ms
     let mut buf = [0u8; 1024];
     loop {
-        match timeout(Duration::from_millis(200), port.read(&mut buf)).await {
+        match tokio::time::timeout(Duration::from_millis(200), port.read(&mut buf)).await {
             Ok(Ok(n)) if n > 0 => { /* discard */ }
             _ => break,
         }
@@ -81,7 +81,7 @@ async fn send_at_quick(port: &mut SerialStream, cmd: &str) -> anyhow::Result<()>
     let mut buf = [0u8; 256];
     let mut resp = String::new();
 
-    let res = timeout(Duration::from_millis(500), async {
+    let res = tokio::time::timeout(Duration::from_millis(500), async {
         loop {
             let n = port.read(&mut buf).await?;
             if n > 0 {
@@ -137,7 +137,7 @@ async fn send_at_command(port: &mut SerialStream, command: &str) -> anyhow::Resu
     let mut response = String::new();
 
     // Full command timeout (e.g. 3 seconds)
-    let res = timeout(Duration::from_secs(3), async {
+    let res = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let n = port.read(&mut buffer).await?;
             if n > 0 {
