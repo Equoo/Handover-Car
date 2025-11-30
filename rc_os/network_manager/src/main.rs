@@ -95,8 +95,6 @@ async fn send_at_command(port: &mut SerialStream, command: &str) -> anyhow::Resu
     port.write_all(full_command.as_bytes()).await?;
     port.flush().await?;
 
-    println!("SEND {}", full_command);
-
     let mut buffer = vec![0u8; 1024];
     let mut response = String::new();
 
@@ -105,12 +103,11 @@ async fn send_at_command(port: &mut SerialStream, command: &str) -> anyhow::Resu
         if n == 0 {
             continue; // wait for more data
         }
-        println!("read {:?}", &buffer[..n]);
         response.push_str(&String::from_utf8_lossy(&buffer[..n]));
 
         // Check if response contains OK or ERROR line
         if response.contains("\r\nOK\r\n") {
-            println!("> {}:\n{}", command, response.trim());
+            println!("<< {}\n> {}", command, response.trim());
             return Ok(());
         }
         if let Some(error_line) = response.lines().find(|l| l.starts_with("ERROR")) {
