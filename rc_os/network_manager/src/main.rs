@@ -25,8 +25,8 @@ async fn main() -> anyhow::Result<()> {
         "AT+QNETDEVCTL=1,3,1",
         "AT+QNETDEVCTL=1,1,1",
         "AT+QCFG=\"nat\",0",
-        "AT+CFUN=0",
-        "AT+CFUN=1",
+        // "AT+CFUN=0",
+        // "AT+CFUN=1",
     ];
 
     for cmd in &at_commands {
