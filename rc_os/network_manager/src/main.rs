@@ -144,7 +144,7 @@ async fn send_at_command(port: &mut SerialStream, command: &str) -> anyhow::Resu
                 response.push_str(&String::from_utf8_lossy(&buffer[..n]));
 
                 if response.contains("\r\nOK\r\n") {
-                    println!("<< {}\n> {}");
+                    println!("<< {}\n> {}", command, response);
                     return Ok(response);
                 }
                 if let Some(error) = response.lines().find(|l| l.starts_with("ERROR")) {
