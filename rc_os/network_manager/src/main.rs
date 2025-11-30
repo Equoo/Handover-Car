@@ -1,6 +1,7 @@
-use glob::glob;
+use anyhow::bail;
 use regex::Regex;
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -63,7 +64,7 @@ async fn flush_serial(port: &mut SerialStream) -> anyhow::Result<()> {
 
 const AT_IFACE: &str = "if04"; // interface for AT commands
 
-pub async fn detect_module() -> Result<String> {
+pub async fn detect_module() -> anyhow::Result<String> {
     let dir = Path::new("/dev/serial/by-id");
     if !dir.exists() {
         bail!("/dev/serial/by-id does not exist");
