@@ -61,27 +61,31 @@ async fn flush_serial(port: &mut SerialStream) -> anyhow::Result<()> {
     Ok(())
 }
 
-const RM500U_VENDOR_ID: &str = "2c7c"; // Example VID for Quectel
-const RM500U_PRODUCT_ID: &str = "0900"; // Example PID for RM500U
+const AT_IFACE: &str = "if04"; // interface for AT commands
 
-async fn detect_module() -> anyhow::Result<String> {
-    for entry in glob("/dev/ttyUSB*")? {
-        let port = entry?;
-        let port_name = port.to_string_lossy();
+pub async fn detect_module() -> Result<String> {
+    let dir = Path::new("/dev/serial/by-id");
+    if !dir.exists() {
+        bail!("/dev/serial/by-id does not exist");
+    }
 
-        // Read USB device symlink to find vendor/product info
-        let device_path = format!("/sys/class/tty/{}/device/../idVendor", port_name);
-        let product_path = format!("/sys/class/tty/{}/device/../idProduct", port_name);
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
 
-        let vid = fs::read_to_string(&device_path).unwrap_or_default();
-        let pid = fs::read_to_string(&product_path).unwrap_or_default();
+        // Pick the interface you want
+        if name.contains("RM500U") && name.contains(AT_IFACE) {
+            let link_target = fs::read_link(entry.path())?;
+            let dev = link_target
+                .file_name()
+                .and_then(|s| s.to_str())
+                .ok_or_else(|| anyhow::anyhow!("Invalid symlink target"))?;
 
-        if vid.trim() == RM500U_VENDOR_ID && pid.trim() == RM500U_PRODUCT_ID {
-            return Ok(port_name.to_string());
+            return Ok(format!("/dev/{}", dev));
         }
     }
 
-    anyhow::bail!("No RM500U module found on /dev/ttyUSB*");
+    bail!("RM500U AT interface not found (if04)");
 }
 
 // Send AT command and wait for full response
