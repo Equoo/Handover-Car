@@ -64,7 +64,7 @@ async fn flush_serial(port: &mut SerialStream) -> anyhow::Result<()> {
 const RM500U_VENDOR_ID: &str = "2c7c"; // Example VID for Quectel
 const RM500U_PRODUCT_ID: &str = "0900"; // Example PID for RM500U
 
-async fn detect_module() -> Result<String> {
+async fn detect_module() -> anyhow::Result<String> {
     for entry in glob("/dev/ttyUSB*")? {
         let port = entry?;
         let port_name = port.to_string_lossy();
