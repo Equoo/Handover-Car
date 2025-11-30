@@ -48,21 +48,56 @@ async fn main() -> anyhow::Result<()> {
 }
 
 async fn flush_serial(port: &mut SerialStream) -> anyhow::Result<()> {
-    // Flush the output (what we write)
+    // Flush outgoing buffer
     port.flush().await?;
 
-    // Drain input buffer
+    // Drain input buffer for 500ms
     let mut buf = [0u8; 1024];
     loop {
-        match tokio::time::timeout(Duration::from_millis(500), port.read(&mut buf)).await {
-            Ok(Ok(n)) if n > 0 => {
-                // discard the data
-            }
-            _ => break, // timeout or no data, done
+        match timeout(Duration::from_millis(200), port.read(&mut buf)).await {
+            Ok(Ok(n)) if n > 0 => { /* discard */ }
+            _ => break,
         }
     }
 
-    Ok(())
+    // Now verify module responds
+    println!("Checking if module responds to 'AT'...");
+
+    for _ in 0..5 {
+        match send_at_quick(port, "AT").await {
+            Ok(_) => return Ok(()),
+            Err(_) => tokio::time::sleep(Duration::from_millis(200)).await,
+        }
+    }
+
+    anyhow::bail!("Module does not respond after flush")
+}
+
+async fn send_at_quick(port: &mut SerialStream, cmd: &str) -> anyhow::Result<()> {
+    let full = format!("{}\r", cmd);
+    port.write_all(full.as_bytes()).await?;
+    port.flush().await?;
+
+    let mut buf = [0u8; 256];
+    let mut resp = String::new();
+
+    let res = timeout(Duration::from_millis(500), async {
+        loop {
+            let n = port.read(&mut buf).await?;
+            if n > 0 {
+                resp.push_str(&String::from_utf8_lossy(&buf[..n]));
+                if resp.contains("OK") {
+                    return Ok(());
+                }
+            }
+        }
+    })
+    .await;
+
+    match res {
+        Ok(r) => r,
+        Err(_) => anyhow::bail!("Timeout waiting for 'OK'"),
+    }
 }
 
 const AT_IFACE: &str = "if04"; // interface for AT commands
@@ -93,7 +128,7 @@ pub async fn detect_module() -> anyhow::Result<String> {
 }
 
 // Send AT command and wait for full response
-async fn send_at_command(port: &mut SerialStream, command: &str) -> anyhow::Result<()> {
+async fn send_at_command(port: &mut SerialStream, command: &str) -> anyhow::Result<String> {
     let full_command = format!("{}\r", command);
     port.write_all(full_command.as_bytes()).await?;
     port.flush().await?;
@@ -101,21 +136,27 @@ async fn send_at_command(port: &mut SerialStream, command: &str) -> anyhow::Resu
     let mut buffer = vec![0u8; 1024];
     let mut response = String::new();
 
-    loop {
-        let n = port.read(&mut buffer).await?;
-        if n == 0 {
-            continue; // wait for more data
-        }
-        response.push_str(&String::from_utf8_lossy(&buffer[..n]));
+    // Full command timeout (e.g. 3 seconds)
+    let res = timeout(Duration::from_secs(3), async {
+        loop {
+            let n = port.read(&mut buffer).await?;
+            if n > 0 {
+                response.push_str(&String::from_utf8_lossy(&buffer[..n]));
 
-        // Check if response contains OK or ERROR line
-        if response.contains("\r\nOK\r\n") {
-            println!("<< {}\n> {}", command, response.trim());
-            return Ok(());
+                if response.contains("\r\nOK\r\n") {
+                    return Ok(response);
+                }
+                if let Some(error) = response.lines().find(|l| l.starts_with("ERROR")) {
+                    anyhow::bail!("{} failed: {}", command, error);
+                }
+            }
         }
-        if let Some(error_line) = response.lines().find(|l| l.starts_with("ERROR")) {
-            anyhow::bail!("Command '{}' failed: {}", command, error_line);
-        }
+    })
+    .await;
+
+    match res {
+        Ok(r) => r,
+        Err(_) => anyhow::bail!("Timeout waiting for response to '{}'", command),
     }
 }
 
