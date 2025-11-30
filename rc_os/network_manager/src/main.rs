@@ -32,6 +32,8 @@ async fn main() -> anyhow::Result<()> {
         send_at_command(&mut port, cmd).await?;
     }
 
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
     println!("Module configured, detecting RNDIS interface...");
 
     if let Some(interface) = detect_rndis_interface().await? {
@@ -51,7 +53,7 @@ async fn flush_serial(port: &mut SerialStream) -> anyhow::Result<()> {
     // Drain input buffer
     let mut buf = [0u8; 1024];
     loop {
-        match tokio::time::timeout(Duration::from_millis(100), port.read(&mut buf)).await {
+        match tokio::time::timeout(Duration::from_millis(500), port.read(&mut buf)).await {
             Ok(Ok(n)) if n > 0 => {
                 // discard the data
             }
