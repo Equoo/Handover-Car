@@ -26,3 +26,8 @@ The control scripts needed GPIO CONNECTION and 32bit libs:
 sudo dpkg --add-architecture armhf
 sudo apt update
 sudo apt install libc6:armhf libstdc++6:armhf
+
+
+PWM SIGNALS:
+throtle:  993 (backward) - 1486 1487 1492 - 1986 (forward) in pulses
+direction:   1087 - 1480 - 1880
