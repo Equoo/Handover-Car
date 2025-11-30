@@ -28,7 +28,9 @@ open_modem_fd() {
     exec 3<> "$MODEM_DEV" || { echo "Failed opening $MODEM_DEV" >&2; return 1; }
     return 0
 }
-close_modem_fd() { exec 3>&- 3<&- || true; }
+close_modem_fd() {
+	exec 3>&- 3<&- || true;
+}
 
 wait_for_path() {
     local path="$1"
@@ -45,14 +47,13 @@ send_at() {
     local timeout="${2:-5}"  # default timeout 5 seconds
     local response=""
     log "AT> $cmd"
-
     # Send the command
     printf "%s\r" "$cmd" > "$MODEM_DEV"
 
     # Read response until we see OK or ERROR or timeout
     local start=$(date +%s)
     while true; do
-        if IFS= read -r -t 0.5 line < "$MODEM_DEV"; then
+        if IFS= read -r -t 1 line < "$MODEM_DEV"; then
             line="${line//$'\r'/}"  # remove carriage return
             line="${line//$'\n'/}"  # remove newline
             [[ -n "$line" ]] && log "AT< $line"
@@ -74,6 +75,27 @@ send_at() {
     return 0
 }
 
+flush() {
+    local timeout="${2:-5}"  # default timeout 5 seconds
+    local response=""
+    local start=$(date +%s)
+   while true; do
+        if IFS= read -r -t 1 line < "$MODEM_DEV"; then
+            line="${line//$'\r'/}"  # remove carriage return
+            line="${line//$'\n'/}"  # remove newline
+            [[ -n "$line" ]] && log "AT< $line"
+            response+="$line"
+            # Check if we got OK or ERROR
+        fi
+        # Timeout
+        local now=$(date +%s)
+        if (( now - start >= timeout )); then
+            break
+        fi
+
+   done
+   return 0
+}
 
 ### main ###
 
@@ -83,8 +105,8 @@ wait_for_path "$MODEM_DEV" 60 || exit 1
 # Configure serial line
 open_modem_fd
 
-printf "%s\r" "AT" > "$MODEM_DEV"
-printf "%s\r" "AT" > "$MODEM_DEV"
+printf "AT\r" > "$MODEM_DEV"
+flush
 
 send_at 'AT+QCFG="nat",1'
 send_at 'AT+CPIN?'
@@ -104,7 +126,8 @@ if [ -n "$APN" ]; then
     send_at "AT+CGDCONT=1,\"IPV4V6\",\"$APN\""
 fi
 
-# Optional: check registration
+send_at 'AT+QIACT=1'
+
 send_at 'AT+CEREG?'
 
 # Wait for network interface to appear
