@@ -118,6 +118,16 @@ async fn detect_rndis_interface() -> anyhow::Result<Option<String>> {
         }
     }
 
+    let re = Regex::new(r"^usb[0-9]+")?;
+
+    for entry in entries {
+        let entry = entry?;
+        let name = entry.file_name().into_string().unwrap_or_default();
+        if re.is_match(&name) {
+            return Ok(Some(name));
+        }
+    }
+
     Ok(None)
 }
 
