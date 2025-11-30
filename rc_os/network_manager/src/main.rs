@@ -67,7 +67,9 @@ async fn detect_module() -> anyhow::Result<String> {
         let port = entry?;
         // Quick check: try opening and sending basic AT command
         if let Ok(mut p) = tokio_serial::new(&*port.to_string_lossy(), 115200).open_native_async() {
+            println!("FEIUR {:?}", p);
             if send_at_command(&mut p, "AT").await.is_ok() {
+                println!("FEIUR {:?}", p);
                 return Ok(port.to_string_lossy().to_string());
             }
         }
