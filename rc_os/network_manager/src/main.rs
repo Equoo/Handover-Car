@@ -193,11 +193,11 @@ async fn detect_rndis_interface() -> anyhow::Result<Option<String>> {
 // Configure network via DHCP
 fn configure_network(interface: &str) -> anyhow::Result<()> {
     println!("Acquiring IP via dhclient...");
-    Command::new("pkill")
-        .args(&["-f", "dhclient.*$NET_IF"])
+    Command::new("bash")
+        .args(&["-c", "pkill -f dhclient.*$NET_IF"])
         .status()?;
-    Command::new("pkill")
-        .args(&["-f", "udhcpc.*$NET_IF"])
+    Command::new("bash")
+        .args(&["-c", "pkill -f udhcpc.*$NET_IF"])
         .status()?;
     Command::new("dhclient").args(&["-v", interface]).status()?;
 
