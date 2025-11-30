@@ -105,7 +105,7 @@ async fn send_at_command(port: &mut SerialStream, command: &str) -> anyhow::Resu
         if n == 0 {
             continue; // wait for more data
         }
-        println!("read {}", &buffer[..n]);
+        println!("read {:?}", &buffer[..n]);
         response.push_str(&String::from_utf8_lossy(&buffer[..n]));
 
         // Check if response contains OK or ERROR line
