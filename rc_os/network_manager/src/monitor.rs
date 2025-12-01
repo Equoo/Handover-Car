@@ -77,6 +77,7 @@ fn parse_servingcell(lines: &[String]) -> Option<ServingCell> {
         if line.starts_with("+QENG: \"servingcell\"") {
             // Example line:
             // +QENG: "servingcell","LTE","FDD",208,10,9C91F03,326,1501,3,5,5,C161,-99,-12,-68,6,10,22,28
+            println!("FEIR: {}", line);
             let parts: Vec<&str> = line.split(',').collect();
             if parts.len() > 15 {
                 let tech = parts[1].replace('"', "");
@@ -130,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
 
         // Wait 1 second or quit
         let mut quit = false;
-        for _ in 0..30 {
+        for _ in 0..10 {
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(key_event) = event::read()? {
                     if matches!(key_event.code, KeyCode::Char('q') | KeyCode::Char('Q')) {
