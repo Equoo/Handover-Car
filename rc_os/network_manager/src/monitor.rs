@@ -59,12 +59,12 @@ fn color_sinr(sinr: i32) -> ColoredString {
 
 fn signal_bars(rsrp: i32) -> String {
     let bars = match rsrp {
+        r if r == 0 => 0,
         r if r > -80 => 5,
         r if r > -90 => 4,
         r if r > -100 => 3,
         r if r > -110 => 2,
         r if r > -120 => 1,
-        r if r == 0 => 0,
         _ => 0,
     };
 
@@ -308,4 +308,3 @@ async fn main() -> anyhow::Result<()> {
     //terminal::disable_raw_mode()?;
     Ok(())
 }
-
