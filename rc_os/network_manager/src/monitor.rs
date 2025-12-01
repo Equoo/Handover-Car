@@ -6,7 +6,7 @@ use crossterm::{
     terminal::{self, ClearType},
 };
 use std::time::Duration;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
 
 #[derive(Debug)]
@@ -41,27 +41,34 @@ fn color_sinr(sinr: i32) -> ColoredString {
     }
 }
 
-async fn query_modem(port: &mut SerialStream, cmd: &str) -> Vec<String> {
-    port.write_all(format!("{}\r\n", cmd).as_bytes())
-        .await
-        .unwrap();
-    let mut reader = BufReader::new(port);
+async fn query_modem(port: &mut SerialStream, command: &str) -> Vec<String> {
+    let full_command = format!("{}\r", command);
+    port.write_all(full_command.as_bytes()).await.unwrap();
+    port.flush().await.unwrap();
+
+    let mut buffer = vec![0u8; 1024];
+    let mut response = String::new();
     let mut lines = Vec::new();
-    loop {
-        let mut buf = String::new();
-        match reader.read_line(&mut buf).await {
-            Ok(0) => break, // EOF
-            Ok(_) => {
-                let line = buf.trim();
-                println!(" FUCK {}", line);
-                if line == "OK" || line.starts_with("AT") {
+
+    // Full command timeout (e.g. 3 seconds)
+    let res = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let n = port.read(&mut buffer).await.unwrap();
+            if n > 0 {
+                response.push_str(&String::from_utf8_lossy(&buffer[..n]));
+
+                if response.contains("\r\nOK\r\n") {
+                    lines = response.lines().map(String::from).collect();
                     break;
                 }
-                lines.push(line.to_string());
+                if let Some(error) = response.lines().find(|l| l.starts_with("ERROR")) {
+                    break;
+                }
             }
-            Err(_) => break,
         }
-    }
+    })
+    .await;
+
     lines
 }
 
@@ -144,3 +151,4 @@ async fn main() -> anyhow::Result<()> {
     terminal::disable_raw_mode()?;
     Ok(())
 }
+
