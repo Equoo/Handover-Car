@@ -114,6 +114,7 @@ fn parse_servingcells(lines: &[String]) -> Vec<ServingCell> {
         if line.starts_with("+QENG: ") {
             let parts: Vec<&str> = line.split(',').collect();
 
+            println!("FEUR {:?}", parts);
             // LTE servingcell format
             if parts.len() > 15 && parts[1].contains("LTE") {
                 let tech = parts[1].replace('"', "");
