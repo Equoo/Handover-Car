@@ -116,7 +116,7 @@ fn parse_servingcells(lines: &[String]) -> Vec<ServingCell> {
 
             println!("FEUR {:?}", parts);
             // LTE servingcell format
-            if parts.len() > 15 && parts[1].contains("LTE") {
+            if parts.len() > 15 && parts[0].contains("LTE") {
                 let tech = parts[1].replace('"', "");
                 let rsrp = parts[13].parse::<i32>().unwrap_or(0);
                 let rsrq = parts[14].parse::<i32>().unwrap_or(0);
@@ -129,7 +129,7 @@ fn parse_servingcells(lines: &[String]) -> Vec<ServingCell> {
                 });
             }
             // NR5G-NSA servingcell format
-            else if parts.len() > 10 && parts[1].contains("NR5G") {
+            else if parts.len() > 10 && parts[0].contains("NR5G") {
                 let tech = parts[1].replace('"', "");
                 let rsrp = parts[8].parse::<i32>().unwrap_or(0);
                 let rsrq = parts[9].parse::<i32>().unwrap_or(0);
@@ -308,4 +308,3 @@ async fn main() -> anyhow::Result<()> {
     terminal::disable_raw_mode()?;
     Ok(())
 }
-
