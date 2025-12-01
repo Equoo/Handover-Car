@@ -21,9 +21,9 @@ async fn main() -> anyhow::Result<()> {
         "AT+CPIN?",
         "AT+QENG=\"servingcell\"",
         "AT+QCFG=\"ethernet\",0",
-        "AT+QCFG=\"usbnet\",1",
         "AT+QNETDEVCTL=1,3,1",
-        "AT+QNETDEVCTL=1,1,1",
+        "AT+QCFG=\"usbnet\",5", // 0=NDIS, 1=ECM, 2=MBIM, 3=RNDIS, 5=NCM
+        // "AT+QNETDEVCTL=1,1,1",
         "AT+QCFG=\"nat\",0",
         // "AT+CFUN=0",
         // "AT+CFUN=1",
