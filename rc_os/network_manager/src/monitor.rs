@@ -53,6 +53,7 @@ async fn query_modem(port: &mut SerialStream, cmd: &str) -> Vec<String> {
             Ok(0) => break, // EOF
             Ok(_) => {
                 let line = buf.trim();
+                println!(" FUCK {}", line);
                 if line == "OK" || line.starts_with("AT") {
                     break;
                 }
@@ -90,7 +91,7 @@ fn parse_servingcell(lines: &[String]) -> Option<ServingCell> {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Open serial port (replace ttyUSB2 with your modem device)
-    let mut port = tokio_serial::new("/dev/ttyUSB2", 115_200)
+    let mut port = tokio_serial::new("/dev/ttyUSB2", 115200)
         .open_native_async()
         .expect("Failed to open serial port");
 
