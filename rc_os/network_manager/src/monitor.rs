@@ -64,6 +64,7 @@ fn signal_bars(rsrp: i32) -> String {
         r if r > -100 => 3,
         r if r > -110 => 2,
         r if r > -120 => 1,
+        r if r == 0 => 0,
         _ => 0,
     };
 
@@ -217,7 +218,7 @@ async fn main() -> anyhow::Result<()> {
         .open_native_async()
         .expect("Failed to open serial port");
 
-    terminal::enable_raw_mode()?;
+    //terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
 
@@ -305,7 +306,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show)?;
-    terminal::disable_raw_mode()?;
+    //terminal::disable_raw_mode()?;
     Ok(())
 }
 
