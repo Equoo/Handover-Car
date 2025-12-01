@@ -123,7 +123,7 @@ async fn main() -> anyhow::Result<()> {
 
         // Wait 1 second or quit
         let mut quit = false;
-        for _ in 0..10 {
+        for _ in 0..30 {
             if event::poll(Duration::from_millis(100))? {
                 if let Event::Key(key_event) = event::read()? {
                     if matches!(key_event.code, KeyCode::Char('q') | KeyCode::Char('Q')) {
@@ -144,4 +144,3 @@ async fn main() -> anyhow::Result<()> {
     terminal::disable_raw_mode()?;
     Ok(())
 }
-
