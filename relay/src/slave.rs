@@ -59,12 +59,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    thread::sleep(Duration::from_secs(3));
-
-    Command::new("bash")
+    Command::new("bash") // --intra 10
         .args([
             "-c",
-            "rpicam-vid -t 0 --codec h264 --inline --intra 10 --width 720 --height 480 --framerate 60 --bitrate 3000000 -n -o - | nc -u server 13001",
+            "rpicam-vid -t 0 --codec h264 --inline --width 720 --height 480 --framerate 60 --bitrate 3000000 -n -o - | nc -u server 13001",
         ])
         .spawn()
         .expect("failed to start video");
