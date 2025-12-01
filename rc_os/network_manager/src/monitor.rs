@@ -5,11 +5,12 @@ use crossterm::{
     execute,
     terminal::{self, ClearType},
 };
-use std::time::Duration;
+use std::process::Command;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct ServingCell {
     technology: String,
     rsrp: i32,
@@ -17,7 +18,7 @@ struct ServingCell {
     sinr: i32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct NeighborCell {
     technology: String,
     earfcn: String,
@@ -26,11 +27,19 @@ struct NeighborCell {
     rsrq: i32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 enum ConnectionType {
     LTE,
     NR5GNSA, // Non-Standalone
     NR5GSA,  // Standalone
+}
+
+#[derive(Debug, Clone)]
+struct PingStats {
+    min: f32,
+    avg: f32,
+    max: f32,
+    packet_loss: f32,
 }
 
 fn color_rsrp(rsrp: i32) -> ColoredString {
@@ -54,6 +63,14 @@ fn color_sinr(sinr: i32) -> ColoredString {
         r if r > 20 => r.to_string().green(),
         r if r > 10 => r.to_string().yellow(),
         _ => sinr.to_string().red(),
+    }
+}
+
+fn color_ping(ms: f32) -> ColoredString {
+    match ms as i32 {
+        p if p < 50 => format!("{:.1}", ms).green(),
+        p if p < 100 => format!("{:.1}", ms).yellow(),
+        _ => format!("{:.1}", ms).red(),
     }
 }
 
@@ -87,7 +104,7 @@ async fn query_modem(port: &mut SerialStream, command: &str) -> Vec<String> {
     let mut response = String::new();
     let mut lines = Vec::new();
 
-    let res = tokio::time::timeout(Duration::from_secs(3), async {
+    let _ = tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let n = port.read(&mut buffer).await.unwrap_or(0);
             if n > 0 {
@@ -211,100 +228,182 @@ fn display_connection_type(conn_type: &ConnectionType) -> ColoredString {
     }
 }
 
+async fn ping_host(hostname: &str) -> Option<PingStats> {
+    let output = tokio::task::spawn_blocking({
+        let hostname = hostname.to_string();
+        move || {
+            Command::new("ping")
+                .arg("-c")
+                .arg("5")
+                .arg("-W")
+                .arg("1")
+                .arg(&hostname)
+                .output()
+        }
+    })
+    .await
+    .ok()?
+    .ok()?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    // Parse packet loss
+    let packet_loss = stdout
+        .lines()
+        .find(|l| l.contains("packet loss"))?
+        .split_whitespace()
+        .find(|s| s.contains('%'))?
+        .trim_end_matches('%')
+        .parse::<f32>()
+        .ok()?;
+
+    // Parse rtt min/avg/max
+    let rtt_line = stdout.lines().find(|l| l.contains("rtt min/avg/max"))?;
+    let stats_part = rtt_line.split('=').nth(1)?.trim();
+    let values: Vec<&str> = stats_part.split('/').collect();
+
+    if values.len() >= 3 {
+        Some(PingStats {
+            min: values[0].parse().ok()?,
+            avg: values[1].parse().ok()?,
+            max: values[2].parse().ok()?,
+            packet_loss,
+        })
+    } else {
+        None
+    }
+}
+
+fn render_display(
+    cells: &[ServingCell],
+    neighbors: &[NeighborCell],
+    conn_type: &ConnectionType,
+    ping_stats: &Option<PingStats>,
+) -> String {
+    let mut output = String::new();
+
+    output.push_str("╔══════════════════════════════════════════════╗\n");
+    output.push_str("║         MODEM SIGNAL MONITOR                 ║\n");
+    output.push_str("╚══════════════════════════════════════════════╝\n");
+    output.push('\n');
+    output.push_str(&format!(
+        "Connection: {}\n",
+        display_connection_type(conn_type)
+    ));
+    output.push('\n');
+
+    if cells.is_empty() {
+        output.push_str(&format!("{}\n", "No serving cell info available".red()));
+    } else {
+        for (idx, cell) in cells.iter().enumerate() {
+            output.push_str(&format!(
+                "{}\n",
+                format!("━━━ {} ━━━", cell.technology).cyan().bold()
+            ));
+            output.push_str(&format!("Signal: {}\n", signal_bars(cell.rsrp)));
+            output.push_str(&format!("RSRP:   {} dBm\n", color_rsrp(cell.rsrp)));
+            output.push_str(&format!("RSRQ:   {} dB\n", color_rsrq(cell.rsrq)));
+            output.push_str(&format!("SINR:   {} dB\n", color_sinr(cell.sinr)));
+            if idx < cells.len() - 1 {
+                output.push('\n');
+            }
+        }
+    }
+
+    if let Some(stats) = ping_stats {
+        output.push('\n');
+        output.push_str(&format!(
+            "{}\n",
+            "━━━ Network Test (server) ━━━".cyan().bold()
+        ));
+        output.push_str(&format!("Min:         {} ms\n", color_ping(stats.min)));
+        output.push_str(&format!("Avg:         {} ms\n", color_ping(stats.avg)));
+        output.push_str(&format!("Max:         {} ms\n", color_ping(stats.max)));
+        let loss_str = format!("{:.0}%", stats.packet_loss);
+        let loss_colored = if stats.packet_loss > 5.0 {
+            loss_str.red()
+        } else if stats.packet_loss > 0.0 {
+            loss_str.yellow()
+        } else {
+            loss_str.green()
+        };
+        output.push_str(&format!("Packet Loss: {}\n", loss_colored));
+    }
+
+    if !neighbors.is_empty() {
+        output.push('\n');
+        output.push_str(&format!(
+            "{}\n",
+            "━━━ Neighbor Cells ━━━".bright_black().bold()
+        ));
+        for neighbor in neighbors.iter().take(5) {
+            output.push_str(&format!(
+                "{} | PCI: {} | RSRP: {} | RSRQ: {}\n",
+                neighbor.technology.bright_black(),
+                neighbor.pci.bright_black(),
+                color_rsrp(neighbor.rsrp),
+                color_rsrq(neighbor.rsrq)
+            ));
+        }
+        if neighbors.len() > 5 {
+            output.push_str(&format!("... and {} more\n", neighbors.len() - 5));
+        }
+    }
+
+    output.push('\n');
+    output.push_str(&format!("{}\n", "Press Q to quit".bright_black()));
+
+    output
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut port = tokio_serial::new("/dev/ttyUSB2", 115200)
         .open_native_async()
         .expect("Failed to open serial port");
 
-    //terminal::enable_raw_mode()?;
     let mut stdout = std::io::stdout();
     execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
 
+    let mut last_cells: Vec<ServingCell> = Vec::new();
+    let mut last_neighbors: Vec<NeighborCell> = Vec::new();
+    let mut last_ping: Option<PingStats> = None;
+    let mut last_update = Instant::now();
+
     loop {
+        // Update data every second
+        if last_update.elapsed() >= Duration::from_secs(1) {
+            last_cells =
+                parse_servingcells(&query_modem(&mut port, "AT+QENG=\"servingcell\"").await);
+            last_neighbors =
+                parse_neighbors(&query_modem(&mut port, "AT+QENG=\"neighbourcell\"").await);
+            last_ping = ping_host("server").await;
+            last_update = Instant::now();
+        }
+
+        let conn_type = determine_connection_type(&last_cells);
+        let display = render_display(&last_cells, &last_neighbors, &conn_type, &last_ping);
+
         execute!(
             stdout,
             terminal::Clear(ClearType::All),
             cursor::MoveTo(0, 0)
         )?;
-
-        let cells = parse_servingcells(&query_modem(&mut port, "AT+QENG=\"servingcell\"").await);
-        let neighbors = parse_neighbors(&query_modem(&mut port, "AT+QENG=\"neighbourcell\"").await);
-        let conn_type = determine_connection_type(&cells);
-
-        println!(
-            "{}",
-            "╔══════════════════════════════════════════════╗".blue()
-        );
-        println!(
-            "{}",
-            "║         MODEM SIGNAL MONITOR                 ║"
-                .blue()
-                .bold()
-        );
-        println!(
-            "{}",
-            "╚══════════════════════════════════════════════╝".blue()
-        );
-        println!();
-        println!("Connection: {}", display_connection_type(&conn_type));
-        println!();
-
-        if cells.is_empty() {
-            println!("{}", "No serving cell info available".red());
-        } else {
-            for (idx, cell) in cells.iter().enumerate() {
-                println!("{}", format!("━━━ {} ━━━", cell.technology).cyan().bold());
-                println!("Signal: {}", signal_bars(cell.rsrp));
-                println!("RSRP:   {} dBm", color_rsrp(cell.rsrp));
-                println!("RSRQ:   {} dB", color_rsrq(cell.rsrq));
-                println!("SINR:   {} dB", color_sinr(cell.sinr));
-                if idx < cells.len() - 1 {
-                    println!();
-                }
-            }
-        }
-
-        if !neighbors.is_empty() {
-            println!();
-            println!("{}", "━━━ Neighbor Cells ━━━".bright_black().bold());
-            for (idx, neighbor) in neighbors.iter().enumerate().take(5) {
-                println!(
-                    "{} | PCI: {} | RSRP: {} | RSRQ: {}",
-                    neighbor.technology.bright_black(),
-                    neighbor.pci.bright_black(),
-                    color_rsrp(neighbor.rsrp),
-                    color_rsrq(neighbor.rsrq)
-                );
-            }
-            if neighbors.len() > 5 {
-                println!("... and {} more", neighbors.len() - 5);
-            }
-        }
-
-        println!();
-        println!("{}", "Press Q to quit".bright_black());
+        print!("{}", display);
         std::io::Write::flush(&mut stdout)?;
 
-        let mut quit = false;
-        for _ in 0..10 {
-            if event::poll(Duration::from_millis(100))? {
-                if let Event::Key(key_event) = event::read()? {
-                    if matches!(key_event.code, KeyCode::Char('q') | KeyCode::Char('Q')) {
-                        quit = true;
-                        break;
-                    }
+        // Check for quit key
+        if event::poll(Duration::from_millis(100))? {
+            if let Event::Key(key_event) = event::read()? {
+                if matches!(key_event.code, KeyCode::Char('q') | KeyCode::Char('Q')) {
+                    break;
                 }
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
         }
-
-        if quit {
-            break;
-        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
     execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show)?;
-    //terminal::disable_raw_mode()?;
     Ok(())
 }
+
