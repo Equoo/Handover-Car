@@ -75,7 +75,7 @@ async fn query_modem(port: &mut SerialStream, command: &str) -> Vec<String> {
 fn parse_servingcell(lines: &[String]) -> Option<ServingCell> {
     println!("FEIR: {:?}", lines);
     for line in lines {
-        if line.starts_with("+QENG: \"servingcell\"") {
+        if line.starts_with("+QENG: ") {
             // Example line:
             // +QENG: "servingcell","LTE","FDD",208,10,9C91F03,326,1501,3,5,5,C161,-99,-12,-68,6,10,22,28
             let parts: Vec<&str> = line.split(',').collect();
@@ -152,4 +152,3 @@ async fn main() -> anyhow::Result<()> {
     terminal::disable_raw_mode()?;
     Ok(())
 }
-
