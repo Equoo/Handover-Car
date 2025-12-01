@@ -3,7 +3,7 @@ systemctl enable --now heartbeat
 systemctl enable setup-network
 
 apt update
-apt install -y openssh-client rpicam-apps make cargo libdbus-1-dev pkg-config unzip minicom
+apt install -y openssh-client rpicam-apps netcat-openbsd make cargo libdbus-1-dev pkg-config unzip minicom
 
 rm /etc/modprobe.d/dietpi-disable_rpi_camera.conf
 rm /etc/modprobe.d/dietpi-disable_rpi_codec.conf
