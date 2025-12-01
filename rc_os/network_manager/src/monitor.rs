@@ -5,7 +5,6 @@ use crossterm::{
     execute,
     terminal::{self, ClearType},
 };
-use std::io::Write;
 use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio_serial::{SerialPortBuilderExt, SerialStream};
@@ -119,7 +118,7 @@ async fn main() -> anyhow::Result<()> {
         }
 
         println!("\nPress Q to quit");
-        stdout.flush()?;
+        std::io::Write::flush(&mut stdout)?;
 
         // Wait 1 second or quit
         let mut quit = false;
