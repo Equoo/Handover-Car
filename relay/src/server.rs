@@ -5,8 +5,8 @@ use crossbeam_channel::Sender;
 use laminar::{Packet, Socket, SocketEvent};
 use std::collections::{HashMap, HashSet};
 use std::error::Error;
-use std::net::SocketAddr;
 use std::net::UdpSocket;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -27,7 +27,10 @@ fn video_pipe(id: String, clients: Arc<Mutex<HashMap<String, SocketAddr>>>) -> R
                 continue;
             }
             for adr in &subscribes {
-                socket.send_to(&buf[..amt], adr);
+                socket.send_to(
+                    &buf[..amt],
+                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(82, 67, 99, 87)), 14002),
+                ); //adr);
             }
         }
     }
