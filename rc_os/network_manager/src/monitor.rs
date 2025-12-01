@@ -94,7 +94,7 @@ async fn main() -> anyhow::Result<()> {
         stdout.flush()?;
 
         // Non-blocking key read
-        if event::poll(Duration::from_millis(1000))? {
+        if event::poll(Duration::from_millis(3000))? {
             if let Event::Key(key_event) = event::read()? {
                 match key_event.code {
                     KeyCode::Char('q') | KeyCode::Char('Q') => break,
