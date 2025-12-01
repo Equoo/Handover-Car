@@ -372,7 +372,7 @@ async fn main() -> anyhow::Result<()> {
 
     loop {
         // Update data every second
-        if last_update.elapsed() >= Duration::from_secs(1) {
+        if last_update.elapsed() >= Duration::from_millis(500) {
             last_cells =
                 parse_servingcells(&query_modem(&mut port, "AT+QENG=\"servingcell\"").await);
             last_neighbors =
@@ -406,4 +406,3 @@ async fn main() -> anyhow::Result<()> {
     execute!(stdout, terminal::LeaveAlternateScreen, cursor::Show)?;
     Ok(())
 }
-
