@@ -1,158 +1,34 @@
 #!/bin/bash
-#
-# Robust auto-setup script for RM500U-CNV on DietPi
-# - unlock SIM (optional)
-# - set USB network mode to RNDIS
-# - set APN
-# - start data connection
-# - bring usb0 up and get IP via DHCP
-# - retries on failure, resets modem if needed
-#
 
-MODEM_DEV=${MODEM_DEV:-/dev/ttyUSB2}   # AT command port
-NET_IF=${NET_IF:-usb0}                 # network interface created by modem
-APN=${APN:-}                           # <<< set your real APN
-SIM_PIN=${SIM_PIN:-}                   # <<< set to e.g. 1234 if your SIM has a PIN
-MAX_RETRIES=${MAX_RETRIES:-3}          # number of retries for critical steps
-RETRY_DELAY=${RETRY_DELAY:-5}          # seconds between retries
+BINARY_PATH="/root/setup"
+CHECK_HOST="8.8.8.8"   # or any host you prefer
+INTERVAL=3
 
-log() {
-    echo "[$(date +%T)] $*"
+run_binary() {
+    echo "[monitor] starting binary..."
+    "$BINARY_PATH"
+    systemctl restart reverse-ssh.service
+    # BIN_PID=$!
 }
 
-open_modem_fd() {
-    if [[ -z "$MODEM_DEV" ]]; then
-        echo "MODEM_DEV not set" >&2
-        return 1
+check_connection() {
+    ping -c1 -W1 "$CHECK_HOST" >/dev/null 2>&1
+    return $?
+}
+
+run_binary
+# wait "$BIN_PID" 2>/dev/null
+
+sleep 10
+
+while true; do
+    sleep "$INTERVAL"
+
+    if ! check_connection; then
+        echo "[monitor] connection lost — restarting binary..."
+
+        run_binary
+
+	sleep 10
     fi
-    exec 3<> "$MODEM_DEV" || { echo "Failed opening $MODEM_DEV" >&2; return 1; }
-    return 0
-}
-close_modem_fd() {
-	exec 3>&- 3<&- || true;
-}
-
-wait_for_path() {
-    local path="$1"
-    local timeout="${2:-60}"
-    while [ ! -e "$path" ] && [ "$timeout" -gt 0 ]; do
-        sleep 1
-        timeout=$((timeout-1))
-    done
-    [ -e "$path" ]
-}
-
-send_at() {
-    local cmd="$1"
-    local timeout="${2:-5}"  # default timeout 5 seconds
-    local response=""
-    log "AT> $cmd"
-    # Send the command
-    printf "%s\r" "$cmd" > "$MODEM_DEV"
-
-    # Read response until we see OK or ERROR or timeout
-    local start=$(date +%s)
-    while true; do
-        if IFS= read -r -t 1 line < "$MODEM_DEV"; then
-            line="${line//$'\r'/}"  # remove carriage return
-            line="${line//$'\n'/}"  # remove newline
-            [[ -n "$line" ]] && log "AT< $line"
-            response+="$line"
-            # Check if we got OK or ERROR
-            if [[ "$response" =~ OK$ ]] || [[ "$response" =~ ERROR$ ]]; then
-                break
-            fi
-        fi
-
-        # Timeout
-        local now=$(date +%s)
-        if (( now - start >= timeout )); then
-            log "AT< Timeout waiting for response"
-            break
-        fi
-    done
-
-    return 0
-}
-
-flush() {
-    local timeout="${2:-5}"  # default timeout 5 seconds
-    local response=""
-    local start=$(date +%s)
-   while true; do
-        if IFS= read -r -t 1 line < "$MODEM_DEV"; then
-            line="${line//$'\r'/}"  # remove carriage return
-            line="${line//$'\n'/}"  # remove newline
-            [[ -n "$line" ]] && log "AT< $line"
-            response+="$line"
-            # Check if we got OK or ERROR
-        fi
-        # Timeout
-        local now=$(date +%s)
-        if (( now - start >= timeout )); then
-            break
-        fi
-
-   done
-   return 0
-}
-
-### main ###
-
-log "Waiting for modem device $MODEM_DEV ..."
-wait_for_path "$MODEM_DEV" 60 || exit 1
-
-# Configure serial line
-open_modem_fd
-
-printf "AT\r" > "$MODEM_DEV"
-flush
-
-send_at 'AT+QCFG="nat",1'
-send_at 'AT+CPIN?'
-send_at 'AT+QENG="servingcell"'
-send_at 'AT+QCFG="usbnet",3'
-send_at 'AT+QNETDEVCTL=2,3,1'
-send_at 'AT+QUIMSLOT=1'
-
-# Unlock SIM if PIN provided
-if [ -n "$SIM_PIN" ]; then
-    send_at "AT+CPIN=\"$SIM_PIN\""
-    sleep 5
-fi
-
-# Set APN
-if [ -n "$APN" ]; then
-    send_at "AT+CGDCONT=1,\"IPV4V6\",\"$APN\""
-fi
-
-send_at 'AT+QIACT=1'
-
-send_at 'AT+CEREG?'
-
-# Wait for network interface to appear
-log "Waiting for network interface $NET_IF ..."
-wait_for_path "/sys/class/net/$NET_IF" 30 || exit 1
-
-# Bring interface up
-ip link set "eth0" down
-ip link set "$NET_IF" up
-
-# Ask for IP via DHCP
-if [ -n "$FIRST" ]; then
-	log "First init"
-else
-	log "Requesting IP address on $NET_IF via dhclient ..."
-	pkill -f "dhclient.*$NET_IF" 2>/dev/null || true
-	pkill -f "udhcpc.*$NET_IF" 2>/dev/null || true
-	sleep 1
-	dhclient -1 -q "$NET_IF" || exit 1
-fi
-
-log "Current IP configuration for $NET_IF:"
-ip addr show dev "$NET_IF"
-
-close_modem_fd
-
-log "Setup completed successfully."
-log "Done."
+done

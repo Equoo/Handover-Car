@@ -15,7 +15,7 @@ use crate::messages::Message;
 use crate::messages::metric_now;
 
 fn video_pipe(id: String, clients: Arc<Mutex<HashMap<String, SocketAddr>>>) -> Result<()> {
-    let mut socket = UdpSocket::bind(format!("0.0.0.0:950{}", id))?;
+    let mut socket = UdpSocket::bind(format!("0.0.0.0:1300{}", id))?;
     let mut subscribes: HashSet<SocketAddr> = HashSet::new();
 
     loop {

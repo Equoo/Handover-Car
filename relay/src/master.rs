@@ -4,6 +4,7 @@ use laminar::{Packet, Socket, SocketEvent};
 use pasts::Loop;
 use std::error::Error;
 use std::net::{SocketAddr, UdpSocket};
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::task::Poll::{self, Pending, Ready};
 use std::thread;
@@ -151,10 +152,10 @@ fn receive_messages(receiver: Receiver<SocketEvent>) {
 }
 
 fn receive_video(server: SocketAddr, slave: String) -> Result<()> {
-    let mut socket = UdpSocket::bind("0.0.0.0:3466")?;
+    let mut socket = UdpSocket::bind("0.0.0.0:14001")?;
     socket.set_nonblocking(true)?;
     let mut received_video = false;
-    let server_video: SocketAddr = format!("37.59.106.4:950{}", slave).parse().unwrap();
+    let server_video: SocketAddr = format!("37.59.106.4:1300{}", slave).parse().unwrap();
     let mut last = Instant::now();
 
     loop {
@@ -163,7 +164,10 @@ fn receive_video(server: SocketAddr, slave: String) -> Result<()> {
         match socket.recv_from(&mut buf) {
             Ok((amt, src)) => {
                 received_video = true;
-                socket.send_to(&buf[..amt], "127.0.0.1:7654".parse::<SocketAddr>().unwrap());
+                socket.send_to(
+                    &buf[..amt],
+                    "127.0.0.1:14002".parse::<SocketAddr>().unwrap(),
+                );
             }
             Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 if !received_video && last.elapsed().as_millis() > 100 {
@@ -179,7 +183,7 @@ fn receive_video(server: SocketAddr, slave: String) -> Result<()> {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
-    let addr = "0.0.0.0:12352";
+    let addr = "0.0.0.0:14000";
     let server: SocketAddr = SERVER.parse().unwrap();
     let slave = "1";
 
@@ -236,6 +240,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
             thread::sleep(Duration::from_millis(50));
         }
     });
+
+    Command::new("bash")
+        .args([
+            "-c",
+            "gst-launch-1.0 udpsrc port=14002 caps=\"video/x-h264,stream-format=(string)byte-stream,alignement=(string)au\" ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false",
+        ])
+        .spawn()
+        .expect("failed to start video");
 
     loop {
         thread::sleep(Duration::from_millis(1000));
