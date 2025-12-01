@@ -111,7 +111,7 @@ fn parse_servingcells(lines: &[String]) -> Vec<ServingCell> {
     let mut cells = Vec::new();
 
     for line in lines {
-        if line.starts_with("+QENG: ") && line.contains("servingcell") {
+        if line.starts_with("+QENG: ") {
             let parts: Vec<&str> = line.split(',').collect();
 
             // LTE servingcell format
@@ -150,7 +150,7 @@ fn parse_neighbors(lines: &[String]) -> Vec<NeighborCell> {
     let mut neighbors = Vec::new();
 
     for line in lines {
-        if line.starts_with("+QENG: ") && line.contains("neighbourcell") {
+        if line.starts_with("+QENG: ") {
             let parts: Vec<&str> = line.split(',').collect();
 
             // LTE neighbor format
@@ -227,9 +227,8 @@ async fn main() -> anyhow::Result<()> {
             cursor::MoveTo(0, 0)
         )?;
 
-        let lines = query_modem(&mut port, "AT+QENG=\"servingcell\"").await;
-        let cells = parse_servingcells(&lines);
-        let neighbors = parse_neighbors(&lines);
+        let cells = parse_servingcells(&query_modem(&mut port, "AT+QENG=\"servingcell\"").await);
+        let neighbors = parse_neighbors(&query_modem(&mut port, "AT+QENG=\"neighbourcell\"").await);
         let conn_type = determine_connection_type(&cells);
 
         println!(
