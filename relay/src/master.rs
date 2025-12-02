@@ -31,7 +31,7 @@ struct State {
 }
 
 fn to_motor_vector(steer: f64, power: f64) -> (i16, i16) {
-    ((steer * 25.) as i16 + 90, (power * 20.) as i16 + 90)
+    ((steer * -14.) as i16 + 91, (power * -14.) as i16 + 90)
 }
 
 impl State {
@@ -55,9 +55,11 @@ impl State {
             }
             Event::JoyY(y) => {
                 *self.power.lock().unwrap() = y;
+                println!("Y: {}", y);
             }
             Event::CamX(x) => {
                 *self.dir.lock().unwrap() = x;
+                println!("X: {}", x);
             }
             Event::MenuR(true) => return Ready(player),
             _ => {}
@@ -227,13 +229,13 @@ async fn main() -> Result<(), Box<dyn Error>> {
         .spawn()
         .expect("failed to start video");
 
-    loop {
-        thread::sleep(Duration::from_millis(1000));
-    }
+    // loop {
+    //     thread::sleep(Duration::from_millis(1000));
+    // }
 
-    // let player_id = Loop::new(&mut state)
-    //     .when(|s| &mut s.listener, State::connect)
-    //     .poll(|s| &mut s.controllers, State::event)
-    //     .await;
+    let player_id = Loop::new(&mut state)
+        .when(|s| &mut s.listener, State::connect)
+        .poll(|s| &mut s.controllers, State::event)
+        .await;
     Ok(())
 }
