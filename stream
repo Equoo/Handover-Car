@@ -12,7 +12,7 @@ rpicam-vid \
   --shutter 20000 \
   --bitrate 2000000 \
   --segment 1 \
-  -o udp://37.59.106.4:9501
+  -o udp://37.59.106.4:13001
 
 # TESTED with overcloaking "safe" 1600hz default cpuutils using 5g module and relay server at NORD FRANCE
 #720p60:
