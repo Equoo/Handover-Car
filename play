@@ -1,3 +1,0 @@
-#! /bin/bash
-
-gst-launch-1.0 udpsrc port=7654 caps="video/x-h264,stream-format=(string)byte-stream,alignement=(string)au" ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false
