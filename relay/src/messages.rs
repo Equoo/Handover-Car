@@ -19,8 +19,8 @@ pub enum Message {
     },
     MasterInput {
         slave_id: String,
-        motor_right: f32,
-        motor_left: f32,
+        throttle: i16,
+        steering: i16,
     },
 }
 

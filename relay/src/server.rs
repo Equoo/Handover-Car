@@ -29,7 +29,7 @@ fn video_pipe(id: String, clients: Arc<Mutex<HashMap<String, SocketAddr>>>) -> R
             for adr in &subscribes {
                 socket.send_to(
                     &buf[..amt],
-                    SocketAddr::new(IpAddr::V4(Ipv4Addr::new(82, 67, 99, 87)), 14002),
+                    adr, //SocketAddr::new(IpAddr::V4(Ipv4Addr::new(82, 67, 99, 87)), 14002),
                 ); //adr);
             }
         }
@@ -103,8 +103,8 @@ fn handle_message(
         }
         Message::MasterInput {
             ref slave_id,
-            motor_right,
-            motor_left,
+            throttle,
+            steering,
         } => {
             if let Some(target) = clients.lock().unwrap().get(slave_id) {
                 sender.send(Packet::reliable_unordered(

@@ -26,34 +26,12 @@ struct State {
     rumble: (f32, f32),
     server: SocketAddr,
     dir: Arc<Mutex<f64>>,
-    power: Arc<Mutex<i8>>,
+    power: Arc<Mutex<f64>>,
     power_max: i8,
 }
 
-fn to_motor_vector(input: f64, power: i8) -> (i8, i8) {
-    // Clamp input between -1.0 and 1.0
-    let v = input.clamp(-1.0, 1.0);
-    let p = power as f64;
-
-    match v {
-        x if x == -1.0 => (-p as i8, p as i8),
-        x if x == 0.0 => (p as i8, p as i8),
-        x if x == 1.0 => (p as i8, -p as i8),
-        x if x < 0.0 => {
-            // interpolate between -1 and 0
-            let t = (x + 1.0) / 1.0;
-            let left = (-p + t * (p - -p)).round() as i8;
-            let right = p as i8;
-            (left, right)
-        }
-        x => {
-            // interpolate between 0 and 1
-            let t = x;
-            let left = p as i8;
-            let right = (p - t * (p - -p)).round() as i8;
-            (left, right)
-        }
-    }
+fn to_motor_vector(steer: f64, power: f64) -> (i16, i16) {
+    ((steer * 25.) as i16 + 90, (power * 20.) as i16 + 90)
 }
 
 impl State {
@@ -76,7 +54,7 @@ impl State {
                 self.controllers.swap_remove(id);
             }
             Event::JoyY(y) => {
-                *self.power.lock().unwrap() = (y * -1. * self.power_max as f64) as i8;
+                *self.power.lock().unwrap() = y;
             }
             Event::CamX(x) => {
                 *self.dir.lock().unwrap() = x;
@@ -211,7 +189,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         controllers: Vec::new(),
         rumble: (0.0, 0.0),
         dir: Arc::new(Mutex::new(0.)),
-        power: Arc::new(Mutex::new(0)),
+        power: Arc::new(Mutex::new(0.)),
         power_max: 110,
     };
 
@@ -219,7 +197,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let cl_power = state.power.clone();
     let _thread = thread::spawn(move || {
         loop {
-            let mut dir = (0 as i8, 0 as i8);
+            let mut dir = (0 as i16, 0 as i16);
             {
                 dir = to_motor_vector(
                     cl_dir.lock().unwrap().clone(),
@@ -228,8 +206,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
             }
             let mut message: Message = Message::MasterInput {
                 slave_id: "1".to_string(),
-                motor_right: dir.0 as f32 * -1.,
-                motor_left: dir.1 as f32,
+                throttle: dir.1,
+                steering: dir.0,
             };
             sender
                 .send(Packet::unreliable(
