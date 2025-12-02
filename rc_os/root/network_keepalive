@@ -1,0 +1,42 @@
+#!/bin/bash
+
+# Network setup program - replace with your actual command
+NETWORK_SETUP_COMMAND="/root/setup-network"
+
+# Host to ping for checking internet connectivity
+PING_HOST="8.8.8.8"
+
+# Function to setup network
+setup_network() {
+    echo "[$(date)] Setting up network..."
+    $NETWORK_SETUP_COMMAND
+    if [ $? -eq 0 ]; then
+        echo "[$(date)] Network setup completed successfully"
+        return 0
+    else
+        echo "[$(date)] Network setup failed"
+        return 1
+    fi
+}
+
+# Function to check internet connectivity
+check_internet() {
+    ping -c 1 -W 2 $PING_HOST > /dev/null 2>&1
+    return $?
+}
+
+# Main loop
+echo "[$(date)] Starting network monitor..."
+
+# Initial setup
+setup_network
+
+# Monitor loop
+while true; do
+    sleep 1
+    
+    if ! check_internet; then
+        echo "[$(date)] Internet connection lost! Restarting network setup..."
+        setup_network
+    fi
+done

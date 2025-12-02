@@ -1,6 +1,6 @@
 systemctl enable --now reverse-ssh
 systemctl enable --now heartbeat
-systemctl enable setup-network
+systemctl enable network_keepalive
 
 apt update
 apt install -y openssh-client rpicam-apps netcat-openbsd make cargo libdbus-1-dev pkg-config unzip minicom
