@@ -5,6 +5,7 @@ use futures_util::future::FutureExt;
 use laminar::{Packet, Socket, SocketEvent};
 use std::error::Error;
 use std::process::Command;
+use std::process::Stdio;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -78,13 +79,53 @@ async fn main() -> Result<(), Box<dyn Error>> {
         }
     });
 
-    Command::new("bash") // --intra 10
+// rpicam-vid -t 0 \
+//     --flush \
+//     --codec h264 \
+//     --inline \
+//     --width 853 \
+//     --height 480 \
+//     --framerate 60 \
+//     --bitrate 2000000 \
+//     --intra 60 \
+//     -n \
+//     -o udp://37.59.106.4:13001
+
+// --profile baseline
+// --level 4
+// --intra 30
+
+    let mut rpicam = Command::new("rpicam-vid")
         .args([
-            "-c",
-            "rpicam-vid -t 0 --flush --codec h264 --inline --width 853 --height 480 --framerate 60 --shutter 10000 --bitrate 2000000 --segment 1 -n -o udp://37.59.106.4:13001",
+            "-t", "0",
+            "--codec", "h264",
+            "--inline",
+            "--width", "853",
+            "--height", "480",
+            "--framerate", "60",
+            "--bitrate", "2000000",
+            "-o", "-", // stdout
         ])
-        .spawn()
-        .expect("failed to start video");
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    // Get rpicam stdout
+    let rpicam_stdout = rpicam.stdout.take()
+        .expect("Failed to capture rpicam stdout");
+
+    // Spawn gst-launch-1.0
+    let mut gst = Command::new("gst-launch-1.0")
+        .args([
+            "fdsrc",
+            "!",
+            "h264parse",
+            "!",
+            "rtph264pay", "config-interval=1", "pt=96",
+            "!",
+            "udpsink", "host=37.59.106.4", "port=13001",
+        ])
+        .stdin(Stdio::from(rpicam_stdout))
+        .spawn()?;
 
     let mut port = tokio_serial::new(default_port.clone(), default_baud)
         // default settings are 8N1; you can tweak with .parity(), .stop_bits(), .flow_control()

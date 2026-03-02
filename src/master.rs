@@ -42,6 +42,7 @@ impl State {
             controller.id(),
             controller.name(),
         );
+        
         self.controllers.push(controller);
         Pending
     }
@@ -227,15 +228,12 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "gst-launch-1.0 udpsrc port=14002 caps=\"video/x-h264,stream-format=(string)byte-stream,alignement=(string)au\" ! h264parse ! avdec_h264 ! videoconvert ! autovideosink sync=false",
         ])
         .spawn()
-        .expect("failed to start video");
+        .expect("failed to start video").wait();
 
-    // loop {
-    //     thread::sleep(Duration::from_millis(1000));
-    // }
 
-    let player_id = Loop::new(&mut state)
-        .when(|s| &mut s.listener, State::connect)
-        .poll(|s| &mut s.controllers, State::event)
-        .await;
+    // let player_id = Loop::new(&mut state)
+    //     .when(|s| &mut s.listener, State::connect)
+    //     .poll(|s| &mut s.controllers, State::event)
+    //     .await;
     Ok(())
 }
