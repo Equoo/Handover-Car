@@ -1,43 +1,30 @@
-[package]
-name = "rc-relay"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+resolver = "3"
+members = [
+    "common",
+    "client",
+    "server",
+    "slave",
+]
 
-[[bin]]
-name = "slave"
-path = "src/slave.rs"
-
-[[bin]]
-name = "client"
-path = "src/client.rs"
-
-[[bin]]
-name = "master"
-path = "src/master.rs"
-
-[[bin]]
-name = "server"
-path = "src/server.rs"
-
-[dependencies]
+[workspace.dependencies]
 tokio = { version = "1.48.0", features = ["full"] }
-tokio-macros = "2.6.0"
-laminar = "0.5"
 serde = { version = "1.0.228", features = ["derive"] }
-bincode = {version = "2.0.1", features = ["serde"] }
 crossbeam-channel = "0.5.15"
-pasts = "0.8"
-stick = "0.13.0"
+rkyv = "0.8.15"
 anyhow = "1.0.100"
-futures-lite = "2.6.1"
-bimap = "0.6.3"
-btleplug = "0.11.8"
-futures-util = "0.3.31"
-tokio-serial = "5.4.5"
+laminar = "0.5"
+tracing-subscriber = "0.3.22"
+tracing = "0.1.44"
+uuid = "1.21.0"
+parking_lot = "0.12.5"
 
-gtk = { version = "0.9", package = "gtk4" }
-gdk = { version = "0.9", package = "gdk4" }
-glib = "0.20"
-gstreamer = "0.23"
-gstreamer-app = "0.23"
-gstreamer-video = "0.23"
+
+# [dependencies]
+# tokio-macros = "2.6.0"
+# pasts = "0.8"
+# stick = "0.13.0"
+# futures-lite = "2.6.1"
+# bimap = "0.6.3"
+# btleplug = "0.11.8"
+# futures-util = "0.3.31"
