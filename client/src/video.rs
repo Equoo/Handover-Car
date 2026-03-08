@@ -1,24 +1,24 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
-use std::process::ExitCode;
-use std::sync::Arc;
-use std::{env, thread};
-use std::str::FromStr;
-use gstreamer::{ClockTime, Message, MessageView, Registry};
+use anyhow::{Context, Result, bail};
+use gstreamer as gst;
 use gstreamer::glib::object::{Cast, ObjectExt};
 use gstreamer::{Buffer, prelude::*};
-use gstreamer as gst;
+use gstreamer::{ClockTime, Message, MessageView, Registry};
 use gstreamer_app as gst_app;
-use gtk::{Label, Box as GtkBox, Orientation, Overlay, Window, prelude::*};
 use gtk::{Application, ApplicationWindow};
-use anyhow::{Context, Result, bail};
+use gtk::{Box as GtkBox, Label, Orientation, Overlay, Window, prelude::*};
 use parking_lot::Mutex;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::process::ExitCode;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::{env, thread};
 use tokio::io::Join;
 use tokio::join;
 use tokio::net::UdpSocket;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
-use tracing::{error, info, warn};
 use tracing::level_filters::LevelFilter;
+use tracing::{error, info, warn};
 
 use crate::app::AppState;
 
@@ -50,12 +50,13 @@ fn choose_h264_decoder() -> &'static str {
 }
 
 // for NVDEC: need 4:2:0, not 4:4:4
-pub fn build_video(sink: &gst::Element, state: Arc<AppState>) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
+pub fn build_video(
+    sink: &gst::Element,
+    state: Arc<AppState>,
+) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
     let pipeline = gst::Pipeline::new();
 
-    let appsrc = gst::ElementFactory::make("appsrc")
-        .name("source")
-        .build()?;
+    let appsrc = gst::ElementFactory::make("appsrc").name("source").build()?;
 
     // RTP caps directly on udpsrc
     let caps = gst::Caps::builder("application/x-rtp")
@@ -68,32 +69,34 @@ pub fn build_video(sink: &gst::Element, state: Arc<AppState>) -> Result<(gst::Pi
     appsrc.set_property("caps", &caps);
     appsrc.set_property("is-live", true);
     appsrc.set_property("format", gst::Format::Time);
-    appsrc.set_property("do-timestamp", false);
+    appsrc.set_property("do-timestamp", false); // may go to true
 
-    let queue = gst::ElementFactory::make("queue").build()?;
-    queue.set_property("max-size-buffers", 10u32);
-    queue.set_property("max-size-time", 0u64);
-    queue.set_property("max-size-bytes", 0u32);
-    queue.set_property_from_str("leaky", "downstream");
+    // let queue = gst::ElementFactory::make("queue").build()?;
+    // queue.set_property("max-size-buffers", 14u32);
+    // queue.set_property("max-size-time", 0u64);
+    // queue.set_property("max-size-bytes", 0u32);
+    // queue.set_property_from_str("leaky", "downstream");
 
     let jitter = gst::ElementFactory::make("rtpjitterbuffer").build()?;
-    jitter.set_property("latency", 0u32);
+    jitter.set_property("latency", 80u32);
     jitter.set_property("drop-on-latency", true);
-    // jitter.set_property("latency", 20u32);
-    // jitter.set_property("drop-on-latency", false);
+    jitter.set_property("do-lost", true);
+    jitter.set_property("do-retransmission", true);
 
-    let depay  = gst::ElementFactory::make("rtph264depay").build()?;
-    let parse  = gst::ElementFactory::make("h264parse").build()?;
+    let depay = gst::ElementFactory::make("rtph264depay").build()?;
+    let parse = gst::ElementFactory::make("h264parse").build()?;
     parse.set_property_from_str("config-interval", "-1");
-    // parse.set_property_from_str("parse-only", "true"); // non existing ?
+    parse.set_property_from_str("update-timecode", "false"); // NOTE: may is wrong
 
     let decoder = choose_h264_decoder();
-    let dec = gst::ElementFactory::make(decoder)
-        .build()?;
-    // dec.set_property_from_str("low-latency", "true"); // AVDEC_H264 ONLY ? // DO NOT EXIST ?
-    // dec.set_property_from_str("skip-frame", "nonref"); // AVDEC_H264 ONLY  // TOO
+    let dec = gst::ElementFactory::make(decoder).build()?;
+    if decoder == "avdec_h264" {
+        dec.set_property_from_str("lowres", "0");
+    } else if decoder == "nvh264dec" {
+        dec.set_property("cuda-device-id", 0u32);
+    }
 
-    let conv   = gst::ElementFactory::make("videoconvert").build()?;
+    let conv = gst::ElementFactory::make("videoconvert").build()?;
     let caps_filter = gst::ElementFactory::make("capsfilter").build()?;
     caps_filter.set_property(
         "caps",
@@ -102,27 +105,47 @@ pub fn build_video(sink: &gst::Element, state: Arc<AppState>) -> Result<(gst::Pi
             .build(),
     );
 
-    pipeline.add_many([&appsrc, &queue, &jitter, &depay, &parse, &dec, &conv, &caps_filter, sink])?;
-    gst::Element::link_many([&appsrc, &queue, &jitter, &depay, &parse, &dec, &conv, &caps_filter, sink])?;
+    pipeline.add_many([
+        &appsrc,
+        &jitter,
+        &depay,
+        &parse,
+        &dec,
+        &conv,
+        &caps_filter,
+        sink,
+    ])?;
+    gst::Element::link_many([
+        &appsrc,
+        &jitter,
+        &depay,
+        &parse,
+        &dec,
+        &conv,
+        &caps_filter,
+        sink,
+    ])?;
 
     let entry_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
     let entry_clone = entry_time.clone();
-    dec.static_pad("sink").unwrap()
-    .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-        *entry_clone.lock() = Some(Instant::now());
-        gst::PadProbeReturn::Ok
-    });
+    dec.static_pad("sink")
+        .unwrap()
+        .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            *entry_clone.lock() = Some(Instant::now());
+            gst::PadProbeReturn::Ok
+        });
 
-    dec.static_pad("src").unwrap()
-    .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-        if let Some(t) = *entry_time.lock() {
-            *state.decode_latency.lock() = t.elapsed().as_secs_f64() * 1000f64;
-        }
-        gst::PadProbeReturn::Ok
-    });
+    dec.static_pad("src")
+        .unwrap()
+        .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            if let Some(t) = *entry_time.lock() {
+                *state.decode_latency.lock() = t.elapsed().as_secs_f64() * 1000f64;
+            }
+            gst::PadProbeReturn::Ok
+        });
 
     match appsrc.dynamic_cast::<gst_app::AppSrc>() {
         Ok(appsrc_casted) => Ok((pipeline, appsrc_casted)),
-        Err(_) => anyhow::bail!("Dynamic cast of appsrc failed")
+        Err(_) => anyhow::bail!("Dynamic cast of appsrc failed"),
     }
 }

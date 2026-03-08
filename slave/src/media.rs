@@ -34,12 +34,14 @@ impl Media {
                 "-t", "0",
                 "--codec", "h264",
                 "--inline",
-                "--level", "4",
-                "--intra", "30",
-                "--width", "853",
+                "--level", "4.1",
+                "--intra", "15",
+                "--width", "720",
                 "--height", "480",
                 "--framerate", "60",
-                "--bitrate", "2000000",
+                "--bitrate", "300000",
+                "--profile", "baseline",
+                "--intra-refresh-type", "cyclic",
                 "-o", "-", // stdout
             ])
             .stdout(Stdio::piped())
@@ -51,12 +53,13 @@ impl Media {
 
         // Spawn gst-launch-1.0
         let video = Command::new("gst-launch-1.0")
+            .arg("-q")
             .args([
                 "fdsrc",
                 "!",
                 "h264parse",
                 "!",
-                "rtph264pay", "config-interval=-1", "pt=96",
+                "rtph264pay", "config-interval=-1", "pt=96", "mtu=1200",
                 "!",
                 "udpsink", "host=37.59.106.4", &format!("port={port}"),
             ])
