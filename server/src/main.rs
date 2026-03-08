@@ -3,12 +3,12 @@ use std::{collections::HashMap, env, net::SocketAddr, str::FromStr, sync::Arc};
 use anyhow::{Context, Result, bail};
 
 use common::{ArchivedMessage, CommonError, Message, PacketType, Socket, SocketEvent};
-use rkyv::{api::low::deserialize, rancor::Error};
+use parking_lot::Mutex;
+use rkyv::{Archived, api::low::deserialize, rancor::Error};
+use tokio::sync::Mutex as AsyncMutex;
 use tokio::{net::UdpSocket, task::AbortHandle, time::Instant};
 use tracing::{debug, error, field::debug, info, level_filters::LevelFilter, warn};
 use uuid::Uuid;
-use parking_lot::Mutex;
-use tokio::sync::Mutex as AsyncMutex;
 
 const SLAVES_LIMIT: u8 = 16;
 const MAIN_PORT: u16 = 9500;
@@ -28,6 +28,7 @@ struct Slave {
 struct Client {
     uuid: Uuid,
     addr: SocketAddr,
+    subscribe: String,
 }
 
 struct AppState {
@@ -55,7 +56,8 @@ impl AppState {
 
     fn uniqueid(&self) -> u8 {
         let (i, _) = self
-            .usedids.lock()
+            .usedids
+            .lock()
             .iter()
             .enumerate()
             .find(|(_, x)| !**x)
@@ -64,18 +66,22 @@ impl AppState {
     }
 
     async fn new_pipesocket(self: Arc<AppState>, port: u16, id: String) -> Result<AbortHandle> {
+        debug!("New pipesocket on port {port} for {id}");
         Ok(tokio::spawn(async move {
             let socket = UdpSocket::bind(format!("0.0.0.0:{port}")).await.unwrap();
+            let mut last_addr: Option<SocketAddr> = None;
+
             loop {
                 let mut buf = [0; 1 << 18];
-                let size = socket.recv(&mut buf).await.unwrap();
+                let (size, addr) = socket.recv_from(&mut buf).await.unwrap();
 
-                if let Some(slave) = self.slaves.lock().await.get(&id) {
-                    if let Some(client) = self.clients.lock().await.get(&slave.subscriber) {
-                        socket.send_to(&buf[..size], client.addr).await.unwrap();
+                if size != 1 {
+                    if let Some(addr) = last_addr {
+                        socket.send_to(&buf[..size], addr).await.unwrap();
                     }
                 } else {
-                    // bail!("slave {id} doesn't exist");
+                    last_addr = Some(addr);
+                    debug!("Client from {addr} subscribe pipesocket {port} of {id}");
                 }
             }
         })
@@ -93,11 +99,10 @@ impl AppState {
         }
 
         let uniqueid = self.uniqueid();
-        let video_thread = self.clone().new_pipesocket(
-            VIDEO_PORT + uniqueid as u16,
-            id.clone(),
-        )
-        .await?;
+        let video_thread = self
+            .clone()
+            .new_pipesocket(VIDEO_PORT + uniqueid as u16, id.clone())
+            .await?;
 
         self.slaves.lock().await.insert(
             id.clone(),
@@ -111,15 +116,21 @@ impl AppState {
             },
         );
 
-        Ok((0, 0))
+        Ok((VIDEO_PORT + uniqueid as u16, AUDIO_PORT + uniqueid as u16))
     }
 
-    async fn handle_messages(self: &Arc<AppState>, addr: SocketAddr, msg: &ArchivedMessage) -> Result<()> {
+    async fn handle_messages(
+        self: &Arc<AppState>,
+        addr: SocketAddr,
+        msg: &ArchivedMessage,
+    ) -> Result<()> {
         match msg {
             ArchivedMessage::SlaveAnnounce { id, latency } => {
                 let id = id.as_str().to_string();
 
-                if self.slaves.lock().await.get(&id).is_none() {
+                if let Some(slave) = self.slaves.lock().await.get_mut(&id) {
+                    slave.latency = latency.into();
+                } else {
                     if *self.slaves_count.lock() == SLAVES_LIMIT {
                         self.socket.send(
                             &addr,
@@ -130,7 +141,10 @@ impl AppState {
                         )?;
                     }
 
-                    let (video_port, audio_port) = self.clone().new_slave(id.clone(), addr, latency.into()).await?;
+                    let (video_port, audio_port) = self
+                        .clone()
+                        .new_slave(id.clone(), addr, latency.into())
+                        .await?;
 
                     self.socket.send(
                         &addr,
@@ -144,17 +158,34 @@ impl AppState {
                     info!("Connection established with slave '{id}'");
                 }
 
-                self.socket.send(
-                    &addr,
-                    &Message::ServerPong,
-                    PacketType::Unreliable,
-                )?;
+                self.socket
+                    .send(&addr, &Message::ServerPong, PacketType::Unreliable)?;
             }
             ArchivedMessage::MasterSubscribe { slave_id } => {
                 let id = Uuid::from_u128_le(self.starttime.elapsed().as_millis());
-                self.clients.lock().await.insert(id, Client { uuid: id, addr });
+                let cl = Client {
+                    uuid: id,
+                    addr,
+                    subscribe: slave_id.to_string(),
+                };
+
+                debug!("Trying to subscribe to {slave_id}");
+
+                self.clients.lock().await.insert(id, cl);
                 if let Some(slave) = self.slaves.lock().await.get_mut(slave_id.as_ref()) {
                     slave.subscriber = id;
+
+                    self.socket.send(
+                        &addr,
+                        &Message::ServerClientConnected {
+                            uuid: id.to_string(),
+                            video_port: VIDEO_PORT + slave.uniqueid as u16,
+                            audio_port: AUDIO_PORT + slave.uniqueid as u16,
+                        },
+                        PacketType::Reliable,
+                    )?;
+
+                    info!("{addr} connected and suscribed to {slave_id}");
                 }
             }
             ArchivedMessage::MasterInput {
@@ -168,6 +199,19 @@ impl AppState {
                     self.socket.send(
                         &client.addr,
                         &deserialize::<Message, Error>(msg)?, // Note: This is really ugly
+                        PacketType::Unreliable,
+                    )?;
+                }
+            }
+            ArchivedMessage::MasterAnnounce { uuid } => {
+                if let Some(client) = self.clients.lock().await.get(&Uuid::from_str(uuid)?)
+                    && let Some(slave) = self.slaves.lock().await.get(&client.subscribe)
+                {
+                    self.socket.send(
+                        &addr,
+                        &Message::ServerClientPong {
+                            latency: slave.latency,
+                        },
                         PacketType::Unreliable,
                     )?;
                 }
@@ -224,7 +268,8 @@ async fn run() -> Result<()> {
     // });
 
     loop {
-        state.fetch_packets()
+        state
+            .fetch_packets()
             .await
             .context("packets fetching failed")?;
     }

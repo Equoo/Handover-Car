@@ -1,6 +1,6 @@
 use std::process::{Child, Command};
 use std::io::Result;
-use tracing::info;
+use tracing::{debug, info};
 
 pub struct Media {
     video: Child,
@@ -30,18 +30,32 @@ impl Media {
         // --profile baseline
         // --level 4
         // --intra 30
-        let video = Command::new("rpicam-vid")
+        // let video = Command::new("rpicam-vid")
+        //     .args([
+        //         "-t", "0",
+        //         "--codec", "h264",
+        //         "--inline",
+        //         "--width", "853",
+        //         "--height", "480",
+        //         "--framerate", "60",
+        //         "--bitrate", "2000000",
+        //         "-n", "-o", &format!("server:{port}")
+        //     ])
+        //     .spawn()?;
+
+        let video = Command::new("gst-launch-1.0")
             .args([
-                "-t", "0",
-                "--codec", "h264",
-                "--inline",
-                "--width", "853",
-                "--height", "480",
-                "--framerate", "60",
-                "--bitrate", "2000000",
-                "-n", "-o", &format!("server:{port}")
-            ])
-            .spawn()?;
+                "v4l2src", "device=/dev/video0",
+                "!", "image/jpeg,width=1280,height=720,framerate=60/1",
+                "!", "jpegparse",
+                "!", "avdec_mjpeg",
+                "!", "videoconvert",
+                "!", "x264enc", "tune=zerolatency", "bitrate=10000", "key-int-max=15", "speed-preset=ultrafast",
+                "!", "video/x-h264,profile=main",
+                "!", "h264parse",
+                "!", "rtph264pay", "config-interval=-1", "pt=96",
+                "!", "udpsink", "host=127.0.0.1", &format!("port={port}"),
+            ]).spawn()?;
         info!("Camera video started.");
         Ok(video)
     }

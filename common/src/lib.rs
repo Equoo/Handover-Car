@@ -9,6 +9,7 @@ pub mod asyncqueue;
 #[rkyv(compare(PartialEq), derive(Debug))]
 pub enum CommonError {
     SlaveLimit,
+    SlaveNotFound
 }
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
@@ -18,10 +19,18 @@ pub enum Message {
         video_port: u16,
         audio_port: u16,
     },
+    ServerClientConnected {
+        uuid: String,
+        video_port: u16,
+        audio_port: u16
+    },
     ServerError {
         err: CommonError,
     },
     ServerPong,
+    ServerClientPong {
+        latency: u16,
+    },
     SlaveAnnounce {
         id: String,
         latency: u16,
@@ -42,6 +51,9 @@ pub enum Message {
         slave_id: String,
         throttle: i16,
         steering: i16,
+    },
+    MasterAnnounce {
+        uuid: String,
     },
     Disconnect {}
 }
