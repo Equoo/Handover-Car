@@ -1,4 +1,4 @@
-use std::process::{Child, Command};
+use std::process::{Child, Command, Stdio};
 use std::io::Result;
 use tracing::{debug, info};
 
@@ -28,34 +28,54 @@ impl Media {
         //     -o udp://37.59.106.4:13001
 
         // --profile baseline
-        // --level 4
-        // --intra 30
-        // let video = Command::new("rpicam-vid")
-        //     .args([
-        //         "-t", "0",
-        //         "--codec", "h264",
-        //         "--inline",
-        //         "--width", "853",
-        //         "--height", "480",
-        //         "--framerate", "60",
-        //         "--bitrate", "2000000",
-        //         "-n", "-o", &format!("server:{port}")
-        //     ])
-        //     .spawn()?;
 
+        let mut rpicam = Command::new("rpicam-vid")
+            .args([
+                "-t", "0",
+                "--codec", "h264",
+                "--inline",
+                "--level", "4",
+                "--intra", "30",
+                "--width", "853",
+                "--height", "480",
+                "--framerate", "60",
+                "--bitrate", "2000000",
+                "-o", "-", // stdout
+            ])
+            .stdout(Stdio::piped())
+            .spawn()?;
+
+        // Get rpicam stdout
+        let rpicam_stdout = rpicam.stdout.take()
+            .expect("Failed to capture rpicam stdout");
+
+        // Spawn gst-launch-1.0
         let video = Command::new("gst-launch-1.0")
             .args([
-                "v4l2src", "device=/dev/video0",
-                "!", "image/jpeg,width=1280,height=720,framerate=60/1",
-                "!", "jpegparse",
-                "!", "avdec_mjpeg",
-                "!", "videoconvert",
-                "!", "x264enc", "tune=zerolatency", "bitrate=10000", "key-int-max=15", "speed-preset=ultrafast",
-                "!", "video/x-h264,profile=main",
-                "!", "h264parse",
-                "!", "rtph264pay", "config-interval=-1", "pt=96",
-                "!", "udpsink", "host=127.0.0.1", &format!("port={port}"),
-            ]).spawn()?;
+                "fdsrc",
+                "!",
+                "h264parse",
+                "!",
+                "rtph264pay", "config-interval=-1", "pt=96",
+                "!",
+                "udpsink", "host=37.59.106.4", &format!("port={port}"),
+            ])
+            .stdin(Stdio::from(rpicam_stdout))
+            .spawn()?;
+
+        // let video = Command::new("gst-launch-1.0")
+        //     .args([
+        //         "v4l2src", "device=/dev/video0",
+        //         "!", "image/jpeg,width=1280,height=720,framerate=60/1",
+        //         "!", "jpegparse",
+        //         "!", "avdec_mjpeg",
+        //         "!", "videoconvert",
+        //         "!", "x264enc", "tune=zerolatency", "bitrate=10000", "key-int-max=15", "speed-preset=ultrafast",
+        //         "!", "video/x-h264,profile=main",
+        //         "!", "h264parse",
+        //         "!", "rtph264pay", "config-interval=-1", "pt=96",
+        //         "!", "udpsink", "host=127.0.0.1", &format!("port={port}"),
+        //     ]).spawn()?;
         info!("Camera video started.");
         Ok(video)
     }
