@@ -39,8 +39,7 @@ impl Media {
                 "--width", "720",
                 "--height", "480",
                 "--framerate", "60",
-                "--bitrate", "500000",
-                "--profile", "baseline",
+                "--bitrate", "300000",
                 "-o", "-", // stdout
             ])
             .stdout(Stdio::piped())
