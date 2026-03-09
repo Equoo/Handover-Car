@@ -41,7 +41,6 @@ impl Media {
                 "--framerate", "60",
                 "--bitrate", "300000",
                 "--profile", "baseline",
-                "--intra-refresh-type", "cyclic",
                 "-o", "-", // stdout
             ])
             .stdout(Stdio::piped())
