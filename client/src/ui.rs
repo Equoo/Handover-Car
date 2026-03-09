@@ -64,8 +64,7 @@ pub fn build(app: &Application, state: Arc<AppState>) -> Result<()> {
         .build();
 
     let sink = gst::ElementFactory::make("gtk4paintablesink")
-        .build()
-        .unwrap();
+        .build()?;
     sink.set_property("sync", false);
     sink.set_property("async", false);
     sink.set_property("qos", true);

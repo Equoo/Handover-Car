@@ -17,3 +17,4 @@ gdk = { version = "0.9", package = "gdk4" }
 glib = "0.20"
 gstreamer = "0.23"
 gstreamer-app = "0.23"
+dotenv = "0.15.0"

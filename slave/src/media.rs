@@ -59,7 +59,7 @@ impl Media {
                 "!",
                 "rtph264pay", "config-interval=-1", "pt=96", "mtu=1200",
                 "!",
-                "udpsink", "host=82.67.99.87", &format!("port={port}"),
+                "udpsink", "host=37.59.106.4", &format!("port={port}"),
             ])
             .stdin(Stdio::from(rpicam_stdout))
             .spawn()?;

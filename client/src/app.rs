@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, bail};
 use common::{ArchivedMessage, Message, PacketType, Socket, SocketEvent};
+use dotenv::dotenv;
 use gstreamer as gst;
 use gstreamer::glib::object::{Cast, ObjectExt};
 use gstreamer::{Buffer, prelude::*};
@@ -21,7 +22,7 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-const SERVER: &str = "server:9500";
+const SERVER_PORT: u16 = 9500;
 const SLAVE: &str = "FlashMcqueen";
 
 pub struct AppState {
@@ -45,11 +46,13 @@ enum AppEvent {
 
 impl AppState {
     pub fn new() -> Result<Self> {
-        let mut server = SERVER
+        dotenv()?;
+        let server_str = format!("{}:{}", env::var("SERVER")?, SERVER_PORT);
+        let mut server = server_str
             .to_socket_addrs()
-            .with_context(|| format!("failed to resolve '{SERVER}'"))?
+            .with_context(|| format!("failed to resolve '{server_str}'"))?
             .next()
-            .with_context(|| format!("no addresses found for '{SERVER}'"))?;
+            .with_context(|| format!("no addresses found for '{server_str}'"))?;
         if server.ip().is_loopback() {
             server.set_ip(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)));
         }
