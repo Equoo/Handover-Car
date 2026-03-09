@@ -45,6 +45,7 @@ struct AppState {
     connected: Mutex<bool>,
     latency: Mutex<Duration>,
     last_ping: Mutex<Instant>,
+    announce_id: Mutex<u16>,
 }
 
 impl AppState {
@@ -73,6 +74,7 @@ impl AppState {
             connected: Mutex::new(false),
             latency: Mutex::new(Duration::from_secs(0)),
             last_ping: Mutex::new(Instant::now()),
+            announce_id: Mutex::new(0),
         })
     }
 
@@ -131,8 +133,11 @@ impl AppState {
                 //     bail!("Connection to server failed caused by '{what}'");
             }
 
-            ArchivedMessage::ServerPong => {
-                *self.latency.lock() = self.last_ping.lock().elapsed();
+            ArchivedMessage::ServerPong { packet_id } => {
+                let packet_id: u16 = packet_id.into();
+                if packet_id == *self.announce_id.lock() {
+                    *self.latency.lock() = self.last_ping.lock().elapsed();
+                }
             }
             _ => {}
         };
@@ -168,9 +173,12 @@ impl AppState {
     fn announce_loop(&self) -> Result<()> {
         loop {
             *self.last_ping.lock() = Instant::now();
+            *self.announce_id.lock() += 1;
+
             self.socket.send(&self.server, &Message::SlaveAnnounce {
                 id: self.id.clone(),
                 latency: self.latency.lock().as_millis() as u16,
+                packet_id: *self.announce_id.lock()
             }, PacketType::Unreliable)?;
 
             std::thread::sleep(Duration::from_millis(100));

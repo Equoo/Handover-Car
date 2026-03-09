@@ -20,7 +20,7 @@ use tokio::time::Instant;
 use tracing::level_filters::LevelFilter;
 use tracing::{error, info, warn};
 
-use crate::app::AppState;
+use crate::app::{AppState, ema_average};
 
 fn choose_h264_decoder() -> &'static str {
     let registry = Registry::get();
@@ -78,7 +78,7 @@ pub fn build_video(
     // queue.set_property_from_str("leaky", "downstream");
 
     let jitter = gst::ElementFactory::make("rtpjitterbuffer").build()?;
-    jitter.set_property("latency", 80u32);
+    jitter.set_property("latency", 10u32); // 80
     jitter.set_property("drop-on-latency", true);
     jitter.set_property("do-lost", true);
     jitter.set_property("do-retransmission", true);
@@ -137,7 +137,8 @@ pub fn build_video(
         .unwrap()
         .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
             if let Some(t) = *entry_time.lock() {
-                *state.decode_latency.lock() = t.elapsed().as_secs_f64() * 1000f64;
+                let mut decode_latency = state.decode_latency.lock();
+                *decode_latency = ema_average(*decode_latency, t.elapsed().as_secs_f64() * 1000f64);
             }
             gst::PadProbeReturn::Ok
         });

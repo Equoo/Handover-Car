@@ -7,12 +7,14 @@ use gstreamer::{Buffer, prelude::*};
 use gstreamer::{ClockTime, Registry};
 use gstreamer_app as gst_app;
 use gtk::{Application, ApplicationWindow};
+use num_traits::Float;
 use parking_lot::Mutex;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
+use std::ops::Mul;
 use std::process::ExitCode;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::{Duration};
+use std::time::Duration;
 use std::{env, thread};
 use tokio::io::Join;
 use tokio::join;
@@ -31,6 +33,7 @@ pub struct AppState {
     // tx: mpsc::Sender<AppEvent>,
     uuid: Mutex<Uuid>,
     last_ping: Mutex<Instant>,
+    announce_id: Mutex<u16>,
     pub appsrc: Mutex<Option<gst_app::AppSrc>>,
     pub decode_latency: Mutex<f64>,
     pub encode_latency: Mutex<f64>,
@@ -42,6 +45,11 @@ pub struct AppState {
 enum AppEvent {
     FrameStats { latency_ms: u64 },
     Error(String),
+}
+
+const ALPHA: f64 = 0.2;
+pub fn ema_average(average: f64, value: f64) -> f64 {
+    ALPHA * value + (1.0f64 - ALPHA) * average
 }
 
 impl AppState {
@@ -68,6 +76,7 @@ impl AppState {
             encode_latency: Mutex::new(0f64),
             slave_latency: Mutex::new(0),
             client_latency: Mutex::new(0),
+            announce_id: Mutex::new(0),
             fps: Mutex::new(0),
         })
     }
@@ -105,14 +114,16 @@ impl AppState {
     fn announce_loop(&self) -> Result<()> {
         loop {
             *self.last_ping.lock() = Instant::now();
+            *self.announce_id.lock() += 1;
+
             self.socket.send(
                 &self.server,
                 &Message::MasterAnnounce {
-                    uuid: self.uuid.lock().to_string()
+                    uuid: self.uuid.lock().to_string(),
+                    packet_id: *self.announce_id.lock()
                 },
                 PacketType::Unreliable,
             )?;
-
             std::thread::sleep(Duration::from_millis(100));
         }
     }
@@ -135,9 +146,18 @@ impl AppState {
                 let state_clone = self.clone();
                 let announce_thread = tokio::spawn(async move { state_clone.announce_loop() });
             }
-            ArchivedMessage::ServerClientPong { latency } => {
-                *self.slave_latency.lock() = latency.into();
-                *self.client_latency.lock() = self.last_ping.lock().elapsed().as_millis() as u16;
+            ArchivedMessage::ServerClientPong { latency, packet_id } => {
+                let latency: u16 = latency.into();
+                let mut slave_latency = self.slave_latency.lock();
+
+                *slave_latency = ema_average(*slave_latency as f64, latency as f64) as u16;
+
+                let packet_id: u16 = packet_id.into();
+                if packet_id == *self.announce_id.lock() {
+                    let mut client_latency = self.client_latency.lock();
+                    let cl_latency = self.last_ping.lock().elapsed().as_millis() as f64;
+                    *client_latency = ema_average(*client_latency as f64, cl_latency) as u16;
+                }
             }
             _ => {}
         };

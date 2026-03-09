@@ -27,13 +27,17 @@ pub enum Message {
     ServerError {
         err: CommonError,
     },
-    ServerPong,
+    ServerPong {
+        packet_id: u16,
+    },
     ServerClientPong {
         latency: u16,
+        packet_id: u16,
     },
     SlaveAnnounce {
         id: String,
         latency: u16,
+        packet_id: u16,
     },
     SlaveError {
         id: String,
@@ -54,6 +58,7 @@ pub enum Message {
     },
     MasterAnnounce {
         uuid: String,
+        packet_id: u16,
     },
     Disconnect {}
 }

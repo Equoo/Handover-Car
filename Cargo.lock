@@ -137,6 +137,7 @@ dependencies = [
  "gstreamer-app",
  "gstreamer-video",
  "gtk4",
+ "num-traits",
  "parking_lot",
  "tokio",
  "tracing",

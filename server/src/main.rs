@@ -125,7 +125,11 @@ impl AppState {
         msg: &ArchivedMessage,
     ) -> Result<()> {
         match msg {
-            ArchivedMessage::SlaveAnnounce { id, latency } => {
+            ArchivedMessage::SlaveAnnounce {
+                id,
+                latency,
+                packet_id,
+            } => {
                 let id = id.as_str().to_string();
 
                 if let Some(slave) = self.slaves.lock().await.get_mut(&id) {
@@ -158,8 +162,13 @@ impl AppState {
                     info!("Connection established with slave '{id}'");
                 }
 
-                self.socket
-                    .send(&addr, &Message::ServerPong, PacketType::Unreliable)?;
+                self.socket.send(
+                    &addr,
+                    &Message::ServerPong {
+                        packet_id: packet_id.into(),
+                    },
+                    PacketType::Unreliable,
+                )?;
             }
             ArchivedMessage::MasterSubscribe { slave_id } => {
                 let id = Uuid::from_u128_le(self.starttime.elapsed().as_millis());
@@ -203,7 +212,7 @@ impl AppState {
                     )?;
                 }
             }
-            ArchivedMessage::MasterAnnounce { uuid } => {
+            ArchivedMessage::MasterAnnounce { uuid, packet_id } => {
                 if let Some(client) = self.clients.lock().await.get(&Uuid::from_str(uuid)?)
                     && let Some(slave) = self.slaves.lock().await.get(&client.subscribe)
                 {
@@ -211,6 +220,7 @@ impl AppState {
                         &addr,
                         &Message::ServerClientPong {
                             latency: slave.latency,
+                            packet_id: packet_id.into()
                         },
                         PacketType::Unreliable,
                     )?;
