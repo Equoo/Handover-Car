@@ -31,7 +31,7 @@ use common::{ArchivedMessage, Message, Socket, SocketEvent};
 mod media;
 use crate::media::Media;
 
-const SERVER: &str = "server:9500";
+const SERVER: &str = "rcserver:9500";
 const SERIAL_PORT: &str = "/dev/ttyUSB0";
 const SERIAL_BAUD: u32 = 115200;
 

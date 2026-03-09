@@ -92,8 +92,6 @@ pub fn build_video(
     let dec = gst::ElementFactory::make(decoder).build()?;
     if decoder == "avdec_h264" {
         dec.set_property_from_str("lowres", "0");
-    } else if decoder == "nvh264dec" {
-        dec.set_property("cuda-device-id", 0u32);
     }
 
     let conv = gst::ElementFactory::make("videoconvert").build()?;
