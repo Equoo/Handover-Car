@@ -85,11 +85,20 @@ pub fn build_video(
     // queue.set_property("max-size-bytes", 0u32);
     // queue.set_property_from_str("leaky", "downstream");
 
+    let fecdec = gst::ElementFactory::make("rtpulpfecdec")
+    .build()?;
+    fecdec.set_property("pt", 122u32);
+
+    let storage = gst::ElementFactory::make("rtpstorage").build()?;
+    storage.set_property("size-time", 250_000_000u64);
+
     let jitter = gst::ElementFactory::make("rtpjitterbuffer").build()?;
     jitter.set_property("latency", 40u32);
     jitter.set_property("drop-on-latency", true);
     jitter.set_property("do-lost", true);
     jitter.set_property("do-retransmission", true);
+    let storage_val = storage.to_value();
+    jitter.set_property("rtp-storage", &storage_val);
 
     let depay = gst::ElementFactory::make("rtph264depay").build()?;
     let parse = gst::ElementFactory::make("h264parse").build()?;
@@ -113,7 +122,9 @@ pub fn build_video(
 
     pipeline.add_many([
         &appsrc,
+        &storage,
         &jitter,
+        &fecdec,
         &depay,
         &parse,
         &dec,
@@ -123,7 +134,9 @@ pub fn build_video(
     ])?;
     gst::Element::link_many([
         &appsrc,
+        &storage,
         &jitter,
+        &fecdec,
         &depay,
         &parse,
         &dec,
