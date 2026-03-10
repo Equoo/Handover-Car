@@ -63,8 +63,7 @@ pub fn build(app: &Application, state: Arc<AppState>) -> Result<()> {
         .default_height(720)
         .build();
 
-    let sink = gst::ElementFactory::make("gtk4paintablesink")
-        .build()?;
+    let sink = gst::ElementFactory::make("gtk4paintablesink").build()?;
     sink.set_property("sync", false);
     sink.set_property("async", false);
     sink.set_property("qos", true);
@@ -83,12 +82,14 @@ pub fn build(app: &Application, state: Arc<AppState>) -> Result<()> {
         let decode_label = Label::new(Some("Decode latency: --"));
         let client_label = Label::new(Some("client ping: --"));
         let slave_label = Label::new(Some("Slave ping: --"));
+        let loss_label = Label::new(Some(""));
         let bitrate_label = Label::new(Some("Bitrate: --"));
 
         stats_box.append(&fps_label);
         stats_box.append(&slave_label);
         stats_box.append(&client_label);
         stats_box.append(&decode_label);
+        stats_box.append(&loss_label);
         stats_box.append(&bitrate_label);
 
         let css_provider = gtk::CssProvider::new();
@@ -118,6 +119,7 @@ pub fn build(app: &Application, state: Arc<AppState>) -> Result<()> {
 
         let decode_clone = decode_label.clone();
         let slave_clone = slave_label.clone();
+        let loss_clone = loss_label.clone();
         let client_clone = client_label.clone();
         let state_clone = state.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
@@ -134,6 +136,15 @@ pub fn build(app: &Application, state: Arc<AppState>) -> Result<()> {
                 "Client ping: {}ms",
                 *state_clone.client_latency.lock()
             ));
+            {
+                let loss = state_clone.loss.lock();
+                loss_clone.set_text(&format!(
+                    "RTP loss: {}/{} ({:.1}%)",
+                    loss.num_lost,
+                    loss.num_lost + loss.num_pushed,
+                    loss.loss_pct
+                ));
+            }
             // bitrate_label_clone.set_text(&format!(
             //     "Bitrate: {:.1} Mbps",
             //     stats.bitrate as f64 / 1_000_000.0

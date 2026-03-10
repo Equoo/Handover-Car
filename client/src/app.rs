@@ -24,6 +24,8 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::video::PacketLoss;
+
 const SERVER_PORT: u16 = 9500;
 const SLAVE: &str = "FlashMcqueen";
 
@@ -40,6 +42,7 @@ pub struct AppState {
     pub slave_latency: Mutex<u16>,
     pub client_latency: Mutex<u16>,
     pub fps: Mutex<u8>,
+    pub loss: Mutex<PacketLoss>,
 }
 
 enum AppEvent {
@@ -78,6 +81,7 @@ impl AppState {
             client_latency: Mutex::new(0),
             announce_id: Mutex::new(0),
             fps: Mutex::new(0),
+            loss: Mutex::new(PacketLoss {num_lost: 0, num_pushed: 0, loss_pct: 0f64}),
         })
     }
 
@@ -91,7 +95,6 @@ impl AppState {
                 .unwrap();
 
             let mut buffer = [0u8; 1 << 18];
-
             loop {
                 if let Ok((size, _)) = socket.recv_from(&mut buffer).await {
                     let mut gst_buffer = gst::Buffer::with_size(size).unwrap();

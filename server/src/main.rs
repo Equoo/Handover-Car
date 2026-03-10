@@ -70,7 +70,6 @@ impl AppState {
         Ok(tokio::spawn(async move {
             let socket = UdpSocket::bind(format!("0.0.0.0:{port}")).await.unwrap();
             let mut last_addr: Option<SocketAddr> = None;
-
             loop {
                 let mut buf = [0; 1 << 18];
                 let (size, addr) = socket.recv_from(&mut buf).await.unwrap();
