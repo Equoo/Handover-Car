@@ -71,7 +71,7 @@ fn make_fec_decoder(rtpbin: &gst::Element, sess_id: u32) -> Result<gst::Element,
     let internal_storage = rtpbin.emit_by_name::<glib::Object>("get-internal-storage", &[&sess_id]);
     let fecdec = gst::ElementFactory::make("rtpulpfecdec")
         .property("storage", &internal_storage)
-        .property("pt", 100u32)
+        .property("pt", 122u32)
         .build()?;
 
     Ok(fecdec)
@@ -134,7 +134,10 @@ pub fn build_video(
         netsim.set_property("drop-probability", drop_probability);
 
     let rtpbin = gst::ElementFactory::make("rtpbin").build()?;
+        rtpbin.set_property("latency", 300u32);
+        rtpbin.set_property("drop-on-latency", true);
         rtpbin.set_property("do-lost", true);
+        rtpbin.set_property("do-retransmission", true);
 
     let depay = gst::ElementFactory::make("rtph264depay").build()?;
 
@@ -185,7 +188,7 @@ pub fn build_video(
         let storage = values[1]
             .get::<gst::Element>()
             .expect("rtpbin \"new-storage\" signal values[1]");
-        storage.set_property("size-time", 250_000_000u64);
+        storage.set_property("size-time", 200_000_000u64);
 
         None
     });
