@@ -119,6 +119,7 @@ pub fn build_video(
 ) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
     let drop_probability = 0.3f32;
     let caps = gst::Caps::builder("application/x-rtp")
+        .field("media", "video")
         .field("clock-rate", 90000i32)
         .build();
 
@@ -206,6 +207,7 @@ pub fn build_video(
                 gst::Caps::builder("application/x-rtp")
                     .field("media", "video")
                     .field("encoding-name", "H264")
+                    .field("clock-rate", 90000i32)
                     .field("payload", 96i32)
                     .build()
                     .to_value(),

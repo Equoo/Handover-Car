@@ -57,8 +57,8 @@ impl Media {
                 "!",
                 "h264parse",
                 "!",
-                "rtph264pay", "config-interval=-1", "pt=96", "mtu=1200",
-                "!", "rtpulpfecenc", "percentage=30", "clock-rate=90000", "pt=122", // Tune between 20-50
+                "rtph264pay", "config-interval=-1", "clock-rate=90000", "pt=96", "mtu=1200",
+                "!", "rtpulpfecenc", "percentage=30", "pt=122", // Tune between 20-50
                 "!",
                 "udpsink", "host=37.59.106.4", &format!("port={port}"),
             ])
