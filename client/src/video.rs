@@ -134,7 +134,7 @@ pub fn build_video(
         netsim.set_property("drop-probability", drop_probability);
 
     let rtpbin = gst::ElementFactory::make("rtpbin").build()?;
-        rtpbin.set_property("latency", 300u32);
+        rtpbin.set_property("latency", 40u32);
         rtpbin.set_property("drop-on-latency", true);
         rtpbin.set_property("do-lost", true);
         rtpbin.set_property("do-retransmission", true);
@@ -188,7 +188,7 @@ pub fn build_video(
         let storage = values[1]
             .get::<gst::Element>()
             .expect("rtpbin \"new-storage\" signal values[1]");
-        storage.set_property("size-time", 200_000_000u64);
+        storage.set_property("size-time", 100_000_000u64);
 
         None
     });
