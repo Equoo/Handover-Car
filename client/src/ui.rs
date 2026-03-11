@@ -14,9 +14,8 @@ use crate::video::build_video;
 fn window_run(win: &ApplicationWindow, sink: &gst::Element, state: Arc<AppState>) {
     let (pipeline, appsrc) = build_video(sink, state.clone()).unwrap();
 
-    pipeline.set_state(gst::State::Paused).unwrap();
-    *state.appsrc.lock() = Some(appsrc);
     pipeline.set_state(gst::State::Playing).unwrap();
+    *state.appsrc.lock() = Some(appsrc);
 
     let bus = pipeline.bus().unwrap();
     bus.add_watch(move |_, msg: &Message| {

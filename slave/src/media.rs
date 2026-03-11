@@ -22,12 +22,12 @@ impl Media {
                 "-t", "0",
                 "--codec", "h264",
                 "--inline",
-                "--level", "4",
+                "--level", "4.1",
                 "--intra", "10",
                 "--width", "720",
                 "--height", "480",
                 "--framerate", "60",
-                "--bitrate", "1000000",
+                "--bitrate", "500000",
                 "-o", "-", // stdout
             ])
             .stdout(Stdio::piped())

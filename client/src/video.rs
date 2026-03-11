@@ -62,7 +62,9 @@ pub fn build_video(
 ) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
     let caps = gst::Caps::builder("application/x-rtp")
         .field("media", "video")
+        .field("encoding-name", "H264")
         .field("clock-rate", 90000i32)
+        .field("payload", 96i32)
         .build();
 
     let pipeline = gst::Pipeline::default();
@@ -70,10 +72,10 @@ pub fn build_video(
         src.set_property("caps", &caps);
         src.set_property("is-live", true);
         src.set_property("format", gst::Format::Time);
-        src.set_property("do-timestamp", false); // true may needed but when true if receive packet before playing it warn
+        src.set_property("do-timestamp", true); // true may needed but when true if receive packet before playing it warn
 
     let jitter = gst::ElementFactory::make("rtpjitterbuffer").build()?;
-        jitter.set_property("latency", 150u32);
+        jitter.set_property("latency", 40u32);
         jitter.set_property("drop-on-latency", true);
         jitter.set_property("do-lost", true);
         jitter.set_property("do-retransmission", true);
