@@ -1,24 +1,11 @@
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
-use std::process::ExitCode;
-use std::str::FromStr;
 use std::sync::Arc;
-use std::{env, thread};
-
-use anyhow::{Context, Result, bail};
+use anyhow::{Result};
 use gstreamer as gst;
-use gstreamer::glib::object::{Cast, ObjectExt};
-use gstreamer::{Buffer, prelude::*};
-use gstreamer::{ClockTime, Message, MessageView, Registry};
-use gstreamer_app as gst_app;
+use gstreamer::glib::object::{ObjectExt};
+use gstreamer::{ prelude::*};
+use gstreamer::{Message, MessageView};
 use gtk::{Application, ApplicationWindow};
-use gtk::{Box as GtkBox, Label, Orientation, Overlay, Window, prelude::*};
-use parking_lot::Mutex;
-use tokio::io::Join;
-use tokio::join;
-use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
-use tokio::time::Instant;
-use tracing::level_filters::LevelFilter;
+use gtk::{Box as GtkBox, Label, Orientation, Overlay,prelude::*};
 use tracing::{error, info, warn};
 
 use crate::app::AppState;
@@ -26,8 +13,9 @@ use crate::video::build_video;
 
 fn window_run(win: &ApplicationWindow, sink: &gst::Element, state: Arc<AppState>) {
     let (pipeline, appsrc) = build_video(sink, state.clone()).unwrap();
-    *state.appsrc.lock() = Some(appsrc);
 
+    pipeline.set_state(gst::State::Paused).unwrap();
+    *state.appsrc.lock() = Some(appsrc);
     pipeline.set_state(gst::State::Playing).unwrap();
 
     let bus = pipeline.bus().unwrap();

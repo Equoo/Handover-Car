@@ -1,25 +1,81 @@
-use anyhow::{Context, Result, bail};
-use gstreamer as gst;
+use anyhow::{Error, Result};
+use gstreamer::{self as gst, element_error};
 use gstreamer::glib::object::{Cast, ObjectExt};
-use gstreamer::{Buffer, prelude::*};
-use gstreamer::{ClockTime, Message, MessageView, Registry};
+use gstreamer::{ prelude::*};
+use gstreamer::{Registry};
 use gstreamer_app as gst_app;
-use gtk::{Application, ApplicationWindow};
-use gtk::{Box as GtkBox, Label, Orientation, Overlay, Window, prelude::*};
 use parking_lot::Mutex;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
-use std::process::ExitCode;
-use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
-use std::{env, thread};
-use tokio::io::Join;
-use tokio::join;
-use tokio::net::UdpSocket;
-use tokio::sync::mpsc;
 use tokio::time::Instant;
-use tracing::level_filters::LevelFilter;
-use tracing::{error, info, warn};
+use tracing::{info, warn};
+
+use derive_more::derive::{Display, Error};
+
+#[derive(Debug, Display, Error)]
+#[display("No such pad {_0} in {_1}")]
+struct NoSuchPad(#[error(not(source))] &'static str, String);
+
+#[derive(Debug, Display, Error)]
+#[display("Unknown payload type {_0}")]
+struct UnknownPT(#[error(not(source))] u32);
+
+#[derive(Debug, Display, Error)]
+#[display("Usage: {_0} (play | record) DROP_PROBABILITY")]
+struct UsageError(#[error(not(source))] String);
+
+#[derive(Debug, Display, Error)]
+#[display("Received error from {src}: {error} (debug: {debug:?})")]
+struct ErrorMessage {
+    src: glib::GString,
+    error: glib::Error,
+    debug: Option<glib::GString>,
+}
+
+fn static_pad(element: &gst::Element, pad_name: &'static str) -> Result<gst::Pad, Error> {
+    match element.static_pad(pad_name) {
+        Some(pad) => Ok(pad),
+        None => {
+            let element_name = element.name();
+            Err(Error::from(NoSuchPad(pad_name, element_name.to_string())))
+        }
+    }
+}
+
+fn request_pad(element: &gst::Element, pad_name: &'static str) -> Result<gst::Pad, Error> {
+    match element.request_pad_simple(pad_name) {
+        Some(pad) => Ok(pad),
+        None => {
+            let element_name = element.name();
+            Err(Error::from(NoSuchPad(pad_name, element_name.to_string())))
+        }
+    }
+}
+
+fn connect_rtpbin_srcpad(src_pad: &gst::Pad, sink: &gst::Element) -> Result<(), Error> {
+    let name = src_pad.name();
+    let split_name = name.split('_');
+    let split_name = split_name.collect::<Vec<&str>>();
+    let pt = split_name[5].parse::<u32>()?;
+
+    match pt {
+        96 => {
+            let sinkpad = static_pad(sink, "sink")?;
+            src_pad.link(&sinkpad)?;
+            Ok(())
+        }
+        _ => Err(Error::from(UnknownPT(pt))),
+    }
+}
+
+fn make_fec_decoder(rtpbin: &gst::Element, sess_id: u32) -> Result<gst::Element, Error> {
+    let internal_storage = rtpbin.emit_by_name::<glib::Object>("get-internal-storage", &[&sess_id]);
+    let fecdec = gst::ElementFactory::make("rtpulpfecdec")
+        .property("storage", &internal_storage)
+        .property("pt", 100u32)
+        .build()?;
+
+    Ok(fecdec)
+}
 
 use crate::app::{AppState, ema_average};
 
@@ -61,49 +117,29 @@ pub fn build_video(
     sink: &gst::Element,
     state: Arc<AppState>,
 ) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
-    let pipeline = gst::Pipeline::new();
-
-    let appsrc = gst::ElementFactory::make("appsrc").name("source").build()?;
-
-    // RTP caps directly on udpsrc
+    let drop_probability = 0.3f32;
     let caps = gst::Caps::builder("application/x-rtp")
-        .field("media", "video")
-        .field("encoding-name", "H264")
-        .field("payload", 96i32)
         .field("clock-rate", 90000i32)
-        .field("seqnum-base", 0i32)
         .build();
 
-    appsrc.set_property("caps", &caps);
-    appsrc.set_property("is-live", true);
-    appsrc.set_property("format", gst::Format::Time);
-    appsrc.set_property("do-timestamp", true); // may go to true
+    let pipeline = gst::Pipeline::default();
+    let src = gst::ElementFactory::make("appsrc").name("source").build()?;
+        src.set_property("caps", &caps);
+        src.set_property("is-live", true);
+        src.set_property("format", gst::Format::Time);
+        src.set_property("do-timestamp", false); // true may needed but when true if receive packet before playing it warn
 
-    // let queue = gst::ElementFactory::make("queue").build()?;
-    // queue.set_property("max-size-buffers", 14u32);
-    // queue.set_property("max-size-time", 0u64);
-    // queue.set_property("max-size-bytes", 0u32);
-    // queue.set_property_from_str("leaky", "downstream");
+    let netsim = gst::ElementFactory::make("netsim").build()?;
+        netsim.set_property("drop-probability", drop_probability);
 
-    let fecdec = gst::ElementFactory::make("rtpulpfecdec")
-    .build()?;
-    fecdec.set_property("pt", 122u32);
-
-    let storage = gst::ElementFactory::make("rtpstorage").build()?;
-    storage.set_property("size-time", 250_000_000u64);
-
-    let jitter = gst::ElementFactory::make("rtpjitterbuffer").build()?;
-    jitter.set_property("latency", 40u32);
-    jitter.set_property("drop-on-latency", true);
-    jitter.set_property("do-lost", true);
-    jitter.set_property("do-retransmission", true);
-    let storage_val = storage.to_value();
-    jitter.set_property("rtp-storage", &storage_val);
+    let rtpbin = gst::ElementFactory::make("rtpbin").build()?;
+        rtpbin.set_property("do-lost", true);
 
     let depay = gst::ElementFactory::make("rtph264depay").build()?;
+
     let parse = gst::ElementFactory::make("h264parse").build()?;
-    parse.set_property_from_str("config-interval", "-1");
-    parse.set_property_from_str("update-timecode", "false"); // NOTE: may is wrong
+        parse.set_property_from_str("config-interval", "-1");
+        parse.set_property_from_str("update-timecode", "false"); // NOTE: may is wrong
 
     let decoder = choose_h264_decoder();
     let dec = gst::ElementFactory::make(decoder).build()?;
@@ -112,19 +148,19 @@ pub fn build_video(
     }
 
     let conv = gst::ElementFactory::make("videoconvert").build()?;
+
     let caps_filter = gst::ElementFactory::make("capsfilter").build()?;
-    caps_filter.set_property(
-        "caps",
-        gst::Caps::builder("video/x-raw")
-            .field("format", "BGRx")
-            .build(),
-    );
+        caps_filter.set_property(
+            "caps",
+            gst::Caps::builder("video/x-raw")
+                .field("format", "BGRx")
+                .build(),
+        );
 
     pipeline.add_many([
-        &appsrc,
-        &storage,
-        &jitter,
-        &fecdec,
+        &src,
+        &netsim,
+        &rtpbin,
         &depay,
         &parse,
         &dec,
@@ -132,11 +168,8 @@ pub fn build_video(
         &caps_filter,
         sink,
     ])?;
+
     gst::Element::link_many([
-        &appsrc,
-        &storage,
-        &jitter,
-        &fecdec,
         &depay,
         &parse,
         &dec,
@@ -144,6 +177,91 @@ pub fn build_video(
         &caps_filter,
         sink,
     ])?;
+
+    src.link(&netsim)?;
+
+    rtpbin.connect("new-storage", false, |values| {
+        let storage = values[1]
+            .get::<gst::Element>()
+            .expect("rtpbin \"new-storage\" signal values[1]");
+        storage.set_property("size-time", 250_000_000u64);
+
+        None
+    });
+
+    rtpbin.connect("request-pt-map", false, |values| {
+        let pt = values[2]
+            .get::<u32>()
+            .expect("rtpbin \"new-storage\" signal values[2]");
+        match pt {
+            122 => Some(
+                gst::Caps::builder("application/x-rtp")
+                    .field("media", "video")
+                    .field("clock-rate", 90000i32)
+                    .field("is-fec", true)
+                    .build()
+                    .to_value(),
+            ),
+            96 => Some(
+                gst::Caps::builder("application/x-rtp")
+                    .field("media", "video")
+                    .field("encoding-name", "H264")
+                    .field("payload", 96i32)
+                    .build()
+                    .to_value(),
+            ),
+            _ => None,
+        }
+    });
+
+    rtpbin.connect("request-fec-decoder", false, |values| {
+        let rtpbin = values[0]
+            .get::<gst::Element>()
+            .expect("rtpbin \"request-fec-decoder\" signal values[0]");
+        let sess_id = values[1]
+            .get::<u32>()
+            .expect("rtpbin \"request-fec-decoder\" signal values[1]");
+
+        match make_fec_decoder(&rtpbin, sess_id) {
+            Ok(elem) => Some(elem.to_value()),
+            Err(err) => {
+                element_error!(
+                    rtpbin,
+                    gst::LibraryError::Failed,
+                    ("Failed to make FEC decoder"),
+                    ["{}", err]
+                );
+                None
+            }
+        }
+    });
+
+    let srcpad = static_pad(&netsim, "src")?;
+    let sinkpad = request_pad(&rtpbin, "recv_rtp_sink_0")?;
+    srcpad.link(&sinkpad)?;
+
+    let depay_weak = depay.downgrade();
+    rtpbin.connect_pad_added(move |rtpbin, src_pad| {
+        let Some(depay) = depay_weak.upgrade() else {
+            return;
+        };
+
+        match connect_rtpbin_srcpad(src_pad, &depay) {
+            Ok(_) => (),
+            Err(err) => {
+                element_error!(
+                    rtpbin,
+                    gst::LibraryError::Failed,
+                    ("Failed to link srcpad"),
+                    ["{}", err]
+                );
+            }
+        }
+    });
+
+
+
+
 
     let entry_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
     let entry_clone = entry_time.clone();
@@ -165,28 +283,28 @@ pub fn build_video(
             gst::PadProbeReturn::Ok
         });
 
-    let jitter_clone = jitter.clone();
-    let state_clone = state.clone();
-    tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
-            let stats = jitter_clone.property::<gst::Structure>("stats");
-            // Fields: num-pushed, num-lost, num-late, num-duplicates, rtx-count...
-            let num_lost = stats.get::<u64>("num-lost").unwrap_or(0);
-            let num_pushed = stats.get::<u64>("num-pushed").unwrap_or(0);
-            let loss_pct = if num_pushed > 0 {
-                num_lost as f64 / (num_lost + num_pushed) as f64 * 100.0
-            } else {
-                0.0
-            };
-            let mut loss = state_clone.loss.lock();
-            loss.num_lost = num_lost;
-            loss.num_pushed = num_pushed;
-            loss.loss_pct = loss_pct;
-        }
-    });
+    // let jitter_clone = jitter.clone();
+    // let state_clone = state.clone();
+    // tokio::spawn(async move {
+    //     loop {
+    //         tokio::time::sleep(Duration::from_secs(2)).await;
+    //         let stats = jitter_clone.property::<gst::Structure>("stats");
+    //         // Fields: num-pushed, num-lost, num-late, num-duplicates, rtx-count...
+    //         let num_lost = stats.get::<u64>("num-lost").unwrap_or(0);
+    //         let num_pushed = stats.get::<u64>("num-pushed").unwrap_or(0);
+    //         let loss_pct = if num_pushed > 0 {
+    //             num_lost as f64 / (num_lost + num_pushed) as f64 * 100.0
+    //         } else {
+    //             0.0
+    //         };
+    //         let mut loss = state_clone.loss.lock();
+    //         loss.num_lost = num_lost;
+    //         loss.num_pushed = num_pushed;
+    //         loss.loss_pct = loss_pct;
+    //     }
+    // });
 
-    match appsrc.dynamic_cast::<gst_app::AppSrc>() {
+    match src.dynamic_cast::<gst_app::AppSrc>() {
         Ok(appsrc_casted) => Ok((pipeline, appsrc_casted)),
         Err(_) => anyhow::bail!("Dynamic cast of appsrc failed"),
     }
