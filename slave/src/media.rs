@@ -15,19 +15,7 @@ impl Media {
     }
 
     fn start_video(port: u16) -> Result<Child> {
-        // rpicam-vid -t 0 \
-        //     --flush \
-        //     --codec h264 \
-        //     --inline \
-        //     --width 853 \
-        //     --height 480 \
-        //     --framerate 60 \
-        //     --bitrate 2000000 \
-        //     --intra 60 \
-        //     -n \
-        //     -o udp://37.59.106.4:13001
-
-        // --profile baseline
+        // --profile baseline // but make freeze pipeline ?
 
         let mut rpicam = Command::new("rpicam-vid")
             .args([
@@ -35,7 +23,7 @@ impl Media {
                 "--codec", "h264",
                 "--inline",
                 "--level", "4",
-                "--intra", "15",
+                "--intra", "10",
                 "--width", "720",
                 "--height", "480",
                 "--framerate", "60",
@@ -54,30 +42,13 @@ impl Media {
             .arg("-q")
             .args([
                 "fdsrc",
-                "!",
-                "h264parse",
-                "!",
-                "rtph264pay", "config-interval=-1", "pt=96", "mtu=1200",
-                "!", "rtpulpfecenc", "percentage=30", "pt=122", // Tune between 20-50
-                "!",
-                "udpsink", "host=37.59.106.4", &format!("port={port}"),
+                "!", "h264parse",
+                "!", "rtph264pay", "config-interval=-1", "pt=96", "mtu=1200",
+                "!", "udpsink", "host=37.59.106.4", &format!("port={port}"),
             ])
             .stdin(Stdio::from(rpicam_stdout))
             .spawn()?;
 
-        // let video = Command::new("gst-launch-1.0")
-        //     .args([
-        //         "v4l2src", "device=/dev/video0",
-        //         "!", "image/jpeg,width=1280,height=720,framerate=60/1",
-        //         "!", "jpegparse",
-        //         "!", "avdec_mjpeg",
-        //         "!", "videoconvert",
-        //         "!", "x264enc", "tune=zerolatency", "bitrate=10000", "key-int-max=15", "speed-preset=ultrafast",
-        //         "!", "video/x-h264,profile=main",
-        //         "!", "h264parse",
-        //         "!", "rtph264pay", "config-interval=-1", "pt=96",
-        //         "!", "udpsink", "host=127.0.0.1", &format!("port={port}"),
-        //     ]).spawn()?;
         info!("Camera video started.");
         Ok(video)
     }
