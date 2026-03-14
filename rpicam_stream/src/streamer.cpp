@@ -70,8 +70,6 @@ static GstElement *g_appsrc   = nullptr;
 static GstElement *g_fecenc   = nullptr;
 static Camera     *s_cam      = nullptr;
 
-static std::atomic<V4L2H264Encoder*> g_encoder_ptr{nullptr};
-
 // ─── V4L2 H264 Encoder (mirrors rpicam-apps H264Encoder) ─────────────────────
 //
 // Talks directly to /dev/video11 (bcm2835-codec-encode).
@@ -408,6 +406,9 @@ private:
         }
     }
 };
+
+
+static std::atomic<V4L2H264Encoder*> g_encoder_ptr{nullptr};
 
 // ─── Frame queue: libcamera → encoder ────────────────────────────────────────
 
