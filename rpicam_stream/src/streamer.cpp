@@ -27,11 +27,12 @@
 
 #include <libcamera/libcamera.h>
 
-#include <sys/mman.h>   // mmap, munmap, PROT_READ, MAP_SHARED, MAP_FAILED
-#include <sys/ioctl.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <linux/videodev2.h>
+#include <sys/mman.h>    // mmap, munmap
+#include <sys/ioctl.h>   // ioctl
+#include <sys/stat.h>    // mkfifo
+#include <fcntl.h>       // open, O_RDONLY
+#include <unistd.h>      // read, close, unlink
+#include <linux/videodev2.h>  // V4L2_CID_MPEG_VIDEO_BITRATE etc.
 
 #include <atomic>
 #include <chrono>
@@ -44,12 +45,14 @@
 #include <string>
 #include <thread>
 #include <condition_variable>
+#include <unordered_map>
 
 using namespace libcamera;
 
-// ─── Latency tracking ────────────────────────────────────────────────────────
+// Forward declaration — defined after global state
+static void apply_bitrate(uint32_t bps);
 
-#include <unordered_map>
+// ─── Latency tracking ────────────────────────────────────────────────────────
 
 static std::mutex                              g_latency_mutex;
 static std::unordered_map<guint64, std::chrono::steady_clock::time_point> g_frame_entry;
@@ -85,6 +88,7 @@ static GstElement *g_appsrc    = nullptr;
 static GstElement *g_encoder   = nullptr;  // v4l2h264enc or x264enc
 static GstElement *g_fecenc    = nullptr;
 static Camera     *s_cam       = nullptr;
+static int         g_v4l2_enc_fd = -1;     // /dev/video11 for direct bitrate ioctl
 
 // ─── Signal handler ──────────────────────────────────────────────────────────
 
@@ -95,90 +99,22 @@ static void on_signal(int) {
         gst_element_send_event(g_pipeline, gst_event_new_eos());
 }
 
-// ─── Bitrate control ─────────────────────────────────────────────────────────
-//
-// Two methods:
-//   1. FIFO (recommended): echo 500000 > /tmp/streamer_ctrl
-//   2. stdin: echo 500000  (only works if streamer started interactively)
-
-static constexpr const char *CTRL_FIFO = "/tmp/streamer_ctrl";
-
-static void stdin_reader_thread() {
-    std::string line;
-    while (g_running && std::getline(std::cin, line)) {
-        if (line.empty()) continue;
-        try {
-            uint32_t bps = std::clamp(
-                (uint32_t)std::stoul(line), 100'000u, 8'000'000u);
-            g_bitrate.store(bps);
-            g_bitrate_changed.store(true);
-            apply_bitrate(bps);
-            std::cerr << "[ABR] stdin: " << bps/1000 << " kbps\n";
-        } catch (...) {
-            std::cerr << "[ABR] Invalid value: " << line << "\n";
-        }
-    }
-    std::cerr << "[ABR] stdin closed\n";
-    // Do NOT set g_running=false — stream keeps going
-}
-
-static void fifo_reader_thread() {
-    unlink(CTRL_FIFO);
-    if (mkfifo(CTRL_FIFO, 0666) < 0) {
-        std::cerr << "[ABR] mkfifo failed: " << strerror(errno) << "\n";
-        return;
-    }
-    std::cerr << "[ABR] Ready: echo <bps> > " << CTRL_FIFO << "\n";
-
-    while (g_running) {
-        // Opens block until a writer appears — that's fine
-        int fd = open(CTRL_FIFO, O_RDONLY);
-        if (fd < 0) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
-            continue;
-        }
-        char buf[64];
-        ssize_t n = read(fd, buf, sizeof(buf) - 1);
-        close(fd);
-        if (n <= 0) continue;
-        buf[n] = '\0';
-        std::string s(buf);
-        s.erase(s.find_last_not_of(" \t\r\n") + 1);
-        if (s.empty()) continue;
-        try {
-            uint32_t bps = std::clamp(
-                (uint32_t)std::stoul(s), 100'000u, 8'000'000u);
-            g_bitrate.store(bps);
-            g_bitrate_changed.store(true);
-            apply_bitrate(bps); // immediate — don't wait for next frame
-            std::cerr << "[ABR] FIFO: " << bps/1000 << " kbps\n";
-        } catch (...) {
-            std::cerr << "[ABR] Invalid value: " << s << "\n";
-        }
-    }
-    unlink(CTRL_FIFO);
-}
-
 // ─── Apply bitrate to encoder ────────────────────────────────────────────────
 
-// V4L2 encoder device fd — set once encoder is running so we can change
-// bitrate mid-stream via VIDIOC_S_CTRL directly (extra-controls only works at start)
-static int g_v4l2_enc_fd = -1;
-
 static void apply_bitrate(uint32_t bps) {
-    // Method 1: direct V4L2 ioctl — works mid-stream on /dev/video11
+    // Method 1: direct V4L2 ioctl on /dev/video11 — works mid-stream
     if (g_v4l2_enc_fd >= 0) {
         v4l2_control ctrl{};
         ctrl.id    = V4L2_CID_MPEG_VIDEO_BITRATE;
         ctrl.value = (int32_t)bps;
         if (ioctl(g_v4l2_enc_fd, VIDIOC_S_CTRL, &ctrl) == 0) {
-            std::cerr << "[ENC] Bitrate set to " << bps/1000 << " kbps via V4L2\n";
+            std::cerr << "[ENC] Bitrate → " << bps/1000 << " kbps (V4L2 ioctl)\n";
             return;
         }
-        std::cerr << "[ENC] V4L2 bitrate ioctl failed: " << strerror(errno) << "\n";
+        std::cerr << "[ENC] V4L2 ioctl failed: " << strerror(errno) << "\n";
     }
 
-    // Method 2: GStreamer extra-controls fallback (less reliable mid-stream)
+    // Method 2: GStreamer property fallback
     if (!g_encoder) return;
     gchar *name = gst_element_get_name(g_encoder);
     std::string enc_name(name);
@@ -192,9 +128,68 @@ static void apply_bitrate(uint32_t bps) {
         );
         g_object_set(G_OBJECT(g_encoder), "extra-controls", ctrls, nullptr);
         gst_structure_free(ctrls);
+        std::cerr << "[ENC] Bitrate → " << bps/1000 << " kbps (extra-controls)\n";
     } else {
         g_object_set(G_OBJECT(g_encoder), "bitrate", bps / 1000, nullptr);
+        std::cerr << "[ENC] Bitrate → " << bps/1000 << " kbps (x264enc)\n";
     }
+}
+
+// ─── Bitrate control threads ─────────────────────────────────────────────────
+
+static constexpr const char *CTRL_FIFO = "/tmp/streamer_ctrl";
+
+static void stdin_reader_thread() {
+    std::string line;
+    while (g_running && std::getline(std::cin, line)) {
+        if (line.empty()) continue;
+        try {
+            uint32_t bps = std::clamp(
+                (uint32_t)std::stoul(line), 100'000u, 8'000'000u);
+            g_bitrate.store(bps);
+            g_bitrate_changed.store(true);
+            apply_bitrate(bps);
+        } catch (...) {
+            std::cerr << "[ABR] Invalid stdin value: " << line << "\n";
+        }
+    }
+    // EOF on stdin does NOT stop the streamer
+    std::cerr << "[ABR] stdin closed\n";
+}
+
+static void fifo_reader_thread() {
+    unlink(CTRL_FIFO);
+    if (mkfifo(CTRL_FIFO, 0666) < 0) {
+        std::cerr << "[ABR] mkfifo failed: " << strerror(errno) << "\n";
+        return;
+    }
+    std::cerr << "[ABR] Ready: echo <bps> > " << CTRL_FIFO << "\n";
+
+    while (g_running) {
+        int fd = open(CTRL_FIFO, O_RDONLY);
+        if (fd < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        char buf[64]{};
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n <= 0) continue;
+
+        std::string s(buf);
+        s.erase(s.find_last_not_of(" \t\r\n") + 1);
+        if (s.empty()) continue;
+        try {
+            uint32_t bps = std::clamp(
+                (uint32_t)std::stoul(s), 100'000u, 8'000'000u);
+            g_bitrate.store(bps);
+            g_bitrate_changed.store(true);
+            apply_bitrate(bps);
+        } catch (...) {
+            std::cerr << "[ABR] Invalid FIFO value: " << s << "\n";
+        }
+    }
+    unlink(CTRL_FIFO);
 }
 
 // ─── GStreamer bus callback ───────────────────────────────────────────────────
@@ -682,11 +677,11 @@ int main(int argc, char *argv[]) {
         cam->queueRequest(req.get());
     }
 
-    // ── Open /dev/video11 directly for mid-stream bitrate control ────────
+    // ── Open /dev/video11 for direct mid-stream bitrate control ──────────
     g_v4l2_enc_fd = open("/dev/video11", O_RDWR | O_NONBLOCK);
     if (g_v4l2_enc_fd < 0)
-        std::cerr << "[ENC] Cannot open /dev/video11 for direct ioctl: "
-                  << strerror(errno) << " (falling back to GStreamer property)\n";
+        std::cerr << "[ENC] /dev/video11 not available for direct ioctl, "
+                     "will use GStreamer property fallback\n";
 
     // ── Threads ───────────────────────────────────────────────────────────
     std::thread push_thread(frame_push_thread);
@@ -724,8 +719,8 @@ int main(int argc, char *argv[]) {
     if (alloc) delete alloc;
 
     push_thread.join();
-    stdin_thread.detach(); // may block on getline forever
-    fifo_thread.detach();  // will unblock when FIFO is unlinked
+    stdin_thread.detach(); // may block forever on getline
+    fifo_thread.detach();  // unblocks when FIFO is unlinked on exit
     glib_thread.join();
 
     gst_element_set_state(g_pipeline, GST_STATE_NULL);
