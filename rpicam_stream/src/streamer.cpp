@@ -26,6 +26,7 @@
 
 #include <sys/mman.h>
 #include <sys/ioctl.h>
+#include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <linux/videodev2.h>
@@ -68,6 +69,8 @@ static GstElement *g_pipeline = nullptr;
 static GstElement *g_appsrc   = nullptr;
 static GstElement *g_fecenc   = nullptr;
 static Camera     *s_cam      = nullptr;
+
+static std::atomic<V4L2H264Encoder*> g_encoder_ptr{nullptr};
 
 // ─── V4L2 H264 Encoder (mirrors rpicam-apps H264Encoder) ─────────────────────
 //
@@ -188,6 +191,19 @@ public:
         return true;
     }
 
+    void set_bitrate(uint32_t bps) {
+        v4l2_control ctrl{};
+        ctrl.id    = V4L2_CID_MPEG_VIDEO_BITRATE;
+        ctrl.value = bps;
+        if (xioctl(fd_, VIDIOC_S_CTRL, &ctrl) < 0)
+            std::cerr << "[ENC] Failed to set bitrate to " << bps << "\n";
+
+        // Also set peak bitrate = 1.5x for VBR headroom
+        ctrl.id    = V4L2_CID_MPEG_VIDEO_BITRATE_PEAK;
+        ctrl.value = bps * 3 / 2;
+        xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
+    }
+
 private:
     struct Buffer { void *mem; size_t size; };
 
@@ -243,19 +259,6 @@ private:
         fmt.fmt.pix_mp.plane_fmt[0].sizeimage = 512 * 1024;
         if (xioctl(fd_, VIDIOC_S_FMT, &fmt) < 0)
             throw std::runtime_error("S_FMT output failed");
-    }
-
-    void set_bitrate(uint32_t bps) {
-        v4l2_control ctrl{};
-        ctrl.id    = V4L2_CID_MPEG_VIDEO_BITRATE;
-        ctrl.value = bps;
-        if (xioctl(fd_, VIDIOC_S_CTRL, &ctrl) < 0)
-            std::cerr << "[ENC] Failed to set bitrate to " << bps << "\n";
-
-        // Also set peak bitrate = 1.5x for VBR headroom
-        ctrl.id    = V4L2_CID_MPEG_VIDEO_BITRATE_PEAK;
-        ctrl.value = bps * 3 / 2;
-        xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
     }
 
     void set_profile_level() {
@@ -432,6 +435,20 @@ static void on_signal(int) {
 }
 
 // ─── stdin bitrate reader ─────────────────────────────────────────────────────
+
+static void apply_bitrate(uint32_t bps) {
+    V4L2H264Encoder *enc = g_encoder_ptr.load();
+    if (!enc) {
+        // Encoder not running yet — store for when it starts
+        g_bitrate.store(bps);
+        g_bitrate_changed.store(true);
+        std::cerr << "[ABR] Queued bitrate change: " << bps/1000 << " kbps\n";
+        return;
+    }
+    enc->set_bitrate(bps);
+    g_bitrate.store(bps);
+    std::cerr << "[ABR] Bitrate → " << bps/1000 << " kbps\n";
+}
 
 static constexpr const char *CTRL_FIFO = "/tmp/streamer_ctrl";
 
@@ -689,6 +706,8 @@ static void encoder_thread(uint32_t width, uint32_t height,
     try {
         V4L2H264Encoder enc(width, height, fps, initial_bitrate, on_encoded);
         enc.start();
+
+		g_encoder_ptr.store(&enc);
 
         while (g_running) {
             Frame frame;
