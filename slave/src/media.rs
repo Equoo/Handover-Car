@@ -42,8 +42,11 @@ impl Media {
             .arg("-q")
             .args([
                 "fdsrc",
+                "!", "queue",
                 "!", "h264parse",
+                "!", "queue",
                 "!", "rtph264pay", "config-interval=-1", "pt=96", "mtu=1200",
+                "!", "queue",
                 "!", "udpsink", "host=37.59.106.4", &format!("port={port}"),
             ])
             .stdin(Stdio::from(rpicam_stdout))
