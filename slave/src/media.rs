@@ -17,12 +17,11 @@ impl Media {
     fn start_video(port: u16) -> Result<Child> {
         // --profile baseline // but make freeze pipeline ?
 
-        let mut rpicam = Command::new("./rpicam_stream/build/streamer")
+        let mut video = Command::new("./rpicam_stream/build/streamer")
             .args([
                 "--host", "37.59.106.4",
                 "--port",  &format!("{port}")
             ])
-            .stdin()
             .spawn()?;
 
         // let mut rpicam = Command::new("rpicam-vid")

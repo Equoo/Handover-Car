@@ -433,6 +433,8 @@ static void on_signal(int) {
 
 // ─── stdin bitrate reader ─────────────────────────────────────────────────────
 
+static constexpr const char *CTRL_FIFO = "/tmp/streamer_ctrl";
+
 static void stdin_reader_thread() {
     std::string line;
     while (g_running && std::getline(std::cin, line)) {
@@ -448,6 +450,41 @@ static void stdin_reader_thread() {
         }
     }
     std::cerr << "[ABR] stdin closed\n";
+}
+
+static void fifo_reader_thread() {
+    unlink(CTRL_FIFO);
+    if (mkfifo(CTRL_FIFO, 0666) < 0) {
+        std::cerr << "[ABR] mkfifo failed: " << strerror(errno) << "\n";
+        return;
+    }
+    std::cerr << "[ABR] Ready: echo <bps> > " << CTRL_FIFO << "\n";
+ 
+    while (g_running) {
+        int fd = open(CTRL_FIFO, O_RDONLY);
+        if (fd < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        char buf[64]{};
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n <= 0) continue;
+ 
+        std::string s(buf);
+        s.erase(s.find_last_not_of(" \t\r\n") + 1);
+        if (s.empty()) continue;
+        try {
+            uint32_t bps = std::clamp(
+                (uint32_t)std::stoul(s), 100'000u, 8'000'000u);
+            g_bitrate.store(bps);
+            g_bitrate_changed.store(true);
+            apply_bitrate(bps);
+        } catch (...) {
+            std::cerr << "[ABR] Invalid FIFO value: " << s << "\n";
+        }
+    }
+    unlink(CTRL_FIFO);
 }
 
 // ─── GStreamer bus callback ───────────────────────────────────────────────────
@@ -813,6 +850,7 @@ int main(int argc, char *argv[]) {
 
     std::thread enc_thread(encoder_thread, width, height, fps, bitrate);
     std::thread stdin_thread(stdin_reader_thread);
+	std::thread fifo_thread(fifo_reader_thread);
 
     GMainLoop *loop = g_main_loop_new(nullptr, FALSE);
     std::thread glib_thread([&loop] {
