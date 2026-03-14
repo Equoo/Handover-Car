@@ -43,6 +43,19 @@
 
 using namespace libcamera;
 
+// ─── Latency tracking ────────────────────────────────────────────────────────
+
+#include <unordered_map>
+
+static std::mutex                              g_latency_mutex;
+static std::unordered_map<guint64, std::chrono::steady_clock::time_point> g_frame_entry;
+static std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> g_capture_entry;
+static double                                  g_encode_latency_ms  = 0.0;
+static double                                  g_capture_latency_ms = 0.0;
+static double                                  g_total_latency_ms   = 0.0;
+static guint64                                 g_frame_counter      = 0;
+static uint64_t                                g_capture_counter    = 0;
+
 // ─── Global state ────────────────────────────────────────────────────────────
 
 static std::atomic<bool>     g_running{true};
@@ -54,6 +67,7 @@ struct Frame {
     std::vector<uint8_t> data;
     uint32_t             width;
     uint32_t             height;
+    std::chrono::steady_clock::time_point capture_start; // when queued to libcamera
 };
 
 static std::queue<Frame>        g_frame_queue;
@@ -93,8 +107,10 @@ static void stdin_reader_thread() {
             std::cerr << "[ABR] Invalid bitrate value: " << line << "\n";
         }
     }
-    g_running = false;
-    g_queue_cv.notify_all();
+    // EOF on stdin is NOT a shutdown signal — streamer keeps running.
+    // Only SIGINT/SIGTERM sets g_running = false.
+    // This allows: echo 1000000 | ./streamer  (pipe closes, stream continues)
+    std::cerr << "[ABR] stdin closed, bitrate control disabled (streamer still running)\n";
 }
 
 // ─── Apply bitrate to encoder ────────────────────────────────────────────────
@@ -194,6 +210,10 @@ static void frame_push_thread() {
 
         GST_BUFFER_PTS(buf)      = pts;
         GST_BUFFER_DURATION(buf) = frame_duration;
+        // Carry capture_start as nanos-since-epoch in OFFSET_END for the encoder probe
+        GST_BUFFER_OFFSET_END(buf) = static_cast<guint64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                frame.capture_start.time_since_epoch()).count());
         pts += frame_duration;
 
         GstFlowReturn ret = gst_app_src_push_buffer(
@@ -212,6 +232,22 @@ static void frame_push_thread() {
 static void on_request_completed(Request *request) {
     if (request->status() == Request::RequestCancelled) return;
 
+    // Retrieve capture start time stored when this request was queued
+    auto capture_end = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point capture_start;
+    {
+        std::lock_guard<std::mutex> lock(g_latency_mutex);
+        auto it = g_capture_entry.find(request->cookie());
+        if (it != g_capture_entry.end()) {
+            capture_start = it->second;
+            g_capture_latency_ms = std::chrono::duration<double, std::milli>(
+                capture_end - capture_start).count();
+            g_capture_entry.erase(it);
+        } else {
+            capture_start = capture_end; // fallback: no capture time recorded
+        }
+    }
+
     const auto &buffers = request->buffers();
     for (auto &[stream, fb] : buffers) {
         // Map the first plane (YUV420 Y plane start)
@@ -224,8 +260,9 @@ static void on_request_completed(Request *request) {
 
         Frame frame;
         frame.data.resize(total);
-        frame.width  = stream->configuration().size.width;
-        frame.height = stream->configuration().size.height;
+        frame.width         = stream->configuration().size.width;
+        frame.height        = stream->configuration().size.height;
+        frame.capture_start = capture_start;
 
         size_t offset = 0;
         for (const auto &plane : fb->planes()) {
@@ -251,6 +288,10 @@ static void on_request_completed(Request *request) {
     // Requeue the request so libcamera keeps delivering frames
     if (g_running) {
         request->reuse(Request::ReuseBuffers);
+        {
+            std::lock_guard<std::mutex> lock(g_latency_mutex);
+            g_capture_entry[request->cookie()] = std::chrono::steady_clock::now();
+        }
         s_cam->queueRequest(request);
     }
 }
@@ -381,6 +422,48 @@ static bool build_pipeline(
     GstBus *bus = gst_element_get_bus(g_pipeline);
     gst_bus_add_watch(bus, bus_callback, nullptr);
     gst_object_unref(bus);
+
+    // ── Encoding latency probes ───────────────────────────────────────────
+    // Stamp each buffer as it enters the encoder
+    GstPad *enc_sink = gst_element_get_static_pad(g_encoder, "sink");
+    gst_pad_add_probe(enc_sink, GST_PAD_PROBE_TYPE_BUFFER,
+        [](GstPad *, GstPadProbeInfo *info, gpointer) -> GstPadProbeReturn {
+            std::lock_guard<std::mutex> lock(g_latency_mutex);
+            guint64 id = g_frame_counter++;
+            // Store frame id in buffer meta offset field as a simple stamp
+            GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
+            GST_BUFFER_OFFSET(buf) = id;
+            g_frame_entry[id] = std::chrono::steady_clock::now();
+            return GST_PAD_PROBE_OK;
+        }, nullptr, nullptr);
+    gst_object_unref(enc_sink);
+
+    // Measure wall-clock time when encoded buffer exits the encoder
+    GstPad *enc_src = gst_element_get_static_pad(g_encoder, "src");
+    gst_pad_add_probe(enc_src, GST_PAD_PROBE_TYPE_BUFFER,
+        [](GstPad *, GstPadProbeInfo *info, gpointer) -> GstPadProbeReturn {
+            GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
+            guint64 id              = GST_BUFFER_OFFSET(buf);
+            guint64 capture_nanos   = GST_BUFFER_OFFSET_END(buf);
+            auto    now             = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lock(g_latency_mutex);
+            // Encode latency
+            auto it = g_frame_entry.find(id);
+            if (it != g_frame_entry.end()) {
+                g_encode_latency_ms = std::chrono::duration<double, std::milli>(
+                    now - it->second).count();
+                g_frame_entry.erase(it);
+            }
+            // Total latency: capture submit → encoded frame out
+            if (capture_nanos > 0) {
+                auto capture_start = std::chrono::steady_clock::time_point(
+                    std::chrono::nanoseconds(capture_nanos));
+                g_total_latency_ms = std::chrono::duration<double, std::milli>(
+                    now - capture_start).count();
+            }
+            return GST_PAD_PROBE_OK;
+        }, nullptr, nullptr);
+    gst_object_unref(enc_src);
 
     return true;
 }
@@ -533,9 +616,14 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // Queue all requests
-    for (auto &req : requests)
+    // Queue all requests — stamp capture start time for each
+    for (auto &req : requests) {
+        {
+            std::lock_guard<std::mutex> lock(g_latency_mutex);
+            g_capture_entry[req->cookie()] = std::chrono::steady_clock::now();
+        }
         cam->queueRequest(req.get());
+    }
 
     // ── Threads ───────────────────────────────────────────────────────────
     std::thread push_thread(frame_push_thread);
@@ -545,7 +633,15 @@ int main(int argc, char *argv[]) {
     GMainLoop *loop = g_main_loop_new(nullptr, FALSE);
     // Run until g_running is false
     std::thread glib_thread([&loop] {
-        while (g_running) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        while (g_running) {
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+            std::lock_guard<std::mutex> lock(g_latency_mutex);
+            std::cerr << "[LATENCY]"
+                      << "  capture="  << g_capture_latency_ms  << " ms"
+                      << "  encode="   << g_encode_latency_ms   << " ms"
+                      << "  total="    << g_total_latency_ms    << " ms"
+                      << "  bitrate="  << g_bitrate.load() / 1000 << " kbps\n";
+        }
         g_main_loop_quit(loop);
     });
     g_main_loop_run(loop);
@@ -562,7 +658,9 @@ int main(int argc, char *argv[]) {
     if (alloc) delete alloc;
 
     push_thread.join();
-    stdin_thread.join();
+    // stdin_thread may be blocked on getline() forever if no input —
+    // detach it so it doesn't prevent clean shutdown
+    stdin_thread.detach();
     glib_thread.join();
 
     gst_element_set_state(g_pipeline, GST_STATE_NULL);
