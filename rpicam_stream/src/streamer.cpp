@@ -540,7 +540,7 @@ static bool build_pipeline(const std::string &host, uint16_t port,
     // g_fecenc   = gst_element_factory_make("rtpulpfecenc",  "fec");
     auto *sink   = gst_element_factory_make("udpsink",      "sink");
 
-    if (!g_pipeline || !g_appsrc || !parse || !pay || !g_fecenc || !sink) {
+    if (!g_pipeline || !g_appsrc || !parse || !pay || !sink) {  // || !g_fecenc
         std::cerr << "[GST] Failed to create elements\n";
         return false;
     }
