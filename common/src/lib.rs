@@ -29,6 +29,7 @@ pub enum Message {
     },
     ServerPong {
         packet_id: u16,
+        bitrate: u32
     },
     ServerClientPong {
         latency: u16,
@@ -59,6 +60,7 @@ pub enum Message {
     MasterAnnounce {
         uuid: String,
         packet_id: u16,
+        bitrate: u32
     },
     Disconnect {}
 }

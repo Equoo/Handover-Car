@@ -1,8 +1,8 @@
 use anyhow::{Error, Result};
-use gstreamer::{self as gst, element_error};
+use gstreamer::Registry;
 use gstreamer::glib::object::{Cast, ObjectExt};
-use gstreamer::{ prelude::*};
-use gstreamer::{Registry};
+use gstreamer::prelude::*;
+use gstreamer::{self as gst, element_error};
 use gstreamer_app as gst_app;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -22,6 +22,7 @@ struct ErrorMessage {
 
 use crate::app::{AppState, ema_average};
 
+#[derive(Clone, Copy)]
 pub struct PacketLoss {
     pub num_lost: u64,
     pub num_pushed: u64,
@@ -69,22 +70,22 @@ pub fn build_video(
 
     let pipeline = gst::Pipeline::default();
     let src = gst::ElementFactory::make("appsrc").name("source").build()?;
-        src.set_property("caps", &caps);
-        src.set_property("is-live", true);
-        src.set_property("format", gst::Format::Time);
-        src.set_property("do-timestamp", true); // true may needed but when true if receive packet before playing it warn
+    src.set_property("caps", &caps);
+    src.set_property("is-live", true);
+    src.set_property("format", gst::Format::Time);
+    src.set_property("do-timestamp", true); // true may needed but when true if receive packet before playing it warn
 
     let jitter = gst::ElementFactory::make("rtpjitterbuffer").build()?;
-        jitter.set_property("latency", 40u32);
-        jitter.set_property("drop-on-latency", true);
-        jitter.set_property("do-lost", true);
-        jitter.set_property("do-retransmission", true);
+    jitter.set_property("latency", 40u32);
+    jitter.set_property("drop-on-latency", true);
+    jitter.set_property("do-lost", true);
+    jitter.set_property("do-retransmission", true);
 
     let depay = gst::ElementFactory::make("rtph264depay").build()?;
 
     let parse = gst::ElementFactory::make("h264parse").build()?;
-        parse.set_property_from_str("config-interval", "-1");
-        parse.set_property_from_str("update-timecode", "false"); // NOTE: may is wrong
+    parse.set_property_from_str("config-interval", "-1");
+    parse.set_property_from_str("update-timecode", "false"); // NOTE: may is wrong
 
     let decoder = choose_h264_decoder();
     let dec = gst::ElementFactory::make(decoder).build()?;
@@ -95,12 +96,12 @@ pub fn build_video(
     let conv = gst::ElementFactory::make("videoconvert").build()?;
 
     let caps_filter = gst::ElementFactory::make("capsfilter").build()?;
-        caps_filter.set_property(
-            "caps",
-            gst::Caps::builder("video/x-raw")
-                .field("format", "BGRx")
-                .build(),
-        );
+    caps_filter.set_property(
+        "caps",
+        gst::Caps::builder("video/x-raw")
+            .field("format", "BGRx")
+            .build(),
+    );
 
     pipeline.add_many([
         &src,

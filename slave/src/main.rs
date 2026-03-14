@@ -3,6 +3,7 @@ use anyhow::Result;
 use anyhow::bail;
 use common::PacketType;
 use common::asyncqueue::AsyncQueue;
+use tokio::fs;
 use tracing::field::debug;
 use std::env;
 use std::net::IpAddr;
@@ -133,10 +134,13 @@ impl AppState {
                 //     bail!("Connection to server failed caused by '{what}'");
             }
 
-            ArchivedMessage::ServerPong { packet_id } => {
+            ArchivedMessage::ServerPong { packet_id, bitrate } => {
                 let packet_id: u16 = packet_id.into();
                 if packet_id == *self.announce_id.lock() {
                     *self.latency.lock() = self.last_ping.lock().elapsed();
+                }
+                if self.media.lock().is_some() {
+                    fs::write("/tmp/streamer_ctrl", format!("{}\n", bitrate)).await?;
                 }
             }
             _ => {}

@@ -20,6 +20,7 @@ struct Slave {
     uniqueid: u8,
     last_addr: SocketAddr,
     latency: u16,
+    bitrate: u32,
     video_thread: AbortHandle,
     // audio_thread: AbortHandle,
     subscriber: Uuid,
@@ -111,6 +112,7 @@ impl AppState {
                 last_addr: addr,
                 latency,
                 video_thread,
+                bitrate: 1000000,
                 subscriber: Uuid::nil(),
             },
         );
@@ -130,9 +132,11 @@ impl AppState {
                 packet_id,
             } => {
                 let id = id.as_str().to_string();
+                let mut bitrate: u32 = 1000000;
 
                 if let Some(slave) = self.slaves.lock().await.get_mut(&id) {
                     slave.latency = latency.into();
+                    bitrate = slave.bitrate;
                 } else {
                     if *self.slaves_count.lock() == SLAVES_LIMIT {
                         self.socket.send(
@@ -165,6 +169,7 @@ impl AppState {
                     &addr,
                     &Message::ServerPong {
                         packet_id: packet_id.into(),
+                        bitrate
                     },
                     PacketType::Unreliable,
                 )?;
@@ -211,19 +216,22 @@ impl AppState {
                     )?;
                 }
             }
-            ArchivedMessage::MasterAnnounce { uuid, packet_id } => {
+            ArchivedMessage::MasterAnnounce { uuid, packet_id, bitrate } => {
+                let mut latency: u16 = 0;
                 if let Some(client) = self.clients.lock().await.get(&Uuid::from_str(uuid)?)
-                    && let Some(slave) = self.slaves.lock().await.get(&client.subscribe)
+                    && let Some(slave) = self.slaves.lock().await.get_mut(&client.subscribe)
                 {
-                    self.socket.send(
-                        &addr,
-                        &Message::ServerClientPong {
-                            latency: slave.latency,
-                            packet_id: packet_id.into()
-                        },
-                        PacketType::Unreliable,
-                    )?;
+                    slave.bitrate = bitrate.into();
+                    latency = slave.latency;
                 }
+                self.socket.send(
+                    &addr,
+                    &Message::ServerClientPong {
+                        latency,
+                        packet_id: packet_id.into()
+                    },
+                    PacketType::Unreliable,
+                )?;
             }
             _ => {}
         };

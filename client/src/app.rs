@@ -32,6 +32,7 @@ pub struct AppState {
     pub slave_latency: Mutex<u16>,
     pub client_latency: Mutex<u16>,
     pub fps: Mutex<u8>,
+    pub bitrate: Mutex<u32>,
     pub loss: Mutex<PacketLoss>,
 }
 
@@ -71,6 +72,7 @@ impl AppState {
             client_latency: Mutex::new(0),
             announce_id: Mutex::new(0),
             fps: Mutex::new(0),
+            bitrate: Mutex::new(1000000),
             loss: Mutex::new(PacketLoss {num_lost: 0, num_pushed: 0, loss_pct: 0f64}),
         })
     }
@@ -80,7 +82,7 @@ impl AppState {
             let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
             debug!("Send to {}:{port}", self.server.ip().to_string());
             socket
-                .send_to(&[1], format!("{}:{port}", self.server.ip().to_string()))
+                .send_to(&[1], format!("{}:{port}", self.server.ip()))
                 .await
                 .unwrap();
 
@@ -113,11 +115,47 @@ impl AppState {
                 &self.server,
                 &Message::MasterAnnounce {
                     uuid: self.uuid.lock().to_string(),
-                    packet_id: *self.announce_id.lock()
+                    packet_id: *self.announce_id.lock(),
+                    bitrate: *self.bitrate.lock()
                 },
                 PacketType::Unreliable,
             )?;
             std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    async fn run_abr(self: Arc<AppState>) {
+        let mut interval = tokio::time::interval(Duration::from_secs(3));
+        let mut bitrate: u32 = 1_000_000;
+
+        loop {
+            interval.tick().await;
+
+            let losses = *self.loss.lock();
+            let decode_latency = *self.decode_latency.lock();
+            let loss = losses.num_lost as f32 / (losses.num_pushed as f32).max(1f32);
+
+            // AIMD
+            bitrate = if loss > 0.05 {
+                (bitrate as f64 * 0.7) as u32 // cut 30% on bad loss
+            } else if loss > 0.02 {
+                (bitrate as f64 * 0.9) as u32 // cut 10% on mild loss
+            } else if decode_latency > 10.0 {
+                bitrate // hold if decoder struggling
+            } else {
+                bitrate + 25_000 // additive increase
+            };
+
+            bitrate = bitrate.clamp(200_000, 4_000_000);
+
+            tracing::info!(
+                "ABR: loss={:.1}% latency={:.1}ms → {}kbps",
+                loss * 100.0,
+                decode_latency,
+                bitrate / 1000
+            );
+
+            *self.bitrate.lock() = bitrate;
         }
     }
 
@@ -138,6 +176,8 @@ impl AppState {
 
                 let state_clone = self.clone();
                 let announce_thread = tokio::spawn(async move { state_clone.announce_loop() });
+                let state_clone = self.clone();
+                let abr_thread = tokio::spawn(async move { state_clone.run_abr().await });
             }
             ArchivedMessage::ServerClientPong { latency, packet_id } => {
                 let latency: u16 = latency.into();
