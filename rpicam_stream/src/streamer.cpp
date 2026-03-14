@@ -5,7 +5,7 @@
  * Replaces: rpicam-vid | gst-launch-1.0 fdsrc ! h264parse ! rtph264pay ! udpsink
  *
  * Pipeline:
- *   libcamera (YUV420) → appsrc → v4l2h264enc → h264parse
+ *   libcamera (YUV420) → appsrc → videoconvert → v4l2h264enc → h264parse
  *   → rtph264pay → rtpulpfecenc → udpsink
  *
  * Bitrate control: write integer to stdin e.g. `echo 500000`
@@ -107,10 +107,8 @@ static void stdin_reader_thread() {
             std::cerr << "[ABR] Invalid bitrate value: " << line << "\n";
         }
     }
-    // EOF on stdin is NOT a shutdown signal — streamer keeps running.
-    // Only SIGINT/SIGTERM sets g_running = false.
-    // This allows: echo 1000000 | ./streamer  (pipe closes, stream continues)
-    std::cerr << "[ABR] stdin closed, bitrate control disabled (streamer still running)\n";
+    g_running = false;
+    g_queue_cv.notify_all();
 }
 
 // ─── Apply bitrate to encoder ────────────────────────────────────────────────
@@ -322,24 +320,28 @@ static bool build_pipeline(
     }
 
     g_pipeline  = gst_pipeline_new("streamer");
-    g_appsrc    = gst_element_factory_make("appsrc",       "source");
-    auto *parse  = gst_element_factory_make("h264parse",   "parse");
-    auto *pay    = gst_element_factory_make("rtph264pay",  "pay");
-    g_fecenc    = gst_element_factory_make("rtpulpfecenc", "fec");
-    auto *sink   = gst_element_factory_make("udpsink",     "sink");
+    g_appsrc    = gst_element_factory_make("appsrc",        "source");
+    auto *conv   = gst_element_factory_make("videoconvert", "conv");  // bridges caps mismatch
+    auto *parse  = gst_element_factory_make("h264parse",    "parse");
+    auto *pay    = gst_element_factory_make("rtph264pay",   "pay");
+    g_fecenc    = gst_element_factory_make("rtpulpfecenc",  "fec");
+    auto *sink   = gst_element_factory_make("udpsink",      "sink");
 
-    if (!g_pipeline || !g_appsrc || !g_encoder || !parse || !pay || !g_fecenc || !sink) {
+    if (!g_pipeline || !g_appsrc || !conv || !g_encoder || !parse || !pay || !g_fecenc || !sink) {
         std::cerr << "[GST] Failed to create elements\n";
         return false;
     }
 
     // ── appsrc caps: raw YUV420 from libcamera ────────────────────────────
+    // Must include colorimetry and interlace-mode so v4l2h264enc accepts them
     GstCaps *src_caps = gst_caps_new_simple(
         "video/x-raw",
-        "format",    G_TYPE_STRING,  "I420",
-        "width",     G_TYPE_INT,     (gint)width,
-        "height",    G_TYPE_INT,     (gint)height,
-        "framerate", GST_TYPE_FRACTION, (gint)framerate, 1,
+        "format",         G_TYPE_STRING,    "I420",
+        "width",          G_TYPE_INT,       (gint)width,
+        "height",         G_TYPE_INT,       (gint)height,
+        "framerate",      GST_TYPE_FRACTION, (gint)framerate, 1,
+        "interlace-mode", G_TYPE_STRING,    "progressive",
+        "colorimetry",    G_TYPE_STRING,    "bt709",
         nullptr
     );
     g_object_set(G_OBJECT(g_appsrc),
@@ -409,11 +411,11 @@ static bool build_pipeline(
 
     // ── Add and link ──────────────────────────────────────────────────────
     gst_bin_add_many(GST_BIN(g_pipeline),
-        g_appsrc, g_encoder, parse, pay, g_fecenc, sink,
+        g_appsrc, conv, g_encoder, parse, pay, g_fecenc, sink,
         nullptr
     );
 
-    if (!gst_element_link_many(g_appsrc, g_encoder, parse, pay, g_fecenc, sink, nullptr)) {
+    if (!gst_element_link_many(g_appsrc, conv, g_encoder, parse, pay, g_fecenc, sink, nullptr)) {
         std::cerr << "[GST] Failed to link pipeline\n";
         return false;
     }
@@ -658,9 +660,7 @@ int main(int argc, char *argv[]) {
     if (alloc) delete alloc;
 
     push_thread.join();
-    // stdin_thread may be blocked on getline() forever if no input —
-    // detach it so it doesn't prevent clean shutdown
-    stdin_thread.detach();
+    stdin_thread.join();
     glib_thread.join();
 
     gst_element_set_state(g_pipeline, GST_STATE_NULL);
