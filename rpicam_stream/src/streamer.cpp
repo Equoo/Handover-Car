@@ -2,13 +2,13 @@
  * streamer.cpp
  *
  * Raspberry Pi H264 RTP streamer with dynamic bitrate control.
- * Based on rpicam-apps H264Encoder architecture (direct V4L2 /dev/video11).
+ * Replaces: rpicam-vid | gst-launch-1.0 fdsrc ! h264parse ! rtph264pay ! udpsink
  *
  * Pipeline:
- *   libcamera (YUV420) → V4L2Encoder (/dev/video11) → appsrc
- *   → h264parse → rtph264pay → rtpulpfecenc → udpsink
+ *   libcamera (YUV420) → appsrc → v4l2h264enc → h264parse
+ *   → rtph264pay → rtpulpfecenc → udpsink
  *
- * Bitrate control: write integer bps to stdin e.g. `echo 500000`
+ * Bitrate control: write integer to stdin e.g. `echo 500000`
  *
  * Build:
  *   g++ streamer.cpp -o streamer \
@@ -18,18 +18,20 @@
  *
  * Run:
  *   ./streamer --host 37.59.106.4 --port 9600
+ *   # Then from another terminal or your Rust ABR controller:
+ *   echo 300000 > /proc/$(pidof streamer)/fd/0
  */
 
 #include <gst/gst.h>
 #include <gst/app/gstappsrc.h>
+
 #include <libcamera/libcamera.h>
 
-#include <sys/mman.h>
+#include <sys/mman.h>   // mmap, munmap, PROT_READ, MAP_SHARED, MAP_FAILED
 #include <sys/ioctl.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <linux/videodev2.h>
-#include <poll.h>
 
 #include <atomic>
 #include <chrono>
@@ -42,385 +44,47 @@
 #include <string>
 #include <thread>
 #include <condition_variable>
-#include <functional>
-#include <unordered_map>
-#include <stdexcept>
 
 using namespace libcamera;
 
 // ─── Latency tracking ────────────────────────────────────────────────────────
 
-static std::mutex  g_latency_mutex;
+#include <unordered_map>
+
+static std::mutex                              g_latency_mutex;
+static std::unordered_map<guint64, std::chrono::steady_clock::time_point> g_frame_entry;
 static std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> g_capture_entry;
-static std::unordered_map<uint64_t, std::chrono::steady_clock::time_point> g_encode_entry;
-static double      g_capture_latency_ms = 0.0;
-static double      g_encode_latency_ms  = 0.0;
-static double      g_total_latency_ms   = 0.0;
-static uint64_t    g_frame_seq          = 0;
+static double                                  g_encode_latency_ms  = 0.0;
+static double                                  g_capture_latency_ms = 0.0;
+static double                                  g_total_latency_ms   = 0.0;
+static guint64                                 g_frame_counter      = 0;
+static uint64_t                                g_capture_counter    = 0;
 
 // ─── Global state ────────────────────────────────────────────────────────────
 
 static std::atomic<bool>     g_running{true};
-static std::atomic<uint32_t> g_bitrate{1000000};
+static std::atomic<uint32_t> g_bitrate{1000000};   // current target bitrate (bps)
 static std::atomic<bool>     g_bitrate_changed{false};
 
-static GstElement *g_pipeline = nullptr;
-static GstElement *g_appsrc   = nullptr;
-static GstElement *g_fecenc   = nullptr;
-static Camera     *s_cam      = nullptr;
-
-// ─── V4L2 H264 Encoder (mirrors rpicam-apps H264Encoder) ─────────────────────
-//
-// Talks directly to /dev/video11 (bcm2835-codec-encode).
-// Input: YUV420 frames via mmap buffers.
-// Output: H264 NAL units via callback.
-//
-// Two threads:
-//   poll_thread_   — waits for V4L2 events (resolution changes etc.)
-//   output_thread_ — dequeues encoded H264 buffers and calls output_cb_
-
-class V4L2H264Encoder {
-public:
-    using OutputCallback = std::function<void(uint8_t *data, size_t size,
-                                               int64_t timestamp_us, bool keyframe,
-                                               uint64_t seq)>;
-
-    V4L2H264Encoder(uint32_t width, uint32_t height, uint32_t fps,
-                    uint32_t bitrate, OutputCallback cb)
-        : width_(width), height_(height), fps_(fps),
-          bitrate_(bitrate), output_cb_(cb)
-    {
-        fd_ = open("/dev/video11", O_RDWR | O_NONBLOCK);
-        if (fd_ < 0)
-            throw std::runtime_error("Cannot open /dev/video11");
-
-        setup_input();
-        setup_output();
-        set_bitrate(bitrate);
-        set_profile_level();
-        alloc_input_buffers();
-        alloc_output_buffers();
-    }
-
-    ~V4L2H264Encoder() {
-        stop();
-        for (auto &b : input_buffers_)  { munmap(b.mem, b.size); }
-        for (auto &b : output_buffers_) { munmap(b.mem, b.size); }
-        close(fd_);
-    }
-
-    void start() {
-        int type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        if (ioctl(fd_, VIDIOC_STREAMON, &type) < 0)
-            throw std::runtime_error("STREAMON input failed");
-        type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        if (ioctl(fd_, VIDIOC_STREAMON, &type) < 0)
-            throw std::runtime_error("STREAMON output failed");
-
-        // Queue all output (capture) buffers
-        for (size_t i = 0; i < output_buffers_.size(); i++) {
-            v4l2_buffer buf{};
-            v4l2_plane  planes[1]{};
-            buf.type     = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-            buf.memory   = V4L2_MEMORY_MMAP;
-            buf.index    = i;
-            buf.length   = 1;
-            buf.m.planes = planes;
-            if (ioctl(fd_, VIDIOC_QBUF, &buf) < 0)
-                throw std::runtime_error("QBUF output failed");
-        }
-
-        poll_thread_   = std::thread(&V4L2H264Encoder::poll_loop,   this);
-        output_thread_ = std::thread(&V4L2H264Encoder::output_loop, this);
-    }
-
-    void stop() {
-        if (!running_) return;
-        running_ = false;
-
-        // Send EOS
-        v4l2_encoder_cmd cmd{};
-        cmd.cmd = V4L2_ENC_CMD_STOP;
-        ioctl(fd_, VIDIOC_ENCODER_CMD, &cmd);
-
-        if (poll_thread_.joinable())   poll_thread_.join();
-        if (output_thread_.joinable()) output_thread_.join();
-
-        int type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        ioctl(fd_, VIDIOC_STREAMOFF, &type);
-        type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        ioctl(fd_, VIDIOC_STREAMOFF, &type);
-    }
-
-    // Encode one YUV420 frame. Returns false if no input buffer available.
-    bool encode(const uint8_t *yuv, size_t size, int64_t timestamp_us, uint64_t seq) {
-        // Apply pending bitrate change
-        if (g_bitrate_changed.exchange(false))
-            set_bitrate(g_bitrate.load());
-
-        // Get a free input buffer
-        v4l2_buffer buf{};
-        v4l2_plane  planes[1]{};
-        buf.type     = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        buf.memory   = V4L2_MEMORY_MMAP;
-        buf.length   = 1;
-        buf.m.planes = planes;
-
-        if (ioctl(fd_, VIDIOC_DQBUF, &buf) < 0) {
-            // No free input buffer yet — caller should retry or drop
-            return false;
-        }
-
-        size_t idx = buf.index;
-        size_t copy = std::min(size, input_buffers_[idx].size);
-        memcpy(input_buffers_[idx].mem, yuv, copy);
-
-        buf.m.planes[0].bytesused = copy;
-        buf.m.planes[0].length    = input_buffers_[idx].size;
-        buf.timestamp.tv_sec  = timestamp_us / 1'000'000;
-        buf.timestamp.tv_usec = timestamp_us % 1'000'000;
-        buf.sequence = seq;
-
-        if (ioctl(fd_, VIDIOC_QBUF, &buf) < 0) {
-            std::cerr << "[ENC] QBUF input failed\n";
-            return false;
-        }
-        return true;
-    }
-
-private:
-    struct Buffer { void *mem; size_t size; };
-
-    int      fd_     = -1;
-    bool     running_ = true;
-    uint32_t width_, height_, fps_, bitrate_;
-
-    std::vector<Buffer> input_buffers_;
-    std::vector<Buffer> output_buffers_;
-
-    std::thread poll_thread_;
-    std::thread output_thread_;
-    OutputCallback output_cb_;
-
-    static int xioctl(int fd, unsigned long req, void *arg) {
-        int r;
-        do { r = ioctl(fd, req, arg); } while (r == -1 && errno == EINTR);
-        return r;
-    }
-
-    void setup_input() {
-        v4l2_format fmt{};
-        fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        fmt.fmt.pix_mp.width       = width_;
-        fmt.fmt.pix_mp.height      = height_;
-        fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_YUV420;
-        fmt.fmt.pix_mp.field       = V4L2_FIELD_ANY;
-        fmt.fmt.pix_mp.colorspace  = V4L2_COLORSPACE_JPEG; // = BT.601 full range
-        fmt.fmt.pix_mp.num_planes  = 1;
-        fmt.fmt.pix_mp.plane_fmt[0].bytesperline = width_;
-        fmt.fmt.pix_mp.plane_fmt[0].sizeimage    = width_ * height_ * 3 / 2;
-        if (xioctl(fd_, VIDIOC_S_FMT, &fmt) < 0)
-            throw std::runtime_error("S_FMT input failed");
-
-        // Set framerate
-        v4l2_streamparm parm{};
-        parm.type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        parm.parm.output.timeperframe.numerator   = 1;
-        parm.parm.output.timeperframe.denominator = fps_;
-        xioctl(fd_, VIDIOC_S_PARM, &parm); // best effort
-    }
-
-    void setup_output() {
-        v4l2_format fmt{};
-        fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        fmt.fmt.pix_mp.width       = width_;
-        fmt.fmt.pix_mp.height      = height_;
-        fmt.fmt.pix_mp.pixelformat = V4L2_PIX_FMT_H264;
-        fmt.fmt.pix_mp.field       = V4L2_FIELD_ANY;
-        fmt.fmt.pix_mp.colorspace  = V4L2_COLORSPACE_DEFAULT;
-        fmt.fmt.pix_mp.num_planes  = 1;
-        // Bitstream buffer: generous size
-        fmt.fmt.pix_mp.plane_fmt[0].sizeimage = 512 * 1024;
-        if (xioctl(fd_, VIDIOC_S_FMT, &fmt) < 0)
-            throw std::runtime_error("S_FMT output failed");
-    }
-
-    void set_bitrate(uint32_t bps) {
-        v4l2_control ctrl{};
-        ctrl.id    = V4L2_CID_MPEG_VIDEO_BITRATE;
-        ctrl.value = bps;
-        if (xioctl(fd_, VIDIOC_S_CTRL, &ctrl) < 0)
-            std::cerr << "[ENC] Failed to set bitrate to " << bps << "\n";
-
-        // Also set peak bitrate = 1.5x for VBR headroom
-        ctrl.id    = V4L2_CID_MPEG_VIDEO_BITRATE_PEAK;
-        ctrl.value = bps * 3 / 2;
-        xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
-    }
-
-    void set_profile_level() {
-        v4l2_control ctrl{};
-
-        // Baseline profile — no B-frames, simplest NAL structure
-        ctrl.id    = V4L2_CID_MPEG_VIDEO_H264_PROFILE;
-        ctrl.value = V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE;
-        xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
-
-        // Level 4.1
-        ctrl.id    = V4L2_CID_MPEG_VIDEO_H264_LEVEL;
-        ctrl.value = V4L2_MPEG_VIDEO_H264_LEVEL_4_1;
-        xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
-
-        // Inline SPS/PPS in every keyframe (like rpicam-vid --inline)
-        ctrl.id    = V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER;
-        ctrl.value = 1;
-        xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
-
-        // Keyframe every fps/2 frames (~0.5s)
-        ctrl.id    = V4L2_CID_MPEG_VIDEO_H264_I_PERIOD;
-        ctrl.value = fps_ / 2;
-        xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
-
-        // Disable B-frames
-        ctrl.id    = V4L2_CID_MPEG_VIDEO_B_FRAMES;
-        ctrl.value = 0;
-        xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
-
-        // VBR mode
-        ctrl.id    = V4L2_CID_MPEG_VIDEO_BITRATE_MODE;
-        ctrl.value = V4L2_MPEG_VIDEO_BITRATE_MODE_VBR;
-        xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
-    }
-
-    void alloc_input_buffers(uint32_t count = 6) {
-        v4l2_requestbuffers req{};
-        req.count  = count;
-        req.type   = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-        req.memory = V4L2_MEMORY_MMAP;
-        if (xioctl(fd_, VIDIOC_REQBUFS, &req) < 0)
-            throw std::runtime_error("REQBUFS input failed");
-
-        input_buffers_.resize(req.count);
-        for (uint32_t i = 0; i < req.count; i++) {
-            v4l2_buffer buf{};
-            v4l2_plane  planes[1]{};
-            buf.type     = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-            buf.memory   = V4L2_MEMORY_MMAP;
-            buf.index    = i;
-            buf.length   = 1;
-            buf.m.planes = planes;
-            if (xioctl(fd_, VIDIOC_QUERYBUF, &buf) < 0)
-                throw std::runtime_error("QUERYBUF input failed");
-
-            input_buffers_[i].size = buf.m.planes[0].length;
-            input_buffers_[i].mem  = mmap(nullptr, buf.m.planes[0].length,
-                                           PROT_READ | PROT_WRITE, MAP_SHARED,
-                                           fd_, buf.m.planes[0].m.mem_offset);
-            if (input_buffers_[i].mem == MAP_FAILED)
-                throw std::runtime_error("mmap input buffer failed");
-
-            // Pre-queue all input buffers so encoder can receive frames
-            if (xioctl(fd_, VIDIOC_QBUF, &buf) < 0)
-                throw std::runtime_error("QBUF input pre-queue failed");
-        }
-    }
-
-    void alloc_output_buffers(uint32_t count = 6) {
-        v4l2_requestbuffers req{};
-        req.count  = count;
-        req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-        req.memory = V4L2_MEMORY_MMAP;
-        if (xioctl(fd_, VIDIOC_REQBUFS, &req) < 0)
-            throw std::runtime_error("REQBUFS output failed");
-
-        output_buffers_.resize(req.count);
-        for (uint32_t i = 0; i < req.count; i++) {
-            v4l2_buffer buf{};
-            v4l2_plane  planes[1]{};
-            buf.type     = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-            buf.memory   = V4L2_MEMORY_MMAP;
-            buf.index    = i;
-            buf.length   = 1;
-            buf.m.planes = planes;
-            if (xioctl(fd_, VIDIOC_QUERYBUF, &buf) < 0)
-                throw std::runtime_error("QUERYBUF output failed");
-
-            output_buffers_[i].size = buf.m.planes[0].length;
-            output_buffers_[i].mem  = mmap(nullptr, buf.m.planes[0].length,
-                                            PROT_READ | PROT_WRITE, MAP_SHARED,
-                                            fd_, buf.m.planes[0].m.mem_offset);
-            if (output_buffers_[i].mem == MAP_FAILED)
-                throw std::runtime_error("mmap output buffer failed");
-        }
-    }
-
-    void poll_loop() {
-        while (running_) {
-            pollfd pfd{ fd_, POLLPRI, 0 };
-            int ret = poll(&pfd, 1, 200);
-            if (ret < 0 && errno != EINTR) break;
-            if (ret > 0 && (pfd.revents & POLLPRI)) {
-                v4l2_event ev{};
-                xioctl(fd_, VIDIOC_DQEVENT, &ev);
-                if (ev.type == V4L2_EVENT_EOS) {
-                    std::cerr << "[ENC] EOS event\n";
-                    running_ = false;
-                }
-            }
-        }
-    }
-
-    void output_loop() {
-        while (running_) {
-            pollfd pfd{ fd_, POLLIN, 0 };
-            int ret = poll(&pfd, 1, 200);
-            if (ret < 0 && errno != EINTR) break;
-            if (!(pfd.revents & POLLIN)) continue;
-
-            v4l2_buffer buf{};
-            v4l2_plane  planes[1]{};
-            buf.type     = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-            buf.memory   = V4L2_MEMORY_MMAP;
-            buf.length   = 1;
-            buf.m.planes = planes;
-
-            if (xioctl(fd_, VIDIOC_DQBUF, &buf) < 0) {
-                if (errno == EAGAIN) continue;
-                break;
-            }
-
-            size_t idx  = buf.index;
-            size_t used = buf.m.planes[0].bytesused;
-            bool keyframe = (buf.flags & V4L2_BUF_FLAG_KEYFRAME) != 0;
-            int64_t ts_us = (int64_t)buf.timestamp.tv_sec * 1'000'000
-                          + buf.timestamp.tv_usec;
-            uint64_t seq  = buf.sequence;
-
-            if (used > 0)
-                output_cb_((uint8_t *)output_buffers_[idx].mem, used, ts_us, keyframe, seq);
-
-            // Requeue
-            buf.m.planes[0].bytesused = 0;
-            xioctl(fd_, VIDIOC_QBUF, &buf);
-        }
-    }
-};
-
-// ─── Frame queue: libcamera → encoder ────────────────────────────────────────
-
+// Frame queue between libcamera callback and GStreamer push thread
 struct Frame {
-    std::vector<uint8_t>                   data;
-    uint32_t                               width;
-    uint32_t                               height;
-    int64_t                                timestamp_us;
-    std::chrono::steady_clock::time_point  capture_start;
-    uint64_t                               seq;
+    std::vector<uint8_t> data;
+    uint32_t             width;
+    uint32_t             height;
+    std::chrono::steady_clock::time_point capture_start; // when queued to libcamera
 };
 
-static std::queue<Frame>       g_frame_queue;
-static std::mutex              g_queue_mutex;
-static std::condition_variable g_queue_cv;
-static constexpr size_t        MAX_QUEUE = 6;
+static std::queue<Frame>        g_frame_queue;
+static std::mutex               g_queue_mutex;
+static std::condition_variable  g_queue_cv;
+static constexpr size_t         MAX_QUEUE = 4;
+
+// GStreamer elements we need to reach at runtime
+static GstElement *g_pipeline  = nullptr;
+static GstElement *g_appsrc    = nullptr;
+static GstElement *g_encoder   = nullptr;  // v4l2h264enc or x264enc
+static GstElement *g_fecenc    = nullptr;
+static Camera     *s_cam       = nullptr;
 
 // ─── Signal handler ──────────────────────────────────────────────────────────
 
@@ -431,23 +95,106 @@ static void on_signal(int) {
         gst_element_send_event(g_pipeline, gst_event_new_eos());
 }
 
-// ─── stdin bitrate reader ─────────────────────────────────────────────────────
+// ─── Bitrate control ─────────────────────────────────────────────────────────
+//
+// Two methods:
+//   1. FIFO (recommended): echo 500000 > /tmp/streamer_ctrl
+//   2. stdin: echo 500000  (only works if streamer started interactively)
+
+static constexpr const char *CTRL_FIFO = "/tmp/streamer_ctrl";
 
 static void stdin_reader_thread() {
     std::string line;
     while (g_running && std::getline(std::cin, line)) {
         if (line.empty()) continue;
         try {
-            uint32_t bps = static_cast<uint32_t>(std::stoul(line));
-            bps = std::clamp(bps, 100'000u, 8'000'000u);
+            uint32_t bps = std::clamp(
+                (uint32_t)std::stoul(line), 100'000u, 8'000'000u);
             g_bitrate.store(bps);
             g_bitrate_changed.store(true);
-            std::cerr << "[ABR] New bitrate: " << bps / 1000 << " kbps\n";
+            apply_bitrate(bps);
+            std::cerr << "[ABR] stdin: " << bps/1000 << " kbps\n";
         } catch (...) {
             std::cerr << "[ABR] Invalid value: " << line << "\n";
         }
     }
     std::cerr << "[ABR] stdin closed\n";
+    // Do NOT set g_running=false — stream keeps going
+}
+
+static void fifo_reader_thread() {
+    unlink(CTRL_FIFO);
+    if (mkfifo(CTRL_FIFO, 0666) < 0) {
+        std::cerr << "[ABR] mkfifo failed: " << strerror(errno) << "\n";
+        return;
+    }
+    std::cerr << "[ABR] Ready: echo <bps> > " << CTRL_FIFO << "\n";
+
+    while (g_running) {
+        // Opens block until a writer appears — that's fine
+        int fd = open(CTRL_FIFO, O_RDONLY);
+        if (fd < 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        char buf[64];
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        close(fd);
+        if (n <= 0) continue;
+        buf[n] = '\0';
+        std::string s(buf);
+        s.erase(s.find_last_not_of(" \t\r\n") + 1);
+        if (s.empty()) continue;
+        try {
+            uint32_t bps = std::clamp(
+                (uint32_t)std::stoul(s), 100'000u, 8'000'000u);
+            g_bitrate.store(bps);
+            g_bitrate_changed.store(true);
+            apply_bitrate(bps); // immediate — don't wait for next frame
+            std::cerr << "[ABR] FIFO: " << bps/1000 << " kbps\n";
+        } catch (...) {
+            std::cerr << "[ABR] Invalid value: " << s << "\n";
+        }
+    }
+    unlink(CTRL_FIFO);
+}
+
+// ─── Apply bitrate to encoder ────────────────────────────────────────────────
+
+// V4L2 encoder device fd — set once encoder is running so we can change
+// bitrate mid-stream via VIDIOC_S_CTRL directly (extra-controls only works at start)
+static int g_v4l2_enc_fd = -1;
+
+static void apply_bitrate(uint32_t bps) {
+    // Method 1: direct V4L2 ioctl — works mid-stream on /dev/video11
+    if (g_v4l2_enc_fd >= 0) {
+        v4l2_control ctrl{};
+        ctrl.id    = V4L2_CID_MPEG_VIDEO_BITRATE;
+        ctrl.value = (int32_t)bps;
+        if (ioctl(g_v4l2_enc_fd, VIDIOC_S_CTRL, &ctrl) == 0) {
+            std::cerr << "[ENC] Bitrate set to " << bps/1000 << " kbps via V4L2\n";
+            return;
+        }
+        std::cerr << "[ENC] V4L2 bitrate ioctl failed: " << strerror(errno) << "\n";
+    }
+
+    // Method 2: GStreamer extra-controls fallback (less reliable mid-stream)
+    if (!g_encoder) return;
+    gchar *name = gst_element_get_name(g_encoder);
+    std::string enc_name(name);
+    g_free(name);
+
+    if (enc_name.find("v4l2h264enc") != std::string::npos) {
+        GstStructure *ctrls = gst_structure_new(
+            "extra-controls",
+            "video_bitrate", G_TYPE_INT, (gint)bps,
+            nullptr
+        );
+        g_object_set(G_OBJECT(g_encoder), "extra-controls", ctrls, nullptr);
+        gst_structure_free(ctrls);
+    } else {
+        g_object_set(G_OBJECT(g_encoder), "bitrate", bps / 1000, nullptr);
+    }
 }
 
 // ─── GStreamer bus callback ───────────────────────────────────────────────────
@@ -455,100 +202,94 @@ static void stdin_reader_thread() {
 static gboolean bus_callback(GstBus *, GstMessage *msg, gpointer) {
     switch (GST_MESSAGE_TYPE(msg)) {
         case GST_MESSAGE_ERROR: {
-            GError *err = nullptr; gchar *dbg = nullptr;
+            GError *err = nullptr;
+            gchar  *dbg = nullptr;
             gst_message_parse_error(msg, &err, &dbg);
             std::cerr << "[GST ERROR] " << err->message << "\n";
             if (dbg) std::cerr << "[GST DEBUG] " << dbg << "\n";
-            g_error_free(err); g_free(dbg);
-            g_running = false; g_queue_cv.notify_all();
+            g_error_free(err);
+            g_free(dbg);
+            g_running = false;
+            g_queue_cv.notify_all();
             break;
         }
         case GST_MESSAGE_EOS:
             std::cerr << "[GST] EOS\n";
-            g_running = false; g_queue_cv.notify_all();
+            g_running = false;
+            g_queue_cv.notify_all();
             break;
-        default: break;
+        case GST_MESSAGE_WARNING: {
+            GError *err = nullptr;
+            gchar  *dbg = nullptr;
+            gst_message_parse_warning(msg, &err, &dbg);
+            std::cerr << "[GST WARN] " << err->message << "\n";
+            g_error_free(err);
+            g_free(dbg);
+            break;
+        }
+        default:
+            break;
     }
     return TRUE;
 }
 
-// ─── Build GStreamer pipeline (H264 input, no encoder element) ────────────────
+// ─── Frame push thread (libcamera → appsrc) ──────────────────────────────────
 
-static bool build_pipeline(const std::string &host, uint16_t port,
-                            uint8_t fec_percentage) {
-    gst_init(nullptr, nullptr);
+static void frame_push_thread() {
+    GstClockTime pts = 0;
+    // At 60fps, each frame is ~16.67ms
+    const GstClockTime frame_duration = GST_SECOND / 60;
 
-    g_pipeline = gst_pipeline_new("streamer");
-    g_appsrc   = gst_element_factory_make("appsrc",        "source");
-    auto *parse  = gst_element_factory_make("h264parse",    "parse");
-    auto *pay    = gst_element_factory_make("rtph264pay",   "pay");
-    g_fecenc   = gst_element_factory_make("rtpulpfecenc",  "fec");
-    auto *sink   = gst_element_factory_make("udpsink",      "sink");
+    while (g_running) {
+        Frame frame;
+        {
+            std::unique_lock<std::mutex> lock(g_queue_mutex);
+            g_queue_cv.wait(lock, [] {
+                return !g_frame_queue.empty() || !g_running;
+            });
+            if (!g_running && g_frame_queue.empty()) break;
+            frame = std::move(g_frame_queue.front());
+            g_frame_queue.pop();
+        }
 
-    if (!g_pipeline || !g_appsrc || !parse || !pay || !g_fecenc || !sink) {
-        std::cerr << "[GST] Failed to create elements\n";
-        return false;
+        // Apply bitrate change if pending
+        if (g_bitrate_changed.exchange(false))
+            apply_bitrate(g_bitrate.load());
+
+        // Wrap frame data in a GstBuffer
+        GstBuffer *buf = gst_buffer_new_allocate(
+            nullptr, frame.data.size(), nullptr
+        );
+        GstMapInfo map;
+        gst_buffer_map(buf, &map, GST_MAP_WRITE);
+        std::memcpy(map.data, frame.data.data(), frame.data.size());
+        gst_buffer_unmap(buf, &map);
+
+        GST_BUFFER_PTS(buf)      = pts;
+        GST_BUFFER_DURATION(buf) = frame_duration;
+        // Carry capture_start as nanos-since-epoch in OFFSET_END for the encoder probe
+        GST_BUFFER_OFFSET_END(buf) = static_cast<guint64>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                frame.capture_start.time_since_epoch()).count());
+        pts += frame_duration;
+
+        GstFlowReturn ret = gst_app_src_push_buffer(
+            GST_APP_SRC(g_appsrc), buf
+        );
+        if (ret != GST_FLOW_OK) {
+            std::cerr << "[GST] appsrc push error: " << ret << "\n";
+        }
     }
 
-    // appsrc now receives H264 bitstream directly from our V4L2 encoder
-    GstCaps *caps = gst_caps_new_simple(
-        "video/x-h264",
-        "stream-format", G_TYPE_STRING, "byte-stream",
-        "alignment",     G_TYPE_STRING, "au",
-        nullptr
-    );
-    g_object_set(G_OBJECT(g_appsrc),
-        "caps",         caps,
-        "is-live",      TRUE,
-        "format",       GST_FORMAT_TIME,
-        "do-timestamp", TRUE,
-        nullptr
-    );
-    gst_caps_unref(caps);
-
-    g_object_set(G_OBJECT(parse), "config-interval", -1, nullptr);
-
-    g_object_set(G_OBJECT(pay),
-        "config-interval", -1,
-        "pt",              96,
-        "mtu",             1200u,
-        nullptr
-    );
-
-    g_object_set(G_OBJECT(g_fecenc),
-        "percentage", (guint)fec_percentage,
-        "pt",         122u,
-        nullptr
-    );
-
-    g_object_set(G_OBJECT(sink),
-        "host",  host.c_str(),
-        "port",  (gint)port,
-        "sync",  FALSE,
-        "async", FALSE,
-        nullptr
-    );
-
-    gst_bin_add_many(GST_BIN(g_pipeline),
-        g_appsrc, parse, pay, g_fecenc, sink, nullptr);
-
-    if (!gst_element_link_many(g_appsrc, parse, pay, g_fecenc, sink, nullptr)) {
-        std::cerr << "[GST] Failed to link pipeline\n";
-        return false;
-    }
-
-    GstBus *bus = gst_element_get_bus(g_pipeline);
-    gst_bus_add_watch(bus, bus_callback, nullptr);
-    gst_object_unref(bus);
-
-    return true;
+    gst_app_src_end_of_stream(GST_APP_SRC(g_appsrc));
 }
 
-// ─── libcamera callback ───────────────────────────────────────────────────────
+// ─── libcamera request callback ──────────────────────────────────────────────
 
 static void on_request_completed(Request *request) {
     if (request->status() == Request::RequestCancelled) return;
 
+    // Retrieve capture start time stored when this request was queued
     auto capture_end = std::chrono::steady_clock::now();
     std::chrono::steady_clock::time_point capture_start;
     {
@@ -560,32 +301,32 @@ static void on_request_completed(Request *request) {
                 capture_end - capture_start).count();
             g_capture_entry.erase(it);
         } else {
-            capture_start = capture_end;
+            capture_start = capture_end; // fallback: no capture time recorded
         }
     }
 
-    for (auto &[stream, fb] : request->buffers()) {
+    const auto &buffers = request->buffers();
+    for (auto &[stream, fb] : buffers) {
+        // Map the first plane (YUV420 Y plane start)
+        const FrameBuffer::Plane &plane0 = fb->planes()[0];
+
+        // For simplicity we copy all planes into a contiguous buffer
+        // A production impl would use dmabuf / zero-copy
         size_t total = 0;
         for (auto &p : fb->planes()) total += p.length;
 
         Frame frame;
         frame.data.resize(total);
-        frame.width        = stream->configuration().size.width;
-        frame.height       = stream->configuration().size.height;
+        frame.width         = stream->configuration().size.width;
+        frame.height        = stream->configuration().size.height;
         frame.capture_start = capture_start;
-        frame.seq          = g_frame_seq++;
-
-        // Get timestamp from libcamera metadata (microseconds)
-        auto &metadata = request->metadata();
-        auto ts = metadata.get(controls::SensorTimestamp);
-        frame.timestamp_us = ts ? (*ts / 1000) : 0;
 
         size_t offset = 0;
         for (const auto &plane : fb->planes()) {
             void *mem = mmap(nullptr, plane.length, PROT_READ,
                              MAP_SHARED, plane.fd.get(), plane.offset);
             if (mem != MAP_FAILED) {
-                memcpy(frame.data.data() + offset, mem, plane.length);
+                std::memcpy(frame.data.data() + offset, mem, plane.length);
                 munmap(mem, plane.length);
             }
             offset += plane.length;
@@ -593,12 +334,15 @@ static void on_request_completed(Request *request) {
 
         {
             std::lock_guard<std::mutex> lock(g_queue_mutex);
-            if (g_frame_queue.size() < MAX_QUEUE)
+            if (g_frame_queue.size() < MAX_QUEUE) {
                 g_frame_queue.push(std::move(frame));
+            }
+            // else: drop frame (encoder can't keep up)
         }
         g_queue_cv.notify_one();
     }
 
+    // Requeue the request so libcamera keeps delivering frames
     if (g_running) {
         request->reuse(Request::ReuseBuffers);
         {
@@ -609,200 +353,327 @@ static void on_request_completed(Request *request) {
     }
 }
 
-// ─── Encoder + push thread ────────────────────────────────────────────────────
+// ─── Build GStreamer pipeline ─────────────────────────────────────────────────
 
-static void encoder_thread(uint32_t width, uint32_t height,
-                            uint32_t fps, uint32_t initial_bitrate) {
-    // Callback: push encoded H264 directly into GStreamer appsrc
-    auto on_encoded = [&](uint8_t *data, size_t size, int64_t /*ts_us*/,
-                          bool keyframe, uint64_t seq) {
-        // Latency: encode done
-        {
-            std::lock_guard<std::mutex> lock(g_latency_mutex);
-            auto it = g_encode_entry.find(seq);
-            if (it != g_encode_entry.end()) {
-                g_encode_latency_ms = std::chrono::duration<double, std::milli>(
-                    std::chrono::steady_clock::now() - it->second).count();
+static bool build_pipeline(
+    const std::string &host,
+    uint16_t           port,
+    uint32_t           width,
+    uint32_t           height,
+    uint32_t           framerate,
+    uint32_t           initial_bitrate,
+    uint8_t            fec_percentage
+) {
+    gst_init(nullptr, nullptr);
 
-                // Total: from capture submit to encoded output
-                // capture_start is stored in g_encode_entry mapped by seq
-                // (we'd need to thread it through — encode_entry reused here
-                //  stores encode-start, so total = capture_latency + encode_latency)
-                g_total_latency_ms = g_capture_latency_ms + g_encode_latency_ms;
-                g_encode_entry.erase(it);
-            }
+    // Try hardware encoder first, fall back to software
+    g_encoder = gst_element_factory_make("v4l2h264enc", "encoder");
+    bool hw_enc = (g_encoder != nullptr);
+    if (!hw_enc) {
+        std::cerr << "[GST] v4l2h264enc not found, falling back to x264enc\n";
+        g_encoder = gst_element_factory_make("x264enc", "encoder");
+        if (!g_encoder) {
+            std::cerr << "[GST] No H264 encoder found!\n";
+            return false;
         }
-
-        GstBuffer *buf = gst_buffer_new_allocate(nullptr, size, nullptr);
-        GstMapInfo map;
-        gst_buffer_map(buf, &map, GST_MAP_WRITE);
-        memcpy(map.data, data, size);
-        gst_buffer_unmap(buf, &map);
-
-        if (keyframe)
-            GST_BUFFER_FLAG_UNSET(buf, GST_BUFFER_FLAG_DELTA_UNIT);
-        else
-            GST_BUFFER_FLAG_SET(buf, GST_BUFFER_FLAG_DELTA_UNIT);
-
-        GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(g_appsrc), buf);
-        if (ret != GST_FLOW_OK)
-            std::cerr << "[GST] appsrc push error: " << ret << "\n";
-    };
-
-    try {
-        V4L2H264Encoder enc(width, height, fps, initial_bitrate, on_encoded);
-        enc.start();
-
-        while (g_running) {
-            Frame frame;
-            {
-                std::unique_lock<std::mutex> lock(g_queue_mutex);
-                g_queue_cv.wait(lock, [] {
-                    return !g_frame_queue.empty() || !g_running;
-                });
-                if (!g_running && g_frame_queue.empty()) break;
-                frame = std::move(g_frame_queue.front());
-                g_frame_queue.pop();
-            }
-
-            // Stamp encode start
-            {
-                std::lock_guard<std::mutex> lock(g_latency_mutex);
-                g_encode_entry[frame.seq] = std::chrono::steady_clock::now();
-            }
-
-            enc.encode(frame.data.data(), frame.data.size(),
-                       frame.timestamp_us, frame.seq);
-        }
-
-        enc.stop();
-    } catch (const std::exception &e) {
-        std::cerr << "[ENC] Fatal: " << e.what() << "\n";
-        g_running = false;
-        g_queue_cv.notify_all();
     }
 
-    gst_app_src_end_of_stream(GST_APP_SRC(g_appsrc));
+    g_pipeline  = gst_pipeline_new("streamer");
+    g_appsrc    = gst_element_factory_make("appsrc",       "source");
+    auto *parse  = gst_element_factory_make("h264parse",   "parse");
+    auto *pay    = gst_element_factory_make("rtph264pay",  "pay");
+    g_fecenc    = gst_element_factory_make("rtpulpfecenc", "fec");
+    auto *sink   = gst_element_factory_make("udpsink",     "sink");
+
+    if (!g_pipeline || !g_appsrc || !g_encoder || !parse || !pay || !g_fecenc || !sink) {
+        std::cerr << "[GST] Failed to create elements\n";
+        return false;
+    }
+
+    // ── appsrc caps: raw YUV420 from libcamera ────────────────────────────
+    GstCaps *src_caps = gst_caps_new_simple(
+        "video/x-raw",
+        "format",    G_TYPE_STRING,  "I420",
+        "width",     G_TYPE_INT,     (gint)width,
+        "height",    G_TYPE_INT,     (gint)height,
+        "framerate", GST_TYPE_FRACTION, (gint)framerate, 1,
+        nullptr
+    );
+    g_object_set(G_OBJECT(g_appsrc),
+        "caps",         src_caps,
+        "is-live",      TRUE,
+        "format",       GST_FORMAT_TIME,
+        "do-timestamp", FALSE,
+        nullptr
+    );
+    gst_caps_unref(src_caps);
+
+    // ── Encoder settings ──────────────────────────────────────────────────
+    if (hw_enc) {
+        // v4l2h264enc: set initial bitrate via extra-controls
+        GstStructure *ctrls = gst_structure_new(
+            "extra-controls",
+            "video_bitrate",           G_TYPE_INT, (gint)initial_bitrate,
+            "h264_profile",            G_TYPE_INT, 0,   // Baseline
+            "h264_level",              G_TYPE_INT, 41,  // Level 4.1
+            "video_gop_size",          G_TYPE_INT, (gint)(framerate / 2), // keyframe every 0.5s
+            "video_b_frames",          G_TYPE_INT, 0,   // no B-frames
+            nullptr
+        );
+        g_object_set(G_OBJECT(g_encoder), "extra-controls", ctrls, nullptr);
+        gst_structure_free(ctrls);
+    } else {
+        // x264enc software fallback
+        g_object_set(G_OBJECT(g_encoder),
+            "bitrate",       initial_bitrate / 1000,  // x264enc uses kbps
+            "tune",          0x00000004,               // zerolatency
+            "speed-preset",  1,                        // ultrafast
+            "key-int-max",   (guint)(framerate / 2),
+            "bframes",       0u,
+            nullptr
+        );
+    }
+
+    // ── rtph264pay ────────────────────────────────────────────────────────
+    g_object_set(G_OBJECT(pay),
+        "config-interval", -1,
+        "pt",              96,
+        "mtu",             1200u,
+        nullptr
+    );
+
+    // ── FEC ───────────────────────────────────────────────────────────────
+    g_object_set(G_OBJECT(g_fecenc),
+        "percentage", (guint)fec_percentage,
+        "pt",         122u,
+        nullptr
+    );
+
+    // ── h264parse ─────────────────────────────────────────────────────────
+    g_object_set(G_OBJECT(parse),
+        "config-interval", -1,
+        nullptr
+    );
+
+    // ── udpsink ───────────────────────────────────────────────────────────
+    g_object_set(G_OBJECT(sink),
+        "host", host.c_str(),
+        "port", (gint)port,
+        "sync", FALSE,
+        "async", FALSE,
+        nullptr
+    );
+
+    // ── Add and link ──────────────────────────────────────────────────────
+    gst_bin_add_many(GST_BIN(g_pipeline),
+        g_appsrc, g_encoder, parse, pay, g_fecenc, sink,
+        nullptr
+    );
+
+    if (!gst_element_link_many(g_appsrc, g_encoder, parse, pay, g_fecenc, sink, nullptr)) {
+        std::cerr << "[GST] Failed to link pipeline\n";
+        return false;
+    }
+
+    // ── Bus watcher ───────────────────────────────────────────────────────
+    GstBus *bus = gst_element_get_bus(g_pipeline);
+    gst_bus_add_watch(bus, bus_callback, nullptr);
+    gst_object_unref(bus);
+
+    // ── Encoding latency probes ───────────────────────────────────────────
+    // Stamp each buffer as it enters the encoder
+    GstPad *enc_sink = gst_element_get_static_pad(g_encoder, "sink");
+    gst_pad_add_probe(enc_sink, GST_PAD_PROBE_TYPE_BUFFER,
+        [](GstPad *, GstPadProbeInfo *info, gpointer) -> GstPadProbeReturn {
+            std::lock_guard<std::mutex> lock(g_latency_mutex);
+            guint64 id = g_frame_counter++;
+            // Store frame id in buffer meta offset field as a simple stamp
+            GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
+            GST_BUFFER_OFFSET(buf) = id;
+            g_frame_entry[id] = std::chrono::steady_clock::now();
+            return GST_PAD_PROBE_OK;
+        }, nullptr, nullptr);
+    gst_object_unref(enc_sink);
+
+    // Measure wall-clock time when encoded buffer exits the encoder
+    GstPad *enc_src = gst_element_get_static_pad(g_encoder, "src");
+    gst_pad_add_probe(enc_src, GST_PAD_PROBE_TYPE_BUFFER,
+        [](GstPad *, GstPadProbeInfo *info, gpointer) -> GstPadProbeReturn {
+            GstBuffer *buf = GST_PAD_PROBE_INFO_BUFFER(info);
+            guint64 id              = GST_BUFFER_OFFSET(buf);
+            guint64 capture_nanos   = GST_BUFFER_OFFSET_END(buf);
+            auto    now             = std::chrono::steady_clock::now();
+            std::lock_guard<std::mutex> lock(g_latency_mutex);
+            // Encode latency
+            auto it = g_frame_entry.find(id);
+            if (it != g_frame_entry.end()) {
+                g_encode_latency_ms = std::chrono::duration<double, std::milli>(
+                    now - it->second).count();
+                g_frame_entry.erase(it);
+            }
+            // Total latency: capture submit → encoded frame out
+            if (capture_nanos > 0) {
+                auto capture_start = std::chrono::steady_clock::time_point(
+                    std::chrono::nanoseconds(capture_nanos));
+                g_total_latency_ms = std::chrono::duration<double, std::milli>(
+                    now - capture_start).count();
+            }
+            return GST_PAD_PROBE_OK;
+        }, nullptr, nullptr);
+    gst_object_unref(enc_src);
+
+    return true;
 }
 
 // ─── libcamera setup ─────────────────────────────────────────────────────────
 
 static std::shared_ptr<Camera> setup_camera(
-    CameraManager &mgr, uint32_t width, uint32_t height, uint32_t fps,
+    CameraManager        &mgr,
+    uint32_t              width,
+    uint32_t              height,
+    uint32_t              framerate,
     std::vector<std::unique_ptr<Request>> &requests_out,
-    FrameBufferAllocator *&alloc_out)
-{
+    FrameBufferAllocator *&alloc_out
+) {
     if (mgr.cameras().empty()) {
         std::cerr << "[CAM] No cameras found\n";
         return nullptr;
     }
+
     auto cam = mgr.cameras()[0];
     if (cam->acquire()) {
-        std::cerr << "[CAM] Failed to acquire\n";
+        std::cerr << "[CAM] Failed to acquire camera\n";
         return nullptr;
     }
 
     auto config = cam->generateConfiguration({StreamRole::VideoRecording});
-    if (!config) return nullptr;
+    if (!config) {
+        std::cerr << "[CAM] Failed to generate config\n";
+        return nullptr;
+    }
 
     StreamConfiguration &scfg = config->at(0);
     scfg.pixelFormat = formats::YUV420;
     scfg.size        = {width, height};
-    scfg.bufferCount = 6;
+    scfg.bufferCount = 4;
 
     switch (config->validate()) {
         case CameraConfiguration::Valid:    break;
         case CameraConfiguration::Adjusted: std::cerr << "[CAM] Config adjusted\n"; break;
         case CameraConfiguration::Invalid:
-            std::cerr << "[CAM] Invalid config\n"; return nullptr;
+            std::cerr << "[CAM] Invalid config\n";
+            return nullptr;
     }
+
     if (cam->configure(config.get())) {
-        std::cerr << "[CAM] Configure failed\n"; return nullptr;
+        std::cerr << "[CAM] Failed to configure camera\n";
+        return nullptr;
     }
 
     alloc_out = new FrameBufferAllocator(cam);
     Stream *stream = scfg.stream();
     if (alloc_out->allocate(stream) < 0) {
-        std::cerr << "[CAM] Alloc failed\n"; return nullptr;
+        std::cerr << "[CAM] Buffer allocation failed\n";
+        return nullptr;
     }
 
+    // Set frame duration controls (for framerate)
     ControlList controls(cam->controls());
-    int64_t frame_duration = 1'000'000 / fps;
+    int64_t frame_duration = 1'000'000 / framerate; // microseconds
     controls.set(controls::FrameDurationLimits,
         Span<const int64_t, 2>({frame_duration, frame_duration}));
 
     for (const auto &fb : alloc_out->buffers(stream)) {
         auto req = cam->createRequest();
-        if (!req || req->addBuffer(stream, fb.get())) return nullptr;
+        if (!req) {
+            std::cerr << "[CAM] Failed to create request\n";
+            return nullptr;
+        }
+        if (req->addBuffer(stream, fb.get())) {
+            std::cerr << "[CAM] Failed to add buffer to request\n";
+            return nullptr;
+        }
         requests_out.push_back(std::move(req));
     }
+
     return cam;
 }
 
 // ─── main ────────────────────────────────────────────────────────────────────
 
 int main(int argc, char *argv[]) {
-    std::string host    = "127.0.0.1";
-    uint16_t    port    = 9600;
-    uint32_t    width   = 720;
-    uint32_t    height  = 480;
-    uint32_t    fps     = 60;
-    uint32_t    bitrate = 1'000'000;
-    uint8_t     fec_pct = 30;
+    // ── Parse args ────────────────────────────────────────────────────────
+    std::string host     = "127.0.0.1";
+    uint16_t    port     = 9600;
+    uint32_t    width    = 720;
+    uint32_t    height   = 480;
+    uint32_t    fps      = 60;
+    uint32_t    bitrate  = 1'000'000;
+    uint8_t     fec_pct  = 30;
 
     for (int i = 1; i < argc; ++i) {
-        std::string a = argv[i];
-        if      (a == "--host"    && i+1 < argc) host    = argv[++i];
-        else if (a == "--port"    && i+1 < argc) port    = (uint16_t)std::stoi(argv[++i]);
-        else if (a == "--width"   && i+1 < argc) width   = std::stoul(argv[++i]);
-        else if (a == "--height"  && i+1 < argc) height  = std::stoul(argv[++i]);
-        else if (a == "--fps"     && i+1 < argc) fps     = std::stoul(argv[++i]);
-        else if (a == "--bitrate" && i+1 < argc) bitrate = std::stoul(argv[++i]);
-        else if (a == "--fec"     && i+1 < argc) fec_pct = (uint8_t)std::stoi(argv[++i]);
-        else if (a == "--help") {
+        std::string arg = argv[i];
+        if (arg == "--host"    && i+1 < argc) host    = argv[++i];
+        else if (arg == "--port"    && i+1 < argc) port    = (uint16_t)std::stoi(argv[++i]);
+        else if (arg == "--width"   && i+1 < argc) width   = std::stoul(argv[++i]);
+        else if (arg == "--height"  && i+1 < argc) height  = std::stoul(argv[++i]);
+        else if (arg == "--fps"     && i+1 < argc) fps     = std::stoul(argv[++i]);
+        else if (arg == "--bitrate" && i+1 < argc) bitrate = std::stoul(argv[++i]);
+        else if (arg == "--fec"     && i+1 < argc) fec_pct = (uint8_t)std::stoi(argv[++i]);
+        else if (arg == "--help") {
             std::cout <<
                 "Usage: streamer [options]\n"
-                "  --host     <ip>   Destination IP    (default: 127.0.0.1)\n"
-                "  --port     <n>    Destination port  (default: 9600)\n"
-                "  --width    <px>   Frame width        (default: 720)\n"
-                "  --height   <px>   Frame height       (default: 480)\n"
-                "  --fps      <n>    Framerate          (default: 60)\n"
-                "  --bitrate  <bps>  Initial bitrate    (default: 1000000)\n"
-                "  --fec      <pct>  FEC percentage     (default: 30)\n"
-                "\nSend new bitrate via stdin: echo 500000\n";
+                "  --host     <ip>    Destination IP    (default: 127.0.0.1)\n"
+                "  --port     <port>  Destination port  (default: 9600)\n"
+                "  --width    <px>    Frame width        (default: 720)\n"
+                "  --height   <px>    Frame height       (default: 480)\n"
+                "  --fps      <fps>   Framerate          (default: 60)\n"
+                "  --bitrate  <bps>   Initial bitrate    (default: 1000000)\n"
+                "  --fec      <pct>   FEC percentage     (default: 30)\n"
+                "\nSend new bitrate (bps) via stdin: echo 500000\n";
             return 0;
         }
     }
 
-    g_bitrate.store(bitrate);
-
     std::cerr << "[STREAMER] " << width << "x" << height << "@" << fps
               << "fps → " << host << ":" << port
-              << "  bitrate=" << bitrate/1000 << "kbps  fec=" << (int)fec_pct << "%\n";
+              << " bitrate=" << bitrate/1000 << "kbps fec=" << (int)fec_pct << "%\n";
 
+    // ── Signals ───────────────────────────────────────────────────────────
     std::signal(SIGINT,  on_signal);
     std::signal(SIGTERM, on_signal);
 
-    if (!build_pipeline(host, port, fec_pct)) return 1;
+    // ── GStreamer pipeline ────────────────────────────────────────────────
+    if (!build_pipeline(host, port, width, height, fps, bitrate, fec_pct))
+        return 1;
 
+    // ── libcamera ─────────────────────────────────────────────────────────
     CameraManager cam_mgr;
-    if (cam_mgr.start()) { std::cerr << "[CAM] CameraManager start failed\n"; return 1; }
+    if (cam_mgr.start()) {
+        std::cerr << "[CAM] Failed to start CameraManager\n";
+        return 1;
+    }
 
     FrameBufferAllocator *alloc = nullptr;
     std::vector<std::unique_ptr<Request>> requests;
     auto cam = setup_camera(cam_mgr, width, height, fps, requests, alloc);
     if (!cam) return 1;
 
+    // Store cam pointer for requeue in callback
     s_cam = cam.get();
+
     cam->requestCompleted.connect(&on_request_completed);
 
+    // ── Start everything ──────────────────────────────────────────────────
     gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
 
     ControlList cam_controls(cam->controls());
     if (cam->start(&cam_controls)) {
-        std::cerr << "[CAM] Start failed\n"; return 1;
+        std::cerr << "[CAM] Failed to start camera\n";
+        return 1;
     }
 
+    // Queue all requests — stamp capture start time for each
     for (auto &req : requests) {
         {
             std::lock_guard<std::mutex> lock(g_latency_mutex);
@@ -811,35 +682,50 @@ int main(int argc, char *argv[]) {
         cam->queueRequest(req.get());
     }
 
-    std::thread enc_thread(encoder_thread, width, height, fps, bitrate);
-    std::thread stdin_thread(stdin_reader_thread);
+    // ── Open /dev/video11 directly for mid-stream bitrate control ────────
+    g_v4l2_enc_fd = open("/dev/video11", O_RDWR | O_NONBLOCK);
+    if (g_v4l2_enc_fd < 0)
+        std::cerr << "[ENC] Cannot open /dev/video11 for direct ioctl: "
+                  << strerror(errno) << " (falling back to GStreamer property)\n";
 
+    // ── Threads ───────────────────────────────────────────────────────────
+    std::thread push_thread(frame_push_thread);
+    std::thread stdin_thread(stdin_reader_thread);
+    std::thread fifo_thread(fifo_reader_thread);
+
+    // ── GLib main loop (for GStreamer bus) ────────────────────────────────
     GMainLoop *loop = g_main_loop_new(nullptr, FALSE);
+    // Run until g_running is false
     std::thread glib_thread([&loop] {
         while (g_running) {
             std::this_thread::sleep_for(std::chrono::seconds(2));
             std::lock_guard<std::mutex> lock(g_latency_mutex);
             std::cerr << "[LATENCY]"
-                      << "  capture=" << g_capture_latency_ms << " ms"
-                      << "  encode="  << g_encode_latency_ms  << " ms"
-                      << "  total="   << g_total_latency_ms   << " ms"
-                      << "  bitrate=" << g_bitrate.load()/1000 << " kbps\n";
+                      << "  capture="  << g_capture_latency_ms  << " ms"
+                      << "  encode="   << g_encode_latency_ms   << " ms"
+                      << "  total="    << g_total_latency_ms    << " ms"
+                      << "  bitrate="  << g_bitrate.load() / 1000 << " kbps\n";
         }
         g_main_loop_quit(loop);
     });
     g_main_loop_run(loop);
     g_main_loop_unref(loop);
 
+    // ── Cleanup ───────────────────────────────────────────────────────────
     g_running = false;
     g_queue_cv.notify_all();
+
+    if (g_v4l2_enc_fd >= 0) { close(g_v4l2_enc_fd); g_v4l2_enc_fd = -1; }
 
     cam->stop();
     cam->release();
     cam_mgr.stop();
+
     if (alloc) delete alloc;
 
-    enc_thread.join();
-    stdin_thread.detach();
+    push_thread.join();
+    stdin_thread.detach(); // may block on getline forever
+    fifo_thread.detach();  // will unblock when FIFO is unlinked
     glib_thread.join();
 
     gst_element_set_state(g_pipeline, GST_STATE_NULL);
