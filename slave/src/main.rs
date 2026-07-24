@@ -3,8 +3,7 @@ use anyhow::Result;
 use anyhow::bail;
 use common::PacketType;
 use common::asyncqueue::AsyncQueue;
-use tokio::fs;
-use tracing::field::debug;
+use parking_lot::Mutex;
 use std::env;
 use std::net::IpAddr;
 use std::net::Ipv4Addr;
@@ -13,8 +12,8 @@ use std::net::ToSocketAddrs;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::fs;
 use tokio::io::AsyncWriteExt;
-use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::time::Instant;
 use tokio::time::sleep;
@@ -23,6 +22,7 @@ use tokio_serial::SerialPortBuilderExt;
 use tokio_serial::SerialStream;
 use tracing::debug;
 use tracing::error;
+use tracing::field::debug;
 use tracing::info;
 use tracing::level_filters::LevelFilter;
 use tracing::warn;
@@ -32,7 +32,7 @@ use common::{ArchivedMessage, Message, Socket, SocketEvent};
 mod media;
 use crate::media::Media;
 
-const SERVER: &str = "rcserver:9500";
+const SERVER: &str = "server:9500";
 const SERIAL_PORT: &str = "/dev/ttyUSB0";
 const SERIAL_BAUD: u32 = 115200;
 
@@ -82,10 +82,12 @@ impl AppState {
     fn setup_serial(self: Arc<AppState>) -> Result<()> {
         let state = self.clone();
         self.queue.submit(async move {
-            if let Ok(serial) = state.retry("serial setup", u32::MAX, Duration::from_secs(3), || {
-                tokio_serial::new(SERIAL_PORT, SERIAL_BAUD).open_native_async()
-            })
-            .await {
+            if let Ok(serial) = state
+                .retry("serial setup", u32::MAX, Duration::from_secs(3), || {
+                    tokio_serial::new(SERIAL_PORT, SERIAL_BAUD).open_native_async()
+                })
+                .await
+            {
                 *state.serial.lock().await = Some(serial);
             }
         });
@@ -95,11 +97,14 @@ impl AppState {
     fn setup_media(self: Arc<AppState>, video_port: u16, audio_port: u16) -> Result<()> {
         let state = self.clone();
         self.queue.submit(async move {
-            if let Ok(media) = state.retry("media setup", u32::MAX, Duration::from_secs(3), || {
-                debug!("Trying to setup MEDIA");
-                Media::start_stream(video_port, audio_port)
-            })
-            .await {
+            info!("Is ");
+            if let Ok(media) = state
+                .retry("media setup", u32::MAX, Duration::from_secs(3), || {
+                    debug!("Trying to setup MEDIA");
+                    Media::start_stream(video_port, audio_port)
+                })
+                .await
+            {
                 *state.media.lock() = Some(media);
             }
         });
@@ -179,21 +184,29 @@ impl AppState {
             *self.last_ping.lock() = Instant::now();
             *self.announce_id.lock() += 1;
 
-            self.socket.send(&self.server, &Message::SlaveAnnounce {
-                id: self.id.clone(),
-                latency: self.latency.lock().as_millis() as u16,
-                packet_id: *self.announce_id.lock()
-            }, PacketType::Unreliable)?;
+            self.socket.send(
+                &self.server,
+                &Message::SlaveAnnounce {
+                    id: self.id.clone(),
+                    latency: self.latency.lock().as_millis() as u16,
+                    packet_id: *self.announce_id.lock(),
+                },
+                PacketType::Unreliable,
+            )?;
 
             std::thread::sleep(Duration::from_millis(100));
         }
     }
 
     async fn send_err(&self, err: String) -> Result<()> {
-        self.socket.send(&self.server, &Message::SlaveError {
-            id: self.id.clone(),
-            err
-        }, PacketType::Reliable)
+        self.socket.send(
+            &self.server,
+            &Message::SlaveError {
+                id: self.id.clone(),
+                err,
+            },
+            PacketType::Reliable,
+        )
     }
 
     async fn retry<T, E: std::error::Error + std::marker::Send + std::marker::Sync + 'static>(
@@ -230,15 +243,16 @@ async fn run() -> Result<()> {
     state.clone().setup_serial()?;
 
     let state_clone = state.clone();
-    let announce_thread = tokio::spawn(async move {
-        state_clone.announce_loop()
-    });
+    let announce_thread = tokio::spawn(async move { state_clone.announce_loop() });
 
     let state_clone = state.clone();
     let receive_thread = tokio::spawn(async move {
         let mut res: Result<()>;
         loop {
-            res = state_clone.clone().fetch_packets().await
+            res = state_clone
+                .clone()
+                .fetch_packets()
+                .await
                 .context("packets fetching failed");
             if res.is_err() {
                 break;

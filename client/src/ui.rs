@@ -104,6 +104,7 @@ pub fn build(app: &Application, state: Arc<AppState>) -> Result<()> {
 
         window.set_child(Some(&overlay));
 
+        let bitrate_clone = bitrate_label.clone();
         let decode_clone = decode_label.clone();
         let slave_clone = slave_label.clone();
         let loss_clone = loss_label.clone();
@@ -111,6 +112,10 @@ pub fn build(app: &Application, state: Arc<AppState>) -> Result<()> {
         let state_clone = state.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
             // fps_label_clone.set_text(&format!("FPS: {:.1}", stats.fps));
+            bitrate_clone.set_text(&format!(
+                "Bitrate: {}",
+                *state_clone.bitrate.lock()
+            ));
             decode_clone.set_text(&format!(
                 "Decode latency: {:.3}ms",
                 *state_clone.decode_latency.lock()

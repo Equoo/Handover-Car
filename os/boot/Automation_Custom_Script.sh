@@ -1,9 +1,9 @@
 systemctl enable --now reverse-ssh
-systemctl enable --now heartbeat
-systemctl enable network_keepalive
+# systemctl enable --now heartbeat
+# systemctl enable network_keepalive
 
 apt update
-apt install -y openssh-client rpicam-apps netcat-openbsd make cargo libdbus-1-dev pkg-config unzip minicom
+# apt install -y openssh-client rpicam-apps netcat-openbsd make cargo libdbus-1-dev pkg-config unzip minicom
 
 rm /etc/modprobe.d/dietpi-disable_rpi_camera.conf
 rm /etc/modprobe.d/dietpi-disable_rpi_codec.conf
@@ -13,12 +13,12 @@ bcm2835_v4l2
 option
 EOF'
 
-echo "auto usb0
-iface usb0 inet dhcp
-" > /etc/network/interfaces
-
-sh -c 'echo "2c7c 0900" > /sys/bus/usb-serial/drivers/option1/new_id'
-echo 2c7c 0900 > /sys/bus/usb-serial/drivers/generic/new_id
+# echo "auto usb0
+# iface usb0 inet dhcp
+# " > /etc/network/interfaces
+#
+# sh -c 'echo "2c7c 0900" > /sys/bus/usb-serial/drivers/option1/new_id'
+# echo 2c7c 0900 > /sys/bus/usb-serial/drivers/generic/new_id
 
 apt install -y "linux-headers-$(uname -r)"
 

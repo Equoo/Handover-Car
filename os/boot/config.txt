@@ -102,6 +102,5 @@ arm_freq=1600
 #sdram_freq_min=400
 arm_64bit=1
 
-dtoverlay=imx462,vc4-kms-v3d,noaudio
-dtoverlay=disable-wifi
+dtoverlay=imx462,vc4-kms-v3d
 dtparam=i2c_vc=on

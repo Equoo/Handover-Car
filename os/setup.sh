@@ -9,12 +9,24 @@ mkdir -p /mnt/os
 mount $BOOT_PART /mnt/boot
 mount $OS_PART /mnt/os
 
-cp -r ./boot/* /mnt/boot/
-cp ./boot/Automation_Custom_PreScript.sh /mnt/os/boot/
-cp ./boot/Automation_Custom_Script.sh /mnt/os/boot/
-cp ./boot/dietpi.txt /mnt/os/boot/
+set -a
+source .env
+set +a
+
+work_dir=$(mktemp -d)
+
+for file in ./boot/*; do
+  [ -f "$file" ] || continue
+  filename=$(basename "$file")
+  envsubst <"$file" >"$work_dir/${filename}"
+done
+
+cp -r $work_dir/* /mnt/boot/
+cp -r $work_dir/* /mnt/os/boot/
 cp -r ./root/* /mnt/os/root
 cp -r ./root/.ssh /mnt/os/root
+
+rm -Rf $work_dir
 
 chown -R root:root /root
 chmod 700 /mnt/os/root/.ssh
