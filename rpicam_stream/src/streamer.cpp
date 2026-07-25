@@ -20,6 +20,7 @@
  *   ./streamer --host 37.59.106.4 --port 9600
  */
 
+#include <cstdint>
 #include <gst/app/gstappsrc.h>
 #include <gst/gst.h>
 #include <libcamera/libcamera.h>
@@ -89,9 +90,9 @@ public:
                          bool keyframe, uint64_t seq)>;
 
   V4L2H264Encoder(uint32_t width, uint32_t height, uint32_t fps,
-                  uint32_t bitrate, OutputCallback cb)
+                  uint32_t bitrate, uint32_t stride, OutputCallback cb)
       : width_(width), height_(height), fps_(fps), bitrate_(bitrate),
-        output_cb_(cb) {
+        stride_(stride), output_cb_(cb) {
     fd_ = open("/dev/video11", O_RDWR | O_NONBLOCK);
     if (fd_ < 0)
       throw std::runtime_error("Cannot open /dev/video11");
@@ -219,7 +220,7 @@ private:
 
   int fd_ = -1;
   bool running_ = true;
-  uint32_t width_, height_, fps_, bitrate_;
+  uint32_t width_, height_, fps_, bitrate_, stride_;
 
   std::vector<Buffer> input_buffers_;
   std::vector<Buffer> output_buffers_;
@@ -245,8 +246,8 @@ private:
     fmt.fmt.pix_mp.field = V4L2_FIELD_ANY;
     fmt.fmt.pix_mp.colorspace = V4L2_COLORSPACE_JPEG; // = BT.601 full range
     fmt.fmt.pix_mp.num_planes = 1;
-    fmt.fmt.pix_mp.plane_fmt[0].bytesperline = width_;
-    fmt.fmt.pix_mp.plane_fmt[0].sizeimage = width_ * height_ * 3 / 2;
+    fmt.fmt.pix_mp.plane_fmt[0].bytesperline = stride_;
+    fmt.fmt.pix_mp.plane_fmt[0].sizeimage = stride_ * height_ * 3 / 2;
     if (xioctl(fd_, VIDIOC_S_FMT, &fmt) < 0)
       throw std::runtime_error("S_FMT input failed");
 
@@ -684,8 +685,8 @@ static void on_request_completed(Request *request) {
 // ─── Encoder + push thread
 // ────────────────────────────────────────────────────
 
-static void encoder_thread(uint32_t width, uint32_t height, uint32_t fps,
-                           uint32_t initial_bitrate) {
+static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
+                           uint32_t fps, uint32_t initial_bitrate) {
   // Callback: push encoded H264 directly into GStreamer appsrc
   auto on_encoded = [&](uint8_t *data, size_t size, int64_t /*ts_us*/,
                         bool keyframe, uint64_t seq) {
@@ -724,7 +725,8 @@ static void encoder_thread(uint32_t width, uint32_t height, uint32_t fps,
   };
 
   try {
-    V4L2H264Encoder enc(width, height, fps, initial_bitrate, on_encoded);
+    V4L2H264Encoder enc(width, height, fps, initial_bitrate, stride,
+                        on_encoded);
     enc.start();
 
     g_encoder_ptr.store(&enc);
@@ -766,7 +768,7 @@ static void encoder_thread(uint32_t width, uint32_t height, uint32_t fps,
 static std::shared_ptr<Camera>
 setup_camera(CameraManager &mgr, uint32_t width, uint32_t height, uint32_t fps,
              std::vector<std::unique_ptr<Request>> &requests_out,
-             FrameBufferAllocator *&alloc_out) {
+             FrameBufferAllocator *&alloc_out, unsigned int &stride_out) {
   if (mgr.cameras().empty()) {
     std::cerr << "[CAM] No cameras found\n";
     return nullptr;
@@ -800,6 +802,8 @@ setup_camera(CameraManager &mgr, uint32_t width, uint32_t height, uint32_t fps,
     std::cerr << "[CAM] Configure failed\n";
     return nullptr;
   }
+
+  stride_out = scfg.stride;
 
   alloc_out = new FrameBufferAllocator(cam);
   Stream *stream = scfg.stream();
@@ -883,8 +887,9 @@ int main(int argc, char *argv[]) {
   }
 
   FrameBufferAllocator *alloc = nullptr;
+  uint32_t stride = 0;
   std::vector<std::unique_ptr<Request>> requests;
-  auto cam = setup_camera(cam_mgr, width, height, fps, requests, alloc);
+  auto cam = setup_camera(cam_mgr, width, height, fps, requests, alloc, stride);
   if (!cam)
     return 1;
 
@@ -907,7 +912,7 @@ int main(int argc, char *argv[]) {
     cam->queueRequest(req.get());
   }
 
-  std::thread enc_thread(encoder_thread, width, height, fps, bitrate);
+  std::thread enc_thread(encoder_thread, width, height, stride, fps, bitrate);
   std::thread stdin_thread(stdin_reader_thread);
   std::thread fifo_thread(fifo_reader_thread);
 
