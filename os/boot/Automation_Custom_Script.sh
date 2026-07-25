@@ -28,4 +28,6 @@ sudo chmod 777 -R RM500U_FOR_RPI
 cd RM500U_FOR_RPI
 sudo ./install.sh
 
+usermod -aG video,render dietpi
+
 reboot

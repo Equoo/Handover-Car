@@ -22,7 +22,6 @@ use tokio_serial::SerialPortBuilderExt;
 use tokio_serial::SerialStream;
 use tracing::debug;
 use tracing::error;
-use tracing::field::debug;
 use tracing::info;
 use tracing::level_filters::LevelFilter;
 use tracing::warn;

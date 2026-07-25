@@ -56,8 +56,7 @@ disable_overscan=1
 #lcd_rotate=0
 
 #-------RPi camera module-------
-start_x=1
-camera_auto_detect=1
+camera_auto_detect=0
 #disable_camera_led=1
 
 #-------GPU memory splits-------
@@ -69,10 +68,10 @@ gpu_mem_1024=96
 disable_splash=1
 
 #-------Onboard sound-----------
-dtparam=audio=off
+dtparam=audio=on
 
 #-------I2C-------------
-#dtparam=i2c_arm=off
+dtparam=i2c_arm=on
 #dtparam=i2c_arm_baudrate=100000
 
 #-------SPI-------------
@@ -102,5 +101,6 @@ arm_freq=1600
 #sdram_freq_min=400
 arm_64bit=1
 
-dtoverlay=imx462,vc4-kms-v3d
+dtoverlay=vc4-kms-v3d
+dtoverlay=imx462
 dtparam=i2c_vc=on

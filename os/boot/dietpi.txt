@@ -73,7 +73,8 @@ AUTO_UNMASK_LOGIND=0
 # - Add as many APT package names as you wish, separated by space.
 # - They will be installed after dietpi-software options and before the script defined via AUTO_SETUP_CUSTOM_SCRIPT_EXEC (see below) is executed.
 # - E.g. the following (without the leading "#") will install the APT packages iotop, iptables and xz-utils:
-AUTO_SETUP_APT_INSTALLS=openssh-client rpicam-apps netcat-openbsd make cargo libdbus-1-dev pkg-config unzip minicom
+# NOT SURE i2c-tools python3-smbus and TODO: active /etc/modules: i2c-bcm2708 i2c-dev
+AUTO_SETUP_APT_INSTALLS=openssh-client i2c-tools python3-smbus alsa-utils libcamera-dev rpicam-apps netcat-openbsd make cargo clang cmake gstreamer1.0-plugins-* libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libgstreamer-plugins-bad1.0-dev libdbus-1-dev pkg-config unzip minicom
 
 # Custom Script (pre-networking and pre-DietPi install)
 # - Allows you to automatically execute a custom script before network is up on first boot.
