@@ -1,5 +1,5 @@
-use std::process::{Child, Command, Stdio};
 use std::io::Result;
+use std::process::{Child, Command, Stdio};
 use tracing::{debug, info};
 
 pub struct Media {
@@ -10,7 +10,7 @@ pub struct Media {
 impl Media {
     pub fn start_stream(video_port: u16, _audio_port: u16) -> Result<Self> {
         Ok(Self {
-           video: Media::start_video(video_port)?
+            video: Media::start_video(video_port)?,
         })
     }
 
@@ -19,8 +19,12 @@ impl Media {
 
         let mut video = Command::new("./rpicam_stream/build/streamer")
             .args([
-                "--host", "37.59.106.4",
-                "--port",  &format!("{port}")
+                "--host",
+                "37.59.106.4",
+                "--port",
+                &format!("{port}"),
+                "--bitrate",
+                "4000000",
             ])
             .spawn()?;
 

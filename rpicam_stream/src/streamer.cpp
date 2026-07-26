@@ -279,7 +279,7 @@ private:
 
     // Baseline profile — no B-frames, simplest NAL structure
     ctrl.id = V4L2_CID_MPEG_VIDEO_H264_PROFILE;
-    ctrl.value = V4L2_MPEG_VIDEO_H264_PROFILE_BASELINE;
+    ctrl.value = V4L2_MPEG_VIDEO_H264_PROFILE_HIGH;
     xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
 
     // Level 4.1
@@ -305,6 +305,14 @@ private:
     // VBR mode
     ctrl.id = V4L2_CID_MPEG_VIDEO_BITRATE_MODE;
     ctrl.value = V4L2_MPEG_VIDEO_BITRATE_MODE_VBR;
+    xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
+
+    ctrl.id = V4L2_CID_MPEG_VIDEO_H264_MIN_QP;
+    ctrl.value = 16; // don't waste bits on near-perfect quality when static
+    xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
+
+    ctrl.id = V4L2_CID_MPEG_VIDEO_H264_MAX_QP;
+    ctrl.value = 36; // cap how blocky it's allowed to get under motion
     xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
   }
 
