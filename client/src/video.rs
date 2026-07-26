@@ -57,25 +57,16 @@ fn choose_h264_decoder() -> &'static str {
 }
 
 // for NVDEC: need 4:2:0, not 4:4:4
-pub fn build_video(
-    sink: &gst::Element,
-    state: Arc<AppState>,
-) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
-    let caps = gst::Caps::builder("application/x-rtp")
-        .field("media", "video")
-        .field("encoding-name", "H264")
-        .field("clock-rate", 90000i32)
-        .field("payload", 96i32)
-        .build();
-
+pub fn build_video(sink: &gst::Element, state: Arc<AppState>) -> Result<gst::Pipeline> {
     let pipeline = gst::Pipeline::default();
 
+    let port = *state.video_port.lock();
     let src = gst::ElementFactory::make("srtsrc")
         .property(
             "uri",
-            &format!("srt://{}:{}?mode=caller", pi_public_ip, my_local_port),
+            format!("srt://{}:{}?mode=caller", state.server.ip(), port),
         )
-        .property("latency", 150u32) // ms, tune per earlier discussion
+        .property("latency", 40i32) // ms, tune per earlier discussion
         .build()?;
 
     let tsdemux = gst::ElementFactory::make("tsdemux").build()?;
@@ -102,11 +93,16 @@ pub fn build_video(
 
     pipeline.add_many([&src, &tsdemux, &parse, &dec, &conv, &caps_filter, sink])?;
     src.link(&tsdemux)?;
-    gst::Element::link_many([&src, &tsdemux, &parse, &dec, &conv, &caps_filter, sink])?;
+    gst::Element::link_many([&parse, &dec, &conv, &caps_filter, sink])?;
 
     tsdemux.connect_pad_added(move |_, src_pad| {
         let sink_pad = parse.static_pad("sink").unwrap();
-        src_pad.link(&sink_pad).unwrap();
+        if sink_pad.is_linked() {
+            return;
+        }
+        if let Err(e) = src_pad.link(&sink_pad) {
+            eprintln!("[GST] failed to link tsdemux pad: {e:?}");
+        }
     });
 
     let entry_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
@@ -129,8 +125,5 @@ pub fn build_video(
             gst::PadProbeReturn::Ok
         });
 
-    match src.dynamic_cast::<gst_app::AppSrc>() {
-        Ok(appsrc_casted) => Ok((pipeline, appsrc_casted)),
-        Err(_) => anyhow::bail!("Dynamic cast of appsrc failed"),
-    }
+    Ok(pipeline)
 }
