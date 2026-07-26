@@ -21,12 +21,12 @@ const SLAVE: &str = "FlashMcqueen";
 
 pub struct AppState {
     socket: Socket,
-    pub server: SocketAddr,
+    server: SocketAddr,
     // tx: mpsc::Sender<AppEvent>,
     uuid: Mutex<Uuid>,
     last_ping: Mutex<Instant>,
     announce_id: Mutex<u16>,
-    pub video_port: Mutex<u16>,
+    pub appsrc: Mutex<Option<gst_app::AppSrc>>,
     pub decode_latency: Mutex<f64>,
     pub encode_latency: Mutex<f64>,
     pub slave_latency: Mutex<u16>,
@@ -63,9 +63,9 @@ impl AppState {
         Ok(Self {
             socket,
             server,
+            appsrc: Mutex::new(None),
             uuid: Mutex::new(Uuid::nil()),
             last_ping: Mutex::new(Instant::now()),
-            video_port: Mutex::new(0),
             decode_latency: Mutex::new(0f64),
             encode_latency: Mutex::new(0f64),
             slave_latency: Mutex::new(0),
@@ -73,12 +73,37 @@ impl AppState {
             announce_id: Mutex::new(0),
             fps: Mutex::new(0),
             bitrate: Mutex::new(1000000),
-            loss: Mutex::new(PacketLoss {
-                num_lost: 0,
-                num_pushed: 0,
-                loss_pct: 0f64,
-            }),
+            loss: Mutex::new(PacketLoss {num_lost: 0, num_pushed: 0, loss_pct: 0f64}),
         })
+    }
+
+    fn receive_video(self: Arc<AppState>, port: u16) {
+        tokio::spawn(async move {
+            let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
+            debug!("Send to {}:{port}", self.server.ip().to_string());
+            socket
+                .send_to(&[1], format!("{}:{port}", self.server.ip()))
+                .await
+                .unwrap();
+
+            let mut buffer = [0u8; 1 << 18];
+            loop {
+                if let Ok((size, _)) = socket.recv_from(&mut buffer).await {
+                    let mut gst_buffer = gst::Buffer::with_size(size).unwrap();
+                    {
+                        let buf = gst_buffer.get_mut().unwrap();
+                        buf.copy_from_slice(0, &buffer[..size]).unwrap();
+                    }
+                    if let Some(appsrc) = self.appsrc.lock().as_mut() {
+                        appsrc.push_buffer(gst_buffer)?;
+                    }
+                }
+                if false {
+                    break;
+                }
+            }
+            Ok::<(), anyhow::Error>(())
+        });
     }
 
     fn announce_loop(&self) -> Result<()> {
@@ -91,7 +116,7 @@ impl AppState {
                 &Message::MasterAnnounce {
                     uuid: self.uuid.lock().to_string(),
                     packet_id: *self.announce_id.lock(),
-                    bitrate: *self.bitrate.lock(),
+                    bitrate: *self.bitrate.lock()
                 },
                 PacketType::Unreliable,
             )?;
@@ -147,7 +172,7 @@ impl AppState {
             } => {
                 info!("Connected to the server");
                 *self.uuid.lock() = Uuid::from_str(uuid)?;
-                *self.video_port.lock() = video_port.into();
+                self.clone().receive_video(video_port.into());
 
                 let state_clone = self.clone();
                 let announce_thread = tokio::spawn(async move { state_clone.announce_loop() });

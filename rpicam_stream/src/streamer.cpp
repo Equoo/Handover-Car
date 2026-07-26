@@ -70,6 +70,7 @@ static std::atomic<bool> g_bitrate_changed{false};
 
 static GstElement *g_pipeline = nullptr;
 static GstElement *g_appsrc = nullptr;
+static GstElement *g_fecenc = nullptr;
 static Camera *s_cam = nullptr;
 
 // ─── V4L2 H264 Encoder (mirrors rpicam-apps H264Encoder) ─────────────────────
@@ -566,20 +567,23 @@ static gboolean bus_callback(GstBus *, GstMessage *msg, gpointer) {
 // ─── Build GStreamer pipeline (H264 input, no encoder element)
 // ────────────────
 
-static bool build_pipeline(const std::string &host, uint16_t port) {
+static bool build_pipeline(const std::string &host, uint16_t port,
+                           uint8_t fec_percentage) {
   gst_init(nullptr, nullptr);
 
   g_pipeline = gst_pipeline_new("streamer");
   g_appsrc = gst_element_factory_make("appsrc", "source");
   auto *parse = gst_element_factory_make("h264parse", "parse");
-  auto *mux = gst_element_factory_make("mpegtsmux", "mux");
-  auto *sink = gst_element_factory_make("srtsink", "sink");
+  auto *pay = gst_element_factory_make("rtph264pay", "pay");
+  g_fecenc = gst_element_factory_make("rtpulpfecenc", "fec");
+  auto *sink = gst_element_factory_make("udpsink", "sink");
 
-  if (!g_pipeline || !g_appsrc || !parse || !mux || !sink) {
+  if (!g_pipeline || !g_appsrc || !parse || !pay || !sink || !g_fecenc) {
     std::cerr << "[GST] Failed to create elements\n";
     return false;
   }
 
+  // appsrc now receives H264 bitstream directly from our V4L2 encoder
   GstCaps *caps = gst_caps_new_simple("video/x-h264", "stream-format",
                                       G_TYPE_STRING, "byte-stream", "alignment",
                                       G_TYPE_STRING, "au", nullptr);
@@ -589,17 +593,19 @@ static bool build_pipeline(const std::string &host, uint16_t port) {
 
   g_object_set(G_OBJECT(parse), "config-interval", -1, nullptr);
 
-  // srtsink as caller: connects OUT to the relay (VPS listener), works through
-  // cellular NAT
-  std::string uri =
-      "srt://" + host + ":" + std::to_string(port) + "?mode=caller";
-  g_object_set(G_OBJECT(sink), "uri", uri.c_str(), "latency",
-               20, // ms, tune against real 5G RTT/jitter
-               "wait-for-connection", FALSE, nullptr);
+  g_object_set(G_OBJECT(pay), "config-interval", -1, "pt", 96, "mtu", 1200u,
+               nullptr);
 
-  gst_bin_add_many(GST_BIN(g_pipeline), g_appsrc, parse, mux, sink, nullptr);
+  g_object_set(G_OBJECT(g_fecenc), "percentage", (guint)fec_percentage, "pt",
+               122u, nullptr);
 
-  if (!gst_element_link_many(g_appsrc, parse, mux, sink, nullptr)) {
+  g_object_set(G_OBJECT(sink), "host", host.c_str(), "port", (gint)port, "sync",
+               FALSE, "async", FALSE, nullptr);
+
+  gst_bin_add_many(GST_BIN(g_pipeline), g_appsrc, parse, pay, g_fecenc, sink,
+                   nullptr);
+
+  if (!gst_element_link_many(g_appsrc, parse, pay, g_fecenc, sink, nullptr)) {
     std::cerr << "[GST] Failed to link pipeline\n";
     return false;
   }
@@ -858,6 +864,7 @@ int main(int argc, char *argv[]) {
   uint32_t height = 480;
   uint32_t fps = 60;
   uint32_t bitrate = 1'000'000;
+  uint8_t fec_pct = 30;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -873,6 +880,8 @@ int main(int argc, char *argv[]) {
       fps = std::stoul(argv[++i]);
     else if (a == "--bitrate" && i + 1 < argc)
       bitrate = std::stoul(argv[++i]);
+    else if (a == "--fec" && i + 1 < argc)
+      fec_pct = (uint8_t)std::stoi(argv[++i]);
     else if (a == "--help") {
       std::cout
           << "Usage: streamer [options]\n"
@@ -882,6 +891,7 @@ int main(int argc, char *argv[]) {
              "  --height   <px>   Frame height       (default: 480)\n"
              "  --fps      <n>    Framerate          (default: 60)\n"
              "  --bitrate  <bps>  Initial bitrate    (default: 1000000)\n"
+             "  --fec      <pct>  FEC percentage     (default: 30)\n"
              "\nSend new bitrate via stdin: echo 500000\n";
       return 0;
     }
@@ -890,12 +900,13 @@ int main(int argc, char *argv[]) {
   g_bitrate.store(bitrate);
 
   std::cerr << "[STREAMER] " << width << "x" << height << "@" << fps << "fps → "
-            << host << ":" << port << "  bitrate=" << bitrate / 1000 << "\n";
+            << host << ":" << port << "  bitrate=" << bitrate / 1000
+            << "kbps  fec=" << (int)fec_pct << "%\n";
 
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
 
-  if (!build_pipeline(host, port))
+  if (!build_pipeline(host, port, fec_pct))
     return 1;
 
   CameraManager cam_mgr;

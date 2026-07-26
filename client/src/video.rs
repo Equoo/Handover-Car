@@ -57,19 +57,31 @@ fn choose_h264_decoder() -> &'static str {
 }
 
 // for NVDEC: need 4:2:0, not 4:4:4
-pub fn build_video(sink: &gst::Element, state: Arc<AppState>) -> Result<gst::Pipeline> {
+pub fn build_video(
+    sink: &gst::Element,
+    state: Arc<AppState>,
+) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
+    let caps = gst::Caps::builder("application/x-rtp")
+        .field("media", "video")
+        .field("encoding-name", "H264")
+        .field("clock-rate", 90000i32)
+        .field("payload", 96i32)
+        .build();
+
     let pipeline = gst::Pipeline::default();
+    let src = gst::ElementFactory::make("appsrc").name("source").build()?;
+    src.set_property("caps", &caps);
+    src.set_property("is-live", true);
+    src.set_property("format", gst::Format::Time);
+    src.set_property("do-timestamp", true); // true may needed but when true if receive packet before playing it warn
 
-    let port = *state.video_port.lock();
-    let src = gst::ElementFactory::make("srtsrc")
-        .property(
-            "uri",
-            format!("srt://{}:{}?mode=caller", state.server.ip(), port),
-        )
-        .property("latency", 20i32) // ms, tune per earlier discussion
-        .build()?;
+    let jitter = gst::ElementFactory::make("rtpjitterbuffer").build()?;
+    jitter.set_property("latency", 40u32);
+    jitter.set_property("drop-on-latency", true);
+    jitter.set_property("do-lost", true);
+    jitter.set_property("do-retransmission", true);
 
-    let tsdemux = gst::ElementFactory::make("tsdemux").build()?;
+    let depay = gst::ElementFactory::make("rtph264depay").build()?;
 
     let parse = gst::ElementFactory::make("h264parse").build()?;
     parse.set_property_from_str("config-interval", "-1");
@@ -91,19 +103,49 @@ pub fn build_video(sink: &gst::Element, state: Arc<AppState>) -> Result<gst::Pip
             .build(),
     );
 
-    pipeline.add_many([&src, &tsdemux, &parse, &dec, &conv, &caps_filter, sink])?;
-    src.link(&tsdemux)?;
-    gst::Element::link_many([&parse, &dec, &conv, &caps_filter, sink])?;
+    pipeline.add_many([
+        &src,
+        &jitter,
+        &depay,
+        &parse,
+        &dec,
+        &conv,
+        &caps_filter,
+        sink,
+    ])?;
 
-    tsdemux.connect_pad_added(move |_, src_pad| {
-        let sink_pad = parse.static_pad("sink").unwrap();
-        if sink_pad.is_linked() {
-            return;
-        }
-        if let Err(e) = src_pad.link(&sink_pad) {
-            eprintln!("[GST] failed to link tsdemux pad: {e:?}");
-        }
-    });
+    gst::Element::link_many([
+        &src,
+        &jitter,
+        &depay,
+        &parse,
+        &dec,
+        &conv,
+        &caps_filter,
+        sink,
+    ])?;
+
+    // jitter.connect("request-fec-decoder", false, |values| {
+    //     let jitter = values[0]
+    //         .get::<gst::Element>()
+    //         .expect("jitter \"request-fec-decoder\" signal values[0]");
+    //     let sess_id = values[1]
+    //         .get::<u32>()
+    //         .expect("jitter \"request-fec-decoder\" signal values[1]");
+    //
+    //     match make_fec_decoder(&jitter, sess_id) {
+    //         Ok(elem) => Some(elem.to_value()),
+    //         Err(err) => {
+    //             element_error!(
+    //                 jitter,
+    //                 gst::LibraryError::Failed,
+    //                 ("Failed to make FEC decoder"),
+    //                 ["{}", err]
+    //             );
+    //             None
+    //         }
+    //     }
+    // });
 
     let entry_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
     let entry_clone = entry_time.clone();
@@ -125,5 +167,29 @@ pub fn build_video(sink: &gst::Element, state: Arc<AppState>) -> Result<gst::Pip
             gst::PadProbeReturn::Ok
         });
 
-    Ok(pipeline)
+    let jitter_clone = jitter.clone();
+    let state_clone = state.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            let stats = jitter_clone.property::<gst::Structure>("stats");
+            // Fields: num-pushed, num-lost, num-late, num-duplicates, rtx-count...
+            let num_lost = stats.get::<u64>("num-lost").unwrap_or(0);
+            let num_pushed = stats.get::<u64>("num-pushed").unwrap_or(0);
+            let loss_pct = if num_pushed > 0 {
+                num_lost as f64 / (num_lost + num_pushed) as f64 * 100.0
+            } else {
+                0.0
+            };
+            let mut loss = state_clone.loss.lock();
+            loss.num_lost = num_lost;
+            loss.num_pushed = num_pushed;
+            loss.loss_pct = loss_pct;
+        }
+    });
+
+    match src.dynamic_cast::<gst_app::AppSrc>() {
+        Ok(appsrc_casted) => Ok((pipeline, appsrc_casted)),
+        Err(_) => anyhow::bail!("Dynamic cast of appsrc failed"),
+    }
 }

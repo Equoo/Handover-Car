@@ -1,20 +1,21 @@
-use anyhow::Result;
+use std::sync::Arc;
+use anyhow::{Result};
 use gstreamer as gst;
-use gstreamer::glib::object::ObjectExt;
-use gstreamer::prelude::*;
+use gstreamer::glib::object::{ObjectExt};
+use gstreamer::{ prelude::*};
 use gstreamer::{Message, MessageView};
 use gtk::{Application, ApplicationWindow};
-use gtk::{Box as GtkBox, Label, Orientation, Overlay, prelude::*};
-use std::sync::Arc;
+use gtk::{Box as GtkBox, Label, Orientation, Overlay,prelude::*};
 use tracing::{error, info, warn};
 
 use crate::app::AppState;
 use crate::video::build_video;
 
 fn window_run(win: &ApplicationWindow, sink: &gst::Element, state: Arc<AppState>) {
-    let pipeline = build_video(sink, state.clone()).unwrap();
+    let (pipeline, appsrc) = build_video(sink, state.clone()).unwrap();
 
     pipeline.set_state(gst::State::Playing).unwrap();
+    *state.appsrc.lock() = Some(appsrc);
 
     let bus = pipeline.bus().unwrap();
     bus.add_watch(move |_, msg: &Message| {
@@ -111,7 +112,10 @@ pub fn build(app: &Application, state: Arc<AppState>) -> Result<()> {
         let state_clone = state.clone();
         glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
             // fps_label_clone.set_text(&format!("FPS: {:.1}", stats.fps));
-            bitrate_clone.set_text(&format!("Bitrate: {}", *state_clone.bitrate.lock()));
+            bitrate_clone.set_text(&format!(
+                "Bitrate: {}",
+                *state_clone.bitrate.lock()
+            ));
             decode_clone.set_text(&format!(
                 "Decode latency: {:.3}ms",
                 *state_clone.decode_latency.lock()
