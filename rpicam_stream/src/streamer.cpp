@@ -594,7 +594,7 @@ static bool build_pipeline(const std::string &host, uint16_t port) {
   std::string uri =
       "srt://" + host + ":" + std::to_string(port) + "?mode=caller";
   g_object_set(G_OBJECT(sink), "uri", uri.c_str(), "latency",
-               40, // ms, tune against real 5G RTT/jitter
+               20, // ms, tune against real 5G RTT/jitter
                "wait-for-connection", FALSE, nullptr);
 
   gst_bin_add_many(GST_BIN(g_pipeline), g_appsrc, parse, mux, sink, nullptr);

@@ -66,7 +66,7 @@ pub fn build_video(sink: &gst::Element, state: Arc<AppState>) -> Result<gst::Pip
             "uri",
             format!("srt://{}:{}?mode=caller", state.server.ip(), port),
         )
-        .property("latency", 40i32) // ms, tune per earlier discussion
+        .property("latency", 20i32) // ms, tune per earlier discussion
         .build()?;
 
     let tsdemux = gst::ElementFactory::make("tsdemux").build()?;
