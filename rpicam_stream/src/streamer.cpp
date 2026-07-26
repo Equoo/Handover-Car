@@ -648,23 +648,48 @@ static void on_request_completed(Request *request) {
     frame.capture_start = capture_start;
     frame.seq = g_frame_seq++;
 
-    // Get timestamp from libcamera metadata (microseconds)
     auto &metadata = request->metadata();
     auto ts = metadata.get(controls::SensorTimestamp);
     frame.timestamp_us = ts ? (*ts / 1000) : 0;
 
-    size_t offset = 0;
+    // Group planes by fd, find total mapped length needed per fd
+    std::unordered_map<int, size_t> fd_total_len;
     for (const auto &plane : fb->planes()) {
-      void *mem = mmap(nullptr, plane.length, PROT_READ, MAP_SHARED,
-                       plane.fd.get(), plane.offset);
-      if (mem != MAP_FAILED) {
-        memcpy(frame.data.data() + offset, mem, plane.length);
-        munmap(mem, plane.length);
-      }
-      offset += plane.length;
+      size_t end = plane.offset + plane.length;
+      auto &cur = fd_total_len[plane.fd.get()];
+      cur = std::max(cur, end);
     }
 
-    {
+    // mmap each unique fd exactly once, at offset 0
+    std::unordered_map<int, void *> fd_base;
+    bool map_ok = true;
+    for (auto &[fd, len] : fd_total_len) {
+      void *base = mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, 0);
+      if (base == MAP_FAILED) {
+        std::cerr << "[CAP] mmap failed for fd=" << fd << ": "
+                  << strerror(errno) << "\n";
+        map_ok = false;
+        break;
+      }
+      fd_base[fd] = base;
+    }
+
+    if (map_ok) {
+      size_t offset = 0;
+      for (const auto &plane : fb->planes()) {
+        void *base = fd_base[plane.fd.get()];
+        memcpy(frame.data.data() + offset, (uint8_t *)base + plane.offset,
+               plane.length);
+        offset += plane.length;
+      }
+    }
+
+    for (auto &[fd, base] : fd_base) {
+      size_t len = fd_total_len[fd];
+      munmap(base, len);
+    }
+
+    if (map_ok) {
       std::lock_guard<std::mutex> lock(g_queue_mutex);
       if (g_frame_queue.size() < MAX_QUEUE)
         g_frame_queue.push(std::move(frame));
@@ -684,6 +709,8 @@ static void on_request_completed(Request *request) {
 
 // ─── Encoder + push thread
 // ────────────────────────────────────────────────────
+
+static std::atomic<bool> g_dumped{false};
 
 static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
                            uint32_t fps, uint32_t initial_bitrate) {
@@ -751,6 +778,14 @@ static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
 
       enc.encode(frame.data.data(), frame.data.size(), frame.timestamp_us,
                  frame.seq);
+
+      if (!g_dumped.exchange(true)) {
+        FILE *f = fopen("/tmp/raw_frame.yuv", "wb");
+        fwrite(frame.data.data(), 1, frame.data.size(), f);
+        fclose(f);
+        std::cerr << "[DEBUG] Dumped raw frame, size=" << frame.data.size()
+                  << "\n";
+      }
     }
 
     enc.stop();
