@@ -873,8 +873,6 @@ int main(int argc, char *argv[]) {
       fps = std::stoul(argv[++i]);
     else if (a == "--bitrate" && i + 1 < argc)
       bitrate = std::stoul(argv[++i]);
-    else if (a == "--fec" && i + 1 < argc)
-      fec_pct = (uint8_t)std::stoi(argv[++i]);
     else if (a == "--help") {
       std::cout
           << "Usage: streamer [options]\n"
@@ -884,7 +882,6 @@ int main(int argc, char *argv[]) {
              "  --height   <px>   Frame height       (default: 480)\n"
              "  --fps      <n>    Framerate          (default: 60)\n"
              "  --bitrate  <bps>  Initial bitrate    (default: 1000000)\n"
-             "  --fec      <pct>  FEC percentage     (default: 30)\n"
              "\nSend new bitrate via stdin: echo 500000\n";
       return 0;
     }
@@ -893,13 +890,12 @@ int main(int argc, char *argv[]) {
   g_bitrate.store(bitrate);
 
   std::cerr << "[STREAMER] " << width << "x" << height << "@" << fps << "fps → "
-            << host << ":" << port << "  bitrate=" << bitrate / 1000
-            << "kbps  fec=" << (int)fec_pct << "%\n";
+            << host << ":" << port << "  bitrate=" << bitrate / 1000 << "\n";
 
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
 
-  if (!build_pipeline(host, port, fec_pct))
+  if (!build_pipeline(host, port))
     return 1;
 
   CameraManager cam_mgr;
