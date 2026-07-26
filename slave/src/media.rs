@@ -18,14 +18,7 @@ impl Media {
         // --profile baseline // but make freeze pipeline ?
 
         let mut video = Command::new("./rpicam_stream/build/streamer")
-            .args([
-                "--host",
-                "37.59.106.4",
-                "--port",
-                &format!("{port}"),
-                "--bitrate",
-                "4000000",
-            ])
+            .args(["--host", "37.59.106.4", "--port", &format!("{port}")])
             .spawn()?;
 
         // let mut rpicam = Command::new("rpicam-vid")
