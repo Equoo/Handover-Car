@@ -710,8 +710,6 @@ static void on_request_completed(Request *request) {
 // ─── Encoder + push thread
 // ────────────────────────────────────────────────────
 
-static std::atomic<bool> g_dumped{false};
-
 static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
                            uint32_t fps, uint32_t initial_bitrate) {
   // Callback: push encoded H264 directly into GStreamer appsrc
@@ -778,14 +776,6 @@ static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
 
       enc.encode(frame.data.data(), frame.data.size(), frame.timestamp_us,
                  frame.seq);
-
-      if (!g_dumped.exchange(true)) {
-        FILE *f = fopen("/tmp/raw_frame.yuv", "wb");
-        fwrite(frame.data.data(), 1, frame.data.size(), f);
-        fclose(f);
-        std::cerr << "[DEBUG] Dumped raw frame, size=" << frame.data.size()
-                  << "\n";
-      }
     }
 
     enc.stop();
