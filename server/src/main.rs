@@ -1,3 +1,5 @@
+use std::process::{Child, Command, Stdio};
+use std::time::{Duration, SystemTime};
 use std::{collections::HashMap, env, net::SocketAddr, str::FromStr, sync::Arc};
 
 use anyhow::{Context, Result, bail};
@@ -12,16 +14,18 @@ use uuid::Uuid;
 
 const SLAVES_LIMIT: u8 = 16;
 const MAIN_PORT: u16 = 9500;
-const VIDEO_PORT: u16 = 9600; // - 9616
-const AUDIO_PORT: u16 = 9700; // - 9716
+const IN_VIDEO_PORT: u16 = 9600; // - 9616
+const OUT_VIDEO_PORT: u16 = 9700; // - 9716
+const AUDIO_PORT: u16 = 9800; // - 9816
 
 struct Slave {
     name: String,
     uniqueid: u8,
     last_addr: SocketAddr,
+    last_ping: SystemTime,
     latency: u16,
     bitrate: u32,
-    video_thread: AbortHandle,
+    video_relay: Child,
     // audio_thread: AbortHandle,
     subscriber: Uuid,
 }
@@ -99,10 +103,15 @@ impl AppState {
         }
 
         let uniqueid = self.uniqueid();
-        let video_thread = self
-            .clone()
-            .new_pipesocket(VIDEO_PORT + uniqueid as u16, id.clone())
-            .await?;
+        let video_port_a = IN_VIDEO_PORT + uniqueid as u16;
+        let video_port_b = OUT_VIDEO_PORT + uniqueid as u16;
+
+        let video_relay = Command::new("srt-live-transmit")
+            .arg(format!("srt://0.0.0.0:{video_port_a}?mode=listener"))
+            .arg(format!("srt://0.0.0.0:{video_port_b}?mode=listener"))
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()?;
 
         self.slaves.lock().await.insert(
             id.clone(),
@@ -110,14 +119,15 @@ impl AppState {
                 name: id,
                 uniqueid,
                 last_addr: addr,
+                last_ping: SystemTime::now(),
                 latency,
-                video_thread,
+                video_relay,
                 bitrate: 1000000,
                 subscriber: Uuid::nil(),
             },
         );
 
-        Ok((VIDEO_PORT + uniqueid as u16, AUDIO_PORT + uniqueid as u16))
+        Ok((video_port_a, AUDIO_PORT + uniqueid as u16))
     }
 
     async fn handle_messages(
@@ -137,6 +147,8 @@ impl AppState {
                 if let Some(slave) = self.slaves.lock().await.get_mut(&id) {
                     slave.latency = latency.into();
                     bitrate = slave.bitrate;
+
+                    slave.last_ping = SystemTime::now();
                 } else {
                     if *self.slaves_count.lock() == SLAVES_LIMIT {
                         self.socket.send(
@@ -169,7 +181,7 @@ impl AppState {
                     &addr,
                     &Message::ServerPong {
                         packet_id: packet_id.into(),
-                        bitrate
+                        bitrate,
                     },
                     PacketType::Unreliable,
                 )?;
@@ -192,7 +204,7 @@ impl AppState {
                         &addr,
                         &Message::ServerClientConnected {
                             uuid: id.to_string(),
-                            video_port: VIDEO_PORT + slave.uniqueid as u16,
+                            video_port: OUT_VIDEO_PORT + slave.uniqueid as u16,
                             audio_port: AUDIO_PORT + slave.uniqueid as u16,
                         },
                         PacketType::Reliable,
@@ -216,7 +228,11 @@ impl AppState {
                     )?;
                 }
             }
-            ArchivedMessage::MasterAnnounce { uuid, packet_id, bitrate } => {
+            ArchivedMessage::MasterAnnounce {
+                uuid,
+                packet_id,
+                bitrate,
+            } => {
                 let mut latency: u16 = 0;
                 if let Some(client) = self.clients.lock().await.get(&Uuid::from_str(uuid)?)
                     && let Some(slave) = self.slaves.lock().await.get_mut(&client.subscribe)
@@ -228,7 +244,7 @@ impl AppState {
                     &addr,
                     &Message::ServerClientPong {
                         latency,
-                        packet_id: packet_id.into()
+                        packet_id: packet_id.into(),
                     },
                     PacketType::Unreliable,
                 )?;
@@ -236,6 +252,37 @@ impl AppState {
             _ => {}
         };
 
+        Ok(())
+    }
+
+    async fn ping_check(self: &Arc<AppState>) -> Result<()> {
+        let now = SystemTime::now();
+
+        let expired_keys: Vec<_> = {
+            let mut slaves = self.slaves.lock().await;
+            slaves
+                .iter_mut()
+                .filter(|(_, slave)| {
+                    now.duration_since(slave.last_ping)
+                        .map(|d| d > Duration::from_secs(1))
+                        .unwrap_or(false)
+                })
+                .map(|(key, slave)| {
+                    let _ = slave.video_relay.kill();
+                    let _ = slave.video_relay.wait();
+
+                    key.clone()
+                })
+                .collect()
+        };
+
+        if !expired_keys.is_empty() {
+            let mut slaves = self.slaves.lock().await;
+            for key in expired_keys {
+                info!("Lost connection with slave '{key}'");
+                slaves.remove(&key);
+            }
+        }
         Ok(())
     }
 
@@ -257,6 +304,9 @@ impl AppState {
                 self.handle_messages(packet.addr(), msg).await?;
             }
         }
+
+        self.ping_check().await?;
+
         Ok(())
     }
 }

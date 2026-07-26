@@ -70,7 +70,6 @@ static std::atomic<bool> g_bitrate_changed{false};
 
 static GstElement *g_pipeline = nullptr;
 static GstElement *g_appsrc = nullptr;
-static GstElement *g_fecenc = nullptr;
 static Camera *s_cam = nullptr;
 
 // ─── V4L2 H264 Encoder (mirrors rpicam-apps H264Encoder) ─────────────────────
@@ -567,23 +566,20 @@ static gboolean bus_callback(GstBus *, GstMessage *msg, gpointer) {
 // ─── Build GStreamer pipeline (H264 input, no encoder element)
 // ────────────────
 
-static bool build_pipeline(const std::string &host, uint16_t port,
-                           uint8_t fec_percentage) {
+static bool build_pipeline(const std::string &host, uint16_t port) {
   gst_init(nullptr, nullptr);
 
   g_pipeline = gst_pipeline_new("streamer");
   g_appsrc = gst_element_factory_make("appsrc", "source");
   auto *parse = gst_element_factory_make("h264parse", "parse");
-  auto *pay = gst_element_factory_make("rtph264pay", "pay");
-  g_fecenc = gst_element_factory_make("rtpulpfecenc", "fec");
-  auto *sink = gst_element_factory_make("udpsink", "sink");
+  auto *mux = gst_element_factory_make("mpegtsmux", "mux");
+  auto *sink = gst_element_factory_make("srtsink", "sink");
 
-  if (!g_pipeline || !g_appsrc || !parse || !pay || !sink || !g_fecenc) {
+  if (!g_pipeline || !g_appsrc || !parse || !mux || !sink) {
     std::cerr << "[GST] Failed to create elements\n";
     return false;
   }
 
-  // appsrc now receives H264 bitstream directly from our V4L2 encoder
   GstCaps *caps = gst_caps_new_simple("video/x-h264", "stream-format",
                                       G_TYPE_STRING, "byte-stream", "alignment",
                                       G_TYPE_STRING, "au", nullptr);
@@ -593,19 +589,17 @@ static bool build_pipeline(const std::string &host, uint16_t port,
 
   g_object_set(G_OBJECT(parse), "config-interval", -1, nullptr);
 
-  g_object_set(G_OBJECT(pay), "config-interval", -1, "pt", 96, "mtu", 1200u,
-               nullptr);
+  // srtsink as caller: connects OUT to the relay (VPS listener), works through
+  // cellular NAT
+  std::string uri =
+      "srt://" + host + ":" + std::to_string(port) + "?mode=caller";
+  g_object_set(G_OBJECT(sink), "uri", uri.c_str(), "latency",
+               150, // ms, tune against real 5G RTT/jitter
+               "wait-for-connection", FALSE, nullptr);
 
-  g_object_set(G_OBJECT(g_fecenc), "percentage", (guint)fec_percentage, "pt",
-               122u, nullptr);
+  gst_bin_add_many(GST_BIN(g_pipeline), g_appsrc, parse, mux, sink, nullptr);
 
-  g_object_set(G_OBJECT(sink), "host", host.c_str(), "port", (gint)port, "sync",
-               FALSE, "async", FALSE, nullptr);
-
-  gst_bin_add_many(GST_BIN(g_pipeline), g_appsrc, parse, pay, g_fecenc, sink,
-                   nullptr);
-
-  if (!gst_element_link_many(g_appsrc, parse, pay, g_fecenc, sink, nullptr)) {
+  if (!gst_element_link_many(g_appsrc, parse, mux, sink, nullptr)) {
     std::cerr << "[GST] Failed to link pipeline\n";
     return false;
   }
@@ -864,7 +858,6 @@ int main(int argc, char *argv[]) {
   uint32_t height = 480;
   uint32_t fps = 60;
   uint32_t bitrate = 1'000'000;
-  uint8_t fec_pct = 30;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
