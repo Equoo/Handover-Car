@@ -1,0 +1,13 @@
+[Unit]
+Description=Disable modem sleep mode (AT+QSCLK=0)
+Before=wwan-connect.service
+After=dev-ttyUSB2.device
+Wants=dev-ttyUSB2.device
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/modem-disable-sleep.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

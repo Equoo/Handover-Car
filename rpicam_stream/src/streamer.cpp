@@ -575,10 +575,10 @@ static bool build_pipeline(const std::string &host, uint16_t port,
   g_appsrc = gst_element_factory_make("appsrc", "source");
   auto *parse = gst_element_factory_make("h264parse", "parse");
   auto *pay = gst_element_factory_make("rtph264pay", "pay");
-  g_fecenc = gst_element_factory_make("rtpulpfecenc", "fec");
+  // g_fecenc = gst_element_factory_make("rtpulpfecenc", "fec");
   auto *sink = gst_element_factory_make("udpsink", "sink");
 
-  if (!g_pipeline || !g_appsrc || !parse || !pay || !sink || !g_fecenc) {
+  if (!g_pipeline || !g_appsrc || !parse || !pay || !sink) { // || !g_fecenc
     std::cerr << "[GST] Failed to create elements\n";
     return false;
   }
@@ -596,16 +596,17 @@ static bool build_pipeline(const std::string &host, uint16_t port,
   g_object_set(G_OBJECT(pay), "config-interval", -1, "pt", 96, "mtu", 1200u,
                nullptr);
 
-  g_object_set(G_OBJECT(g_fecenc), "percentage", (guint)fec_percentage, "pt",
-               122u, nullptr);
+  // g_object_set(G_OBJECT(g_fecenc), "percentage", (guint)fec_percentage, "pt",
+  //              122u, nullptr);
 
   g_object_set(G_OBJECT(sink), "host", host.c_str(), "port", (gint)port, "sync",
                FALSE, "async", FALSE, nullptr);
 
-  gst_bin_add_many(GST_BIN(g_pipeline), g_appsrc, parse, pay, g_fecenc, sink,
+  gst_bin_add_many(GST_BIN(g_pipeline), g_appsrc, parse, pay, sink, // g_fecenc,
                    nullptr);
 
-  if (!gst_element_link_many(g_appsrc, parse, pay, g_fecenc, sink, nullptr)) {
+  if (!gst_element_link_many(g_appsrc, parse, pay, sink,
+                             nullptr)) { // g_fecenc,
     std::cerr << "[GST] Failed to link pipeline\n";
     return false;
   }
