@@ -115,14 +115,15 @@ pub const METRICS: &[MetricDef] = &[
     MetricDef {
         id: MetricId::RtpLoss,
         key: 'l',
-        label: "RTP loss/duplicates/jitter",
+        label: "RTP lost/late/duplicates/jitter",
         format: |s| {
             let loss = *s.loss.lock();
             format!(
-                "RTP loss: {}/{} ({:.1}%)\nRTP duplicates: {}\nAvg jitter: {}",
+                "RTP lost: {}/{} ({:.1}%)\nRTP late: {}\nRTP duplicates: {}\nAvg jitter: {}",
                 loss.num_lost,
                 loss.num_lost + loss.num_pushed,
                 loss.loss_pct,
+                loss.num_late,
                 loss.num_duplicates,
                 loss.avg_jitter
             )
