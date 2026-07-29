@@ -119,14 +119,21 @@ public:
   void start() {
     // xioctl, not ioctl: these must retry on EINTR, and the error needs to
     // carry errno or a failure here is undiagnosable.
+    // Capture errno into a local before building the message: the operands of
+    // operator+ are indeterminately sequenced, so allocating the string first
+    // can clobber errno and report a bogus cause.
     int type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-    if (xioctl(fd_, VIDIOC_STREAMON, &type) < 0)
+    if (xioctl(fd_, VIDIOC_STREAMON, &type) < 0) {
+      const int err = errno;
       throw std::runtime_error(std::string("STREAMON input failed: ") +
-                               strerror(errno));
+                               strerror(err));
+    }
     type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    if (xioctl(fd_, VIDIOC_STREAMON, &type) < 0)
+    if (xioctl(fd_, VIDIOC_STREAMON, &type) < 0) {
+      const int err = errno;
       throw std::runtime_error(std::string("STREAMON output failed: ") +
-                               strerror(errno));
+                               strerror(err));
+    }
 
     // Queue all output (capture) buffers
     for (size_t i = 0; i < output_buffers_.size(); i++) {
@@ -137,9 +144,11 @@ public:
       buf.index = i;
       buf.length = 1;
       buf.m.planes = planes;
-      if (xioctl(fd_, VIDIOC_QBUF, &buf) < 0)
+      if (xioctl(fd_, VIDIOC_QBUF, &buf) < 0) {
+        const int err = errno;
         throw std::runtime_error(std::string("QBUF output failed: ") +
-                                 strerror(errno));
+                                 strerror(err));
+      }
     }
 
     poll_thread_ = std::thread(&V4L2H264Encoder::poll_loop, this);
