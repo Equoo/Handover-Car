@@ -10,10 +10,10 @@ use tracing::{error, info, warn};
 
 use crate::app::AppState;
 use crate::overlay;
-use crate::video::build_video;
+use crate::video::{RawRtpUdp, VideoReceiver};
 
 fn window_run(win: &ApplicationWindow, sink: &gst::Element, state: Arc<AppState>) {
-    let (pipeline, appsrc) = build_video(sink, state.clone()).unwrap();
+    let (pipeline, appsrc) = RawRtpUdp::build_pipeline(sink, state.clone()).unwrap();
 
     pipeline.set_state(gst::State::Playing).unwrap();
     *state.appsrc.lock() = Some(appsrc);
