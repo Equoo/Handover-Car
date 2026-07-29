@@ -277,19 +277,6 @@ private:
   void set_profile_level() {
     v4l2_control ctrl{};
 
-    // ---- TEST B ----------------------------------------------------------
-    // Every other control is disabled. If STREAMON still fails, CBR is broken
-    // on this firmware outright. If it succeeds, one of the controls below
-    // conflicts with CBR and we re-enable them one at a time.
-    ctrl.id = V4L2_CID_MPEG_VIDEO_BITRATE_MODE;
-    ctrl.value = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR;
-    if (xioctl(fd_, VIDIOC_S_CTRL, &ctrl) < 0)
-      std::cerr << "[ENC] CBR rejected at S_CTRL: " << strerror(errno) << "\n";
-    else
-      std::cerr << "[ENC] CBR accepted at S_CTRL\n";
-    return;
-    // ---- end TEST B ------------------------------------------------------
-
     // Baseline profile — no B-frames, simplest NAL structure
     ctrl.id = V4L2_CID_MPEG_VIDEO_H264_PROFILE;
     ctrl.value = V4L2_MPEG_VIDEO_H264_PROFILE_HIGH;
@@ -313,6 +300,11 @@ private:
     // Disable B-frames
     ctrl.id = V4L2_CID_MPEG_VIDEO_B_FRAMES;
     ctrl.value = 0;
+    xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
+
+    // VBR mode
+    ctrl.id = V4L2_CID_MPEG_VIDEO_BITRATE_MODE;
+    ctrl.value = V4L2_MPEG_VIDEO_BITRATE_MODE_VBR;
     xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
 
     ctrl.id = V4L2_CID_MPEG_VIDEO_H264_MIN_QP;
