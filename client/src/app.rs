@@ -34,6 +34,7 @@ pub struct AppState {
     pub fps: Mutex<u8>,
     pub bitrate: Mutex<u32>,
     pub loss: Mutex<PacketLoss>,
+    last_keyframe_request: Mutex<Option<Instant>>,
 }
 
 enum AppEvent {
@@ -74,7 +75,41 @@ impl AppState {
             fps: Mutex::new(0),
             bitrate: Mutex::new(1000000),
             loss: Mutex::new(PacketLoss {num_lost: 0, num_pushed: 0, loss_pct: 0f64}),
+            last_keyframe_request: Mutex::new(None),
         })
+    }
+
+    /// Ask the car's encoder for an IDR. Sent reliably: a dropped request
+    /// means the picture stays broken until the GOP fallback comes round.
+    ///
+    /// Rate limited, because a keyframe is several times the size of a normal
+    /// frame. Under sustained loss an unthrottled version would emit them
+    /// continuously and recreate exactly the bitrate spikes the long GOP was
+    /// introduced to remove.
+    pub fn request_keyframe(&self) {
+        const MIN_INTERVAL: Duration = Duration::from_millis(1000);
+
+        {
+            let mut last = self.last_keyframe_request.lock();
+            if let Some(t) = *last
+                && t.elapsed() < MIN_INTERVAL
+            {
+                return;
+            }
+            *last = Some(Instant::now());
+        }
+
+        if let Err(e) = self.socket.send(
+            &self.server,
+            &Message::MasterKeyframe {
+                slave_id: SLAVE.to_string(),
+            },
+            PacketType::Reliable,
+        ) {
+            warn!(error = ?e, "failed to request keyframe");
+        } else {
+            debug!("Requested keyframe");
+        }
     }
 
     fn receive_video(self: Arc<AppState>, port: u16) {
@@ -173,6 +208,11 @@ impl AppState {
                 info!("Connected to the server");
                 *self.uuid.lock() = Uuid::from_str(uuid)?;
                 self.clone().receive_video(video_port.into());
+
+                // The stream is already running and its opening IDR is long
+                // gone, so without this we would decode nothing until the GOP
+                // fallback fires.
+                self.request_keyframe();
 
                 let state_clone = self.clone();
                 let announce_thread = tokio::spawn(async move { state_clone.announce_loop() });

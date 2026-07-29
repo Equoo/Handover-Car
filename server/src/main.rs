@@ -137,6 +137,10 @@ impl AppState {
                 if let Some(slave) = self.slaves.lock().await.get_mut(&id) {
                     slave.latency = latency.into();
                     bitrate = slave.bitrate;
+                    // Cellular NAT rebinds, so the address a slave announces
+                    // from changes. Anything we push to it must use the
+                    // latest one, not the one it first connected with.
+                    slave.last_addr = addr;
                 } else {
                     if *self.slaves_count.lock() == SLAVES_LIMIT {
                         self.socket.send(
@@ -213,6 +217,18 @@ impl AppState {
                         &client.addr,
                         &deserialize::<Message, Error>(msg)?, // Note: This is really ugly
                         PacketType::Unreliable,
+                    )?;
+                }
+            }
+            ArchivedMessage::MasterKeyframe { slave_id } => {
+                if let Some(slave) = self.slaves.lock().await.get(slave_id.as_ref()) {
+                    debug!("Keyframe requested for {slave_id}");
+                    self.socket.send(
+                        &slave.last_addr,
+                        &Message::MasterKeyframe {
+                            slave_id: slave_id.to_string(),
+                        },
+                        PacketType::Reliable,
                     )?;
                 }
             }

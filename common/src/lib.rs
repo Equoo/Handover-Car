@@ -62,6 +62,12 @@ pub enum Message {
         packet_id: u16,
         bitrate: u32
     },
+    /// Ask the slave's encoder for an IDR. With a long GOP nothing else
+    /// produces one, so a receiver that has lost sync stays corrupted until
+    /// this arrives -- hence sent reliably.
+    MasterKeyframe {
+        slave_id: String,
+    },
     Disconnect {}
 }
 
