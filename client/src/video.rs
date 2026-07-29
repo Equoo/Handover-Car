@@ -63,7 +63,19 @@ pub fn build_video(
     jitter.set_property("latency", 80u32);
     jitter.set_property("drop-on-latency", true);
     jitter.set_property("do-lost", true);
-    jitter.set_property("do-retransmission", false);
+    // `rtpjitterbuffer` only runs its "this packet is never coming, give up"
+    // timer -- which is also what increments `num-lost` in `stats` -- as
+    // part of the retransmission codepath. With this off, a sequence gap is
+    // silently skipped the moment a later packet arrives and never gets
+    // counted as lost at all, regardless of how much real loss occurs.
+    // We have no RTCP feedback session here (no rtpsession/rtprtxreceive
+    // upstream of appsrc), so a retransmission request can never actually be
+    // answered -- this only switches on the bookkeeping, not real retries.
+    jitter.set_property("do-retransmission", true);
+    // Give up fast instead of GStreamer's "-1 automatic" RTT-based timeout,
+    // which has no real RTCP RTT to estimate from in this setup.
+    jitter.set_property("rtx-retry-period", 40i32);
+    jitter.set_property("rtx-max-retries", 0i32);
 
     let depay = gst::ElementFactory::make("rtph264depay").build()?;
 
@@ -185,8 +197,13 @@ pub fn build_video(
             state_clone.stats.tick_rates();
 
             let jitter_stats = jitter_clone.property::<gst::Structure>("stats");
-            // Fields: num-pushed, num-lost, num-late, num-duplicates, rtx-count...
-            let num_lost = jitter_stats.get::<u64>("num-late").unwrap_or(0); // oldly num-lost
+            // num-lost: sequence numbers that never arrived and were given
+            // up on (needs `do-retransmission` above to be tracked at all).
+            // num-late: packets that did arrive, just after the
+            // jitterbuffer's playout deadline, so they were dropped anyway
+            // -- a different failure mode (buffer too tight vs. real loss).
+            let num_lost = jitter_stats.get::<u64>("num-lost").unwrap_or(0);
+            let num_late = jitter_stats.get::<u64>("num-late").unwrap_or(0);
             let num_pushed = jitter_stats.get::<u64>("num-pushed").unwrap_or(0);
             let num_duplicates = jitter_stats.get::<u64>("num-duplicates").unwrap_or(0);
             let avg_jitter = jitter_stats.get::<u64>("avg-jitter").unwrap_or(0);
@@ -198,6 +215,7 @@ pub fn build_video(
 
             *state_clone.stats.loss.lock() = PacketLoss {
                 num_lost,
+                num_late,
                 num_pushed,
                 num_duplicates,
                 avg_jitter,

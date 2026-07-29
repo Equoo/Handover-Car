@@ -18,7 +18,10 @@ pub fn ema_average(average: f64, value: f64) -> f64 {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct PacketLoss {
+    /// Sequence numbers that never arrived and were given up on.
     pub num_lost: u64,
+    /// Packets that arrived but past the jitterbuffer's playout deadline.
+    pub num_late: u64,
     pub num_pushed: u64,
     pub num_duplicates: u64,
     pub avg_jitter: u64,
