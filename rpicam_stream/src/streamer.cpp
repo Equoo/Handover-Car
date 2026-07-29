@@ -67,6 +67,9 @@ static uint64_t g_frame_seq = 0;
 static std::atomic<bool> g_running{true};
 static std::atomic<uint32_t> g_bitrate{1000000};
 static std::atomic<bool> g_bitrate_changed{false};
+// Set by the control readers, consumed by the encoder thread. Applying it
+// there keeps every ioctl on fd_ on a single thread.
+static std::atomic<bool> g_force_keyframe{false};
 
 static GstElement *g_pipeline = nullptr;
 static GstElement *g_appsrc = nullptr;
@@ -90,9 +93,10 @@ public:
                          bool keyframe, uint64_t seq)>;
 
   V4L2H264Encoder(uint32_t width, uint32_t height, uint32_t fps,
-                  uint32_t bitrate, uint32_t stride, OutputCallback cb)
+                  uint32_t bitrate, uint32_t stride, uint32_t gop,
+                  OutputCallback cb)
       : width_(width), height_(height), fps_(fps), bitrate_(bitrate),
-        stride_(stride), output_cb_(cb) {
+        stride_(stride), gop_(gop), output_cb_(cb) {
     fd_ = open("/dev/video11", O_RDWR | O_NONBLOCK);
     if (fd_ < 0)
       throw std::runtime_error("Cannot open /dev/video11");
@@ -169,6 +173,12 @@ public:
     if (g_bitrate_changed.exchange(false))
       set_bitrate(g_bitrate.load());
 
+    // Apply a pending keyframe request. With a long GOP this is the only
+    // thing that produces an IDR, so a receiver that has lost sync stays
+    // broken until someone asks.
+    if (g_force_keyframe.exchange(false))
+      force_keyframe();
+
     // Get a free input buffer
     v4l2_buffer buf{};
     v4l2_plane planes[1]{};
@@ -206,10 +216,18 @@ public:
     if (xioctl(fd_, VIDIOC_S_CTRL, &ctrl) < 0)
       std::cerr << "[ENC] Failed to set bitrate to " << bps << "\n";
 
-    // Also set peak bitrate = 1.5x for VBR headroom
-    ctrl.id = V4L2_CID_MPEG_VIDEO_BITRATE_PEAK;
-    ctrl.value = bps * 3 / 2;
-    xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
+    // NOTE: V4L2_CID_MPEG_VIDEO_BITRATE_PEAK is not implemented by
+    // bcm2835-codec (absent from --list-ctrls), so it is not set here.
+  }
+
+  // Ask the encoder to emit an IDR on the next frame. Button control:
+  // the value is ignored, writing it is what triggers the action.
+  void force_keyframe() {
+    v4l2_control ctrl{};
+    ctrl.id = V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME;
+    ctrl.value = 1;
+    if (xioctl(fd_, VIDIOC_S_CTRL, &ctrl) < 0)
+      std::cerr << "[ENC] force keyframe failed: " << strerror(errno) << "\n";
   }
 
 private:
@@ -220,7 +238,7 @@ private:
 
   int fd_ = -1;
   bool running_ = true;
-  uint32_t width_, height_, fps_, bitrate_, stride_;
+  uint32_t width_, height_, fps_, bitrate_, stride_, gop_;
 
   std::vector<Buffer> input_buffers_;
   std::vector<Buffer> output_buffers_;
@@ -292,9 +310,12 @@ private:
     ctrl.value = 1;
     xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
 
-    // Keyframe every fps/2 frames (~0.5s)
+    // Long GOP. Periodic keyframes are several times the size of a P-frame,
+    // and on a constrained uplink each one queues in the carrier's buffer and
+    // shows up as a latency spike. Keyframes are requested on demand instead
+    // (see force_keyframe); this is only a recovery net if a request is lost.
     ctrl.id = V4L2_CID_MPEG_VIDEO_H264_I_PERIOD;
-    ctrl.value = fps_ / 2; // TODO: Test using 0 if supported
+    ctrl.value = gop_;
     xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
 
     // Disable B-frames
@@ -465,47 +486,50 @@ static void on_signal(int) {
 // ─── stdin bitrate reader
 // ─────────────────────────────────────────────────────
 
-static void apply_bitrate(uint32_t bps) {
-  V4L2H264Encoder *enc = g_encoder_ptr.load();
-  if (!enc) {
-    // Encoder not running yet — store for when it starts
-    g_bitrate.store(bps);
-    g_bitrate_changed.store(true);
-    std::cerr << "[ABR] Queued bitrate change: " << bps / 1000 << " kbps\n";
+static constexpr const char *CTRL_FIFO = "/tmp/streamer_ctrl";
+
+// One control line: "idr" requests a keyframe, an integer sets the bitrate.
+// Both only raise a flag; the encoder thread applies it, so every ioctl on
+// the encoder fd stays on one thread.
+static void handle_command(std::string s) {
+  s.erase(0, s.find_first_not_of(" \t\r\n"));
+  s.erase(s.find_last_not_of(" \t\r\n") + 1);
+  if (s.empty())
+    return;
+
+  if (s == "idr" || s == "key") {
+    g_force_keyframe.store(true);
+    std::cerr << "[CTRL] Keyframe requested\n";
     return;
   }
-  enc->set_bitrate(bps);
-  g_bitrate.store(bps);
-  std::cerr << "[ABR] Bitrate → " << bps / 1000 << " kbps\n";
-}
 
-static constexpr const char *CTRL_FIFO = "/tmp/streamer_ctrl";
+  try {
+    uint32_t bps = std::clamp((uint32_t)std::stoul(s), 100'000u, 8'000'000u);
+    // Only flag a real change: the slave writes this on every server pong,
+    // and re-applying the same value churns the encoder's rate control.
+    if (g_bitrate.exchange(bps) != bps) {
+      g_bitrate_changed.store(true);
+      std::cerr << "[CTRL] Bitrate -> " << bps / 1000 << " kbps\n";
+    }
+  } catch (...) {
+    std::cerr << "[CTRL] Unrecognised command: " << s << "\n";
+  }
+}
 
 static void stdin_reader_thread() {
   std::string line;
-  while (g_running && std::getline(std::cin, line)) {
-    if (line.empty())
-      continue;
-    try {
-      uint32_t bps = static_cast<uint32_t>(std::stoul(line));
-      bps = std::clamp(bps, 100'000u, 8'000'000u);
-      g_bitrate.store(bps);
-      g_bitrate_changed.store(true);
-      std::cerr << "[ABR] New bitrate: " << bps / 1000 << " kbps\n";
-    } catch (...) {
-      std::cerr << "[ABR] Invalid value: " << line << "\n";
-    }
-  }
-  std::cerr << "[ABR] stdin closed\n";
+  while (g_running && std::getline(std::cin, line))
+    handle_command(line);
+  std::cerr << "[CTRL] stdin closed\n";
 }
 
 static void fifo_reader_thread() {
   unlink(CTRL_FIFO);
   if (mkfifo(CTRL_FIFO, 0666) < 0) {
-    std::cerr << "[ABR] mkfifo failed: " << strerror(errno) << "\n";
+    std::cerr << "[CTRL] mkfifo failed: " << strerror(errno) << "\n";
     return;
   }
-  std::cerr << "[ABR] Ready: echo <bps> > " << CTRL_FIFO << "\n";
+  std::cerr << "[CTRL] Ready: echo <bps>|idr > " << CTRL_FIFO << "\n";
 
   while (g_running) {
     int fd = open(CTRL_FIFO, O_RDONLY);
@@ -519,17 +543,17 @@ static void fifo_reader_thread() {
     if (n <= 0)
       continue;
 
-    std::string s(buf);
-    s.erase(s.find_last_not_of(" \t\r\n") + 1);
-    if (s.empty())
-      continue;
-    try {
-      uint32_t bps = std::clamp((uint32_t)std::stoul(s), 100'000u, 8'000'000u);
-      g_bitrate.store(bps);
-      g_bitrate_changed.store(true);
-      apply_bitrate(bps);
-    } catch (...) {
-      std::cerr << "[ABR] Invalid FIFO value: " << s << "\n";
+    // A single write may carry several lines; handle each.
+    std::string chunk(buf, (size_t)n);
+    size_t start = 0;
+    while (start <= chunk.size()) {
+      size_t nl = chunk.find('\n', start);
+      if (nl == std::string::npos) {
+        handle_command(chunk.substr(start));
+        break;
+      }
+      handle_command(chunk.substr(start, nl - start));
+      start = nl + 1;
     }
   }
   unlink(CTRL_FIFO);
@@ -716,7 +740,8 @@ static void on_request_completed(Request *request) {
 // ────────────────────────────────────────────────────
 
 static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
-                           uint32_t fps, uint32_t initial_bitrate) {
+                           uint32_t fps, uint32_t initial_bitrate,
+                           uint32_t gop) {
   // Callback: push encoded H264 directly into GStreamer appsrc
   auto on_encoded = [&](uint8_t *data, size_t size, int64_t /*ts_us*/,
                         bool keyframe, uint64_t seq) {
@@ -755,9 +780,13 @@ static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
   };
 
   try {
-    V4L2H264Encoder enc(width, height, fps, initial_bitrate, stride,
+    V4L2H264Encoder enc(width, height, fps, initial_bitrate, stride, gop,
                         on_encoded);
     enc.start();
+
+    // The first receiver needs an IDR to start decoding, and with a long GOP
+    // the periodic one may be minutes away.
+    g_force_keyframe.store(true);
 
     g_encoder_ptr.store(&enc);
 
@@ -866,6 +895,8 @@ int main(int argc, char *argv[]) {
   uint32_t fps = 60;
   uint32_t bitrate = 1'000'000;
   uint8_t fec_pct = 30;
+  uint32_t gop = 0; // 0 here means "not given"; derived from fps below
+  bool gop_given = false;
 
   for (int i = 1; i < argc; ++i) {
     std::string a = argv[i];
@@ -883,7 +914,10 @@ int main(int argc, char *argv[]) {
       bitrate = std::stoul(argv[++i]);
     else if (a == "--fec" && i + 1 < argc)
       fec_pct = (uint8_t)std::stoi(argv[++i]);
-    else if (a == "--help") {
+    else if (a == "--gop" && i + 1 < argc) {
+      gop = std::stoul(argv[++i]);
+      gop_given = true;
+    } else if (a == "--help") {
       std::cout
           << "Usage: streamer [options]\n"
              "  --host     <ip>   Destination IP    (default: 127.0.0.1)\n"
@@ -893,16 +927,25 @@ int main(int argc, char *argv[]) {
              "  --fps      <n>    Framerate          (default: 60)\n"
              "  --bitrate  <bps>  Initial bitrate    (default: 1000000)\n"
              "  --fec      <pct>  FEC percentage     (default: 30)\n"
-             "\nSend new bitrate via stdin: echo 500000\n";
+             "  --gop      <n>    Frames between forced keyframes\n"
+             "                    (default: fps*10, 0 = only on request)\n"
+             "\nControl while running:\n"
+             "  echo 500000 > /tmp/streamer_ctrl   set bitrate\n"
+             "  echo idr    > /tmp/streamer_ctrl   force a keyframe\n";
       return 0;
     }
   }
+
+  // Long GOP by default: keyframes are requested on demand, and this is only
+  // the fallback if a request never arrives.
+  if (!gop_given)
+    gop = fps * 10;
 
   g_bitrate.store(bitrate);
 
   std::cerr << "[STREAMER] " << width << "x" << height << "@" << fps << "fps → "
             << host << ":" << port << "  bitrate=" << bitrate / 1000
-            << "kbps  fec=" << (int)fec_pct << "%\n";
+            << "kbps  fec=" << (int)fec_pct << "%  gop=" << gop << "\n";
 
   std::signal(SIGINT, on_signal);
   std::signal(SIGTERM, on_signal);
@@ -942,7 +985,8 @@ int main(int argc, char *argv[]) {
     cam->queueRequest(req.get());
   }
 
-  std::thread enc_thread(encoder_thread, width, height, stride, fps, bitrate);
+  std::thread enc_thread(encoder_thread, width, height, stride, fps, bitrate,
+                         gop);
   std::thread stdin_thread(stdin_reader_thread);
   std::thread fifo_thread(fifo_reader_thread);
 
