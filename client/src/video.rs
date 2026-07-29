@@ -26,6 +26,8 @@ use crate::app::{AppState, ema_average};
 pub struct PacketLoss {
     pub num_lost: u64,
     pub num_pushed: u64,
+    pub num_duplicates: u64,
+    pub avg_jitter: u64,
     pub loss_pct: f64,
 }
 
@@ -76,10 +78,10 @@ pub fn build_video(
     src.set_property("do-timestamp", true); // true may needed but when true if receive packet before playing it warn
 
     let jitter = gst::ElementFactory::make("rtpjitterbuffer").build()?;
-    jitter.set_property("latency", 40u32);
+    jitter.set_property("latency", 80u32);
     jitter.set_property("drop-on-latency", true);
     jitter.set_property("do-lost", true);
-    jitter.set_property("do-retransmission", true);
+    jitter.set_property("do-retransmission", false);
 
     let depay = gst::ElementFactory::make("rtph264depay").build()?;
 
@@ -167,6 +169,22 @@ pub fn build_video(
             gst::PadProbeReturn::Ok
         });
 
+    let srcpad = jitter.static_pad("src").unwrap();
+    let state_clone3 = state.clone();
+    srcpad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+        if let Some(event) = &info.data {
+            if let gst::PadProbeData::Event(ev) = event {
+                if ev.type_() == gst::EventType::CustomDownstream {
+            // A lost packet breaks the P-frame chain: everything after it
+            // decodes against a reference the encoder and decoder no longer
+            // agree on. Only an IDR resets that.
+                    state_clone3.request_keyframe();
+                }
+            }
+        }
+        gst::PadProbeReturn::Ok
+    });
+
     let jitter_clone = jitter.clone();
     let state_clone = state.clone();
     tokio::spawn(async move {
@@ -178,7 +196,10 @@ pub fn build_video(
             tokio::time::sleep(Duration::from_millis(250)).await;
             let stats = jitter_clone.property::<gst::Structure>("stats");
             // Fields: num-pushed, num-lost, num-late, num-duplicates, rtx-count...
-            let num_lost = stats.get::<u64>("num-lost").unwrap_or(0);
+            let num_lost = stats.get::<u64>("num-late").unwrap_or(0); // oldly num-lost
+            let num_pushed = stats.get::<u64>("num-pushed").unwrap_or(0);
+            let num_duplicates = stats.get::<u64>("num-duplicates").unwrap_or(0);
+            let avg_jitter = stats.get::<u64>("avg-jitter").unwrap_or(0);
             let num_pushed = stats.get::<u64>("num-pushed").unwrap_or(0);
             let loss_pct = if num_pushed > 0 {
                 num_lost as f64 / (num_lost + num_pushed) as f64 * 100.0
@@ -189,15 +210,11 @@ pub fn build_video(
                 let mut loss = state_clone.loss.lock();
                 loss.num_lost = num_lost;
                 loss.num_pushed = num_pushed;
+                loss.num_duplicates = num_duplicates;
+                loss.avg_jitter = avg_jitter;
                 loss.loss_pct = loss_pct;
             }
 
-            // A lost packet breaks the P-frame chain: everything after it
-            // decodes against a reference the encoder and decoder no longer
-            // agree on. Only an IDR resets that.
-            // if num_lost > last_lost {
-            //     state_clone.request_keyframe();
-            // }
             last_lost = num_lost;
         }
     });

@@ -73,8 +73,8 @@ impl AppState {
             client_latency: Mutex::new(0),
             announce_id: Mutex::new(0),
             fps: Mutex::new(0),
-            bitrate: Mutex::new(1000000),
-            loss: Mutex::new(PacketLoss {num_lost: 0, num_pushed: 0, loss_pct: 0f64}),
+            bitrate: Mutex::new(500000),
+            loss: Mutex::new(PacketLoss {num_lost: 0, num_pushed: 0, loss_pct: 0f64, num_duplicates: 0, avg_jitter: 0}),
             last_keyframe_request: Mutex::new(None),
         })
     }
@@ -87,7 +87,7 @@ impl AppState {
     /// continuously and recreate exactly the bitrate spikes the long GOP was
     /// introduced to remove.
     pub fn request_keyframe(&self) {
-        const MIN_INTERVAL: Duration = Duration::from_millis(1000);
+        const MIN_INTERVAL: Duration = Duration::from_millis(2000);
 
         {
             let mut last = self.last_keyframe_request.lock();

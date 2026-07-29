@@ -131,16 +131,14 @@ pub fn build(app: &Application, state: Arc<AppState>) -> Result<()> {
             {
                 let loss = state_clone.loss.lock();
                 loss_clone.set_text(&format!(
-                    "RTP loss: {}/{} ({:.1}%)",
+                    "RTP loss: {}/{} ({:.1}%)\nRTP duplicates: {}\n Avg jitter: {}",
                     loss.num_lost,
                     loss.num_lost + loss.num_pushed,
-                    loss.loss_pct
+                    loss.loss_pct,
+                    loss.num_duplicates,
+                    loss.avg_jitter
                 ));
             }
-            // bitrate_label_clone.set_text(&format!(
-            //     "Bitrate: {:.1} Mbps",
-            //     stats.bitrate as f64 / 1_000_000.0
-            // ));
             glib::ControlFlow::Continue
         });
     }
