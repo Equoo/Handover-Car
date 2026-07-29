@@ -232,6 +232,28 @@ impl AppState {
                     )?;
                 }
             }
+            ArchivedMessage::SlaveStats {
+                id,
+                capture_latency_ms,
+                encode_latency_ms,
+                total_latency_ms,
+                bitrate_bps,
+            } => {
+                if let Some(slave) = self.slaves.lock().await.get(id.as_ref())
+                    && let Some(client) = self.clients.lock().await.get(&slave.subscriber)
+                {
+                    self.socket.send(
+                        &client.addr,
+                        &Message::ServerClientSlaveStats {
+                            capture_latency_ms: capture_latency_ms.into(),
+                            encode_latency_ms: encode_latency_ms.into(),
+                            total_latency_ms: total_latency_ms.into(),
+                            bitrate_bps: bitrate_bps.into(),
+                        },
+                        PacketType::Unreliable,
+                    )?;
+                }
+            }
             ArchivedMessage::MasterAnnounce { uuid, packet_id, bitrate } => {
                 let mut latency: u16 = 0;
                 if let Some(client) = self.clients.lock().await.get(&Uuid::from_str(uuid)?)

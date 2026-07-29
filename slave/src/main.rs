@@ -29,7 +29,7 @@ use tracing::warn;
 use common::{ArchivedMessage, Message, Socket, SocketEvent};
 
 mod media;
-use crate::media::Media;
+use crate::media::{Media, StreamerStats};
 
 const SERVER: &str = "server:9500";
 const SERIAL_PORT: &str = "/dev/ttyUSB0";
@@ -97,10 +97,24 @@ impl AppState {
         let state = self.clone();
         self.queue.submit(async move {
             info!("Is ");
+            let stats_state = state.clone();
             if let Ok(media) = state
                 .retry("media setup", u32::MAX, Duration::from_secs(3), || {
                     debug!("Trying to setup MEDIA");
-                    Media::start_stream(video_port, audio_port)
+                    let stats_state = stats_state.clone();
+                    Media::start_stream(video_port, audio_port, move |stats: StreamerStats| {
+                        let _ = stats_state.socket.send(
+                            &stats_state.server,
+                            &Message::SlaveStats {
+                                id: stats_state.id.clone(),
+                                capture_latency_ms: stats.capture_latency_ms,
+                                encode_latency_ms: stats.encode_latency_ms,
+                                total_latency_ms: stats.total_latency_ms,
+                                bitrate_bps: stats.bitrate_bps,
+                            },
+                            PacketType::Unreliable,
+                        );
+                    })
                 })
                 .await
             {

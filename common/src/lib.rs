@@ -68,6 +68,21 @@ pub enum Message {
     MasterKeyframe {
         slave_id: String,
     },
+    /// Encoder-side pipeline stats parsed from the streamer's own stdout
+    /// (capture/encode timings + the bitrate it's actually applying).
+    SlaveStats {
+        id: String,
+        capture_latency_ms: f32,
+        encode_latency_ms: f32,
+        total_latency_ms: f32,
+        bitrate_bps: u32,
+    },
+    ServerClientSlaveStats {
+        capture_latency_ms: f32,
+        encode_latency_ms: f32,
+        total_latency_ms: f32,
+        bitrate_bps: u32,
+    },
     Disconnect {}
 }
 
