@@ -745,6 +745,12 @@ static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
   // Callback: push encoded H264 directly into GStreamer appsrc
   auto on_encoded = [&](uint8_t *data, size_t size, int64_t /*ts_us*/,
                         bool keyframe, uint64_t seq) {
+    // Proves whether the encoder actually produced an IDR, separately from
+    // whether the client ever received one.
+    if (keyframe)
+      std::cerr << "[ENC] IDR emitted at frame " << seq << " (" << size
+                << " bytes)\n";
+
     // Latency: encode done
     {
       std::lock_guard<std::mutex> lock(g_latency_mutex);

@@ -170,8 +170,12 @@ pub fn build_video(
     let jitter_clone = jitter.clone();
     let state_clone = state.clone();
     tokio::spawn(async move {
+        // Polled fast because this drives keyframe recovery, not just the
+        // stats overlay: every tick spent here is time the picture stays
+        // broken after a loss.
+        let mut last_lost: u64 = 0;
         loop {
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            tokio::time::sleep(Duration::from_millis(250)).await;
             let stats = jitter_clone.property::<gst::Structure>("stats");
             // Fields: num-pushed, num-lost, num-late, num-duplicates, rtx-count...
             let num_lost = stats.get::<u64>("num-lost").unwrap_or(0);
@@ -181,10 +185,20 @@ pub fn build_video(
             } else {
                 0.0
             };
-            let mut loss = state_clone.loss.lock();
-            loss.num_lost = num_lost;
-            loss.num_pushed = num_pushed;
-            loss.loss_pct = loss_pct;
+            {
+                let mut loss = state_clone.loss.lock();
+                loss.num_lost = num_lost;
+                loss.num_pushed = num_pushed;
+                loss.loss_pct = loss_pct;
+            }
+
+            // A lost packet breaks the P-frame chain: everything after it
+            // decodes against a reference the encoder and decoder no longer
+            // agree on. Only an IDR resets that.
+            if num_lost > last_lost {
+                state_clone.request_keyframe();
+            }
+            last_lost = num_lost;
         }
     });
 

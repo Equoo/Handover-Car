@@ -138,6 +138,13 @@ impl AppState {
                 //     bail!("Connection to server failed caused by '{what}'");
             }
 
+            ArchivedMessage::MasterKeyframe { slave_id: _ } => {
+                if self.media.lock().is_some() {
+                    debug!("Keyframe requested by client");
+                    fs::write("/tmp/streamer_ctrl", "idr\n").await?;
+                }
+            }
+
             ArchivedMessage::ServerPong { packet_id, bitrate } => {
                 let packet_id: u16 = packet_id.into();
                 if packet_id == *self.announce_id.lock() {
