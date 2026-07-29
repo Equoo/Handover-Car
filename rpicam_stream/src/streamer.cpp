@@ -99,8 +99,8 @@ public:
 
     setup_input();
     setup_output();
-    set_profile_level(); // rate-control mode first...
-    set_bitrate(bitrate); // ...then the target it applies to
+    set_bitrate(bitrate);
+    set_profile_level();
     alloc_input_buffers();
     alloc_output_buffers();
   }
@@ -117,23 +117,12 @@ public:
   }
 
   void start() {
-    // xioctl, not ioctl: these must retry on EINTR, and the error needs to
-    // carry errno or a failure here is undiagnosable.
-    // Capture errno into a local before building the message: the operands of
-    // operator+ are indeterminately sequenced, so allocating the string first
-    // can clobber errno and report a bogus cause.
     int type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-    if (xioctl(fd_, VIDIOC_STREAMON, &type) < 0) {
-      const int err = errno;
-      throw std::runtime_error(std::string("STREAMON input failed: ") +
-                               strerror(err));
-    }
+    if (ioctl(fd_, VIDIOC_STREAMON, &type) < 0)
+      throw std::runtime_error("STREAMON input failed");
     type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    if (xioctl(fd_, VIDIOC_STREAMON, &type) < 0) {
-      const int err = errno;
-      throw std::runtime_error(std::string("STREAMON output failed: ") +
-                               strerror(err));
-    }
+    if (ioctl(fd_, VIDIOC_STREAMON, &type) < 0)
+      throw std::runtime_error("STREAMON output failed");
 
     // Queue all output (capture) buffers
     for (size_t i = 0; i < output_buffers_.size(); i++) {
@@ -144,11 +133,8 @@ public:
       buf.index = i;
       buf.length = 1;
       buf.m.planes = planes;
-      if (xioctl(fd_, VIDIOC_QBUF, &buf) < 0) {
-        const int err = errno;
-        throw std::runtime_error(std::string("QBUF output failed: ") +
-                                 strerror(err));
-      }
+      if (ioctl(fd_, VIDIOC_QBUF, &buf) < 0)
+        throw std::runtime_error("QBUF output failed");
     }
 
     poll_thread_ = std::thread(&V4L2H264Encoder::poll_loop, this);
@@ -214,14 +200,15 @@ public:
   }
 
   void set_bitrate(uint32_t bps) {
-    // Quiet: ABR retunes this while streaming, so only problems are logged.
-    set_ctrl(V4L2_CID_MPEG_VIDEO_BITRATE, bps, "BITRATE", false);
-
-    // Under CBR the peak matches the target — no burst headroom.
-    // Best effort: some drivers ignore this control outside VBR.
     v4l2_control ctrl{};
-    ctrl.id = V4L2_CID_MPEG_VIDEO_BITRATE_PEAK;
+    ctrl.id = V4L2_CID_MPEG_VIDEO_BITRATE;
     ctrl.value = bps;
+    if (xioctl(fd_, VIDIOC_S_CTRL, &ctrl) < 0)
+      std::cerr << "[ENC] Failed to set bitrate to " << bps << "\n";
+
+    // Also set peak bitrate = 1.5x for VBR headroom
+    ctrl.id = V4L2_CID_MPEG_VIDEO_BITRATE_PEAK;
+    ctrl.value = bps * 3 / 2;
     xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
   }
 
@@ -248,32 +235,6 @@ private:
       r = ioctl(fd, req, arg);
     } while (r == -1 && errno == EINTR);
     return r;
-  }
-
-  // Set a control and confirm the driver took the value. A silently ignored
-  // control looks identical to a working one, so read it back.
-  bool set_ctrl(uint32_t id, int32_t value, const char *name,
-                bool verbose = true) {
-    v4l2_control ctrl{};
-    ctrl.id = id;
-    ctrl.value = value;
-    if (xioctl(fd_, VIDIOC_S_CTRL, &ctrl) < 0) {
-      std::cerr << "[ENC] " << name << " = " << value
-                << " REJECTED: " << strerror(errno) << "\n";
-      return false;
-    }
-
-    v4l2_control readback{};
-    readback.id = id;
-    if (xioctl(fd_, VIDIOC_G_CTRL, &readback) == 0 && readback.value != value) {
-      std::cerr << "[ENC] " << name << " = " << value << " CLAMPED to "
-                << readback.value << "\n";
-      return false;
-    }
-
-    if (verbose)
-      std::cerr << "[ENC] " << name << " = " << value << " ok\n";
-    return true;
   }
 
   void setup_input() {
@@ -314,39 +275,53 @@ private:
   }
 
   void set_profile_level() {
-    std::cerr << "[ENC] --- controls ---\n";
+    v4l2_control ctrl{};
 
-    // High profile — compresses better than baseline, and costs nothing in
-    // latency once B-frames are off (below).
-    set_ctrl(V4L2_CID_MPEG_VIDEO_H264_PROFILE,
-             V4L2_MPEG_VIDEO_H264_PROFILE_HIGH, "PROFILE");
+    // ---- TEST B ----------------------------------------------------------
+    // Every other control is disabled. If STREAMON still fails, CBR is broken
+    // on this firmware outright. If it succeeds, one of the controls below
+    // conflicts with CBR and we re-enable them one at a time.
+    ctrl.id = V4L2_CID_MPEG_VIDEO_BITRATE_MODE;
+    ctrl.value = V4L2_MPEG_VIDEO_BITRATE_MODE_CBR;
+    if (xioctl(fd_, VIDIOC_S_CTRL, &ctrl) < 0)
+      std::cerr << "[ENC] CBR rejected at S_CTRL: " << strerror(errno) << "\n";
+    else
+      std::cerr << "[ENC] CBR accepted at S_CTRL\n";
+    return;
+    // ---- end TEST B ------------------------------------------------------
 
-    set_ctrl(V4L2_CID_MPEG_VIDEO_H264_LEVEL, V4L2_MPEG_VIDEO_H264_LEVEL_4_1,
-             "LEVEL");
+    // Baseline profile — no B-frames, simplest NAL structure
+    ctrl.id = V4L2_CID_MPEG_VIDEO_H264_PROFILE;
+    ctrl.value = V4L2_MPEG_VIDEO_H264_PROFILE_HIGH;
+    xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
+
+    // Level 4.1
+    ctrl.id = V4L2_CID_MPEG_VIDEO_H264_LEVEL;
+    ctrl.value = V4L2_MPEG_VIDEO_H264_LEVEL_4_1;
+    xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
 
     // Inline SPS/PPS in every keyframe (like rpicam-vid --inline)
-    set_ctrl(V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER, 1, "REPEAT_SEQ_HEADER");
+    ctrl.id = V4L2_CID_MPEG_VIDEO_REPEAT_SEQ_HEADER;
+    ctrl.value = 1;
+    xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
 
     // Keyframe every fps/2 frames (~0.5s)
-    set_ctrl(V4L2_CID_MPEG_VIDEO_H264_I_PERIOD, fps_ / 2, "I_PERIOD");
+    ctrl.id = V4L2_CID_MPEG_VIDEO_H264_I_PERIOD;
+    ctrl.value = fps_ / 2; // TODO: Test using 0 if supported
+    xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
 
-    // No B-frames: they reorder output, which costs latency.
-    set_ctrl(V4L2_CID_MPEG_VIDEO_B_FRAMES, 0, "B_FRAMES");
+    // Disable B-frames
+    ctrl.id = V4L2_CID_MPEG_VIDEO_B_FRAMES;
+    ctrl.value = 0;
+    xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
 
-    // CBR, not VBR. A VBR burst overshoots the cellular uplink and queues in
-    // the carrier's buffer — and that queue is delay that persists until it
-    // drains. Flat pacing trades sharpness under motion for stable latency.
-    set_ctrl(V4L2_CID_MPEG_VIDEO_BITRATE_MODE,
-             V4L2_MPEG_VIDEO_BITRATE_MODE_CBR, "BITRATE_MODE");
+    ctrl.id = V4L2_CID_MPEG_VIDEO_H264_MIN_QP;
+    ctrl.value = 16; // don't waste bits on near-perfect quality when static
+    xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
 
-    set_ctrl(V4L2_CID_MPEG_VIDEO_H264_MIN_QP, 16, "MIN_QP");
-
-    // Under CBR, QP is the only lever for holding the rate. Cap it too low and
-    // the encoder cannot compress enough under motion, so it overshoots the
-    // bitrate instead — reintroducing the spikes CBR is meant to remove.
-    set_ctrl(V4L2_CID_MPEG_VIDEO_H264_MAX_QP, 40, "MAX_QP");
-
-    std::cerr << "[ENC] -----------------\n";
+    ctrl.id = V4L2_CID_MPEG_VIDEO_H264_MAX_QP;
+    ctrl.value = 36; // cap how blocky it's allowed to get under motion
+    xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
   }
 
   void alloc_input_buffers(uint32_t count = 6) {
