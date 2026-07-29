@@ -117,12 +117,16 @@ public:
   }
 
   void start() {
+    // xioctl, not ioctl: these must retry on EINTR, and the error needs to
+    // carry errno or a failure here is undiagnosable.
     int type = V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE;
-    if (ioctl(fd_, VIDIOC_STREAMON, &type) < 0)
-      throw std::runtime_error("STREAMON input failed");
+    if (xioctl(fd_, VIDIOC_STREAMON, &type) < 0)
+      throw std::runtime_error(std::string("STREAMON input failed: ") +
+                               strerror(errno));
     type = V4L2_BUF_TYPE_VIDEO_CAPTURE_MPLANE;
-    if (ioctl(fd_, VIDIOC_STREAMON, &type) < 0)
-      throw std::runtime_error("STREAMON output failed");
+    if (xioctl(fd_, VIDIOC_STREAMON, &type) < 0)
+      throw std::runtime_error(std::string("STREAMON output failed: ") +
+                               strerror(errno));
 
     // Queue all output (capture) buffers
     for (size_t i = 0; i < output_buffers_.size(); i++) {
@@ -133,8 +137,9 @@ public:
       buf.index = i;
       buf.length = 1;
       buf.m.planes = planes;
-      if (ioctl(fd_, VIDIOC_QBUF, &buf) < 0)
-        throw std::runtime_error("QBUF output failed");
+      if (xioctl(fd_, VIDIOC_QBUF, &buf) < 0)
+        throw std::runtime_error(std::string("QBUF output failed: ") +
+                                 strerror(errno));
     }
 
     poll_thread_ = std::thread(&V4L2H264Encoder::poll_loop, this);
