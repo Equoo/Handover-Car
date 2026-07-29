@@ -195,9 +195,9 @@ pub fn build_video(
             // A lost packet breaks the P-frame chain: everything after it
             // decodes against a reference the encoder and decoder no longer
             // agree on. Only an IDR resets that.
-            if num_lost > last_lost {
-                state_clone.request_keyframe();
-            }
+            // if num_lost > last_lost {
+            //     state_clone.request_keyframe();
+            // }
             last_lost = num_lost;
         }
     });
