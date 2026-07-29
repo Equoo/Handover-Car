@@ -898,27 +898,27 @@ int main(int argc, char *argv[]) {
 			gop = std::stoul(argv[++i]);
 			gop_given = true;
 		} else if (a == "--help") {
-			std::cout << "Usage: streamer [options]"
+			std::cout << "Usage: streamer [options]" << std::endl
+					  << "  --host     <ip>   Destination IP    (default: 127.0.0.1)"
 					  << std::endl
-				"  --host     <ip>   Destination IP    (default: 127.0.0.1)"
+					  << "  --port     <n>    Destination port  (default: 9600)"
 					  << std::endl
-				"  --port     <n>    Destination port  (default: 9600)"
+					  << "  --width    <px>   Frame width        (default: 720)"
 					  << std::endl
-				"  --width    <px>   Frame width        (default: 720)"
+					  << "  --height   <px>   Frame height       (default: 480)"
 					  << std::endl
-				"  --height   <px>   Frame height       (default: 480)"
+					  << "  --fps      <n>    Framerate          (default: 60)"
 					  << std::endl
-				"  --fps      <n>    Framerate          (default: 60)"
+					  << "  --bitrate  <bps>  Initial bitrate    (default: 1000000)"
 					  << std::endl
-				"  --bitrate  <bps>  Initial bitrate    (default: 1000000)"
+					  << "  --gop      <n>    Frames between forced keyframes"
 					  << std::endl
-				"  --gop      <n>    Frames between forced keyframes"
+					  << "                    (default: fps*10, 0 = only on request)"
 					  << std::endl
-				"                    (default: fps*10, 0 = only on request)"
-					  << std::endl "\nControl while running:"
-					  << std::endl "  echo 500000 > /tmp/streamer_ctrl   set bitrate"
+					  << "\nControl while running:" << std::endl
+					  << "  echo 500000 > /tmp/streamer_ctrl   set bitrate"
 					  << std::endl
-				"  echo idr    > /tmp/streamer_ctrl   force a keyframe"
+					  << "  echo idr    > /tmp/streamer_ctrl   force a keyframe"
 					  << std::endl;
 			return 0;
 		}

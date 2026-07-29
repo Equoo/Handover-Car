@@ -37,7 +37,7 @@ impl Media {
             for line in reader.lines() {
                 match line {
                     Ok(line) => {
-                        debug!(target: "streamer_stdout", "{line}");
+                        // debug!(target: "streamer_stdout", "{line}");
                         if line.contains("[CTRL] Ready") {
                             if let Some(tx) = ready_tx.take() {
                                 let _ = tx.send(());
