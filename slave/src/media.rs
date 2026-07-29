@@ -1,14 +1,12 @@
 use std::io::{BufRead, BufReader, Error, ErrorKind, Result};
+use std::net::IpAddr;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-pub struct Media {
-    video: Child,
-    // audio: Child
-}
+use common::VideoMode;
 
 /// One `[LATENCY]` line parsed from the streamer's stdout, printed every ~2s.
 #[derive(Debug, Clone, Copy)]
@@ -17,6 +15,25 @@ pub struct StreamerStats {
     pub encode_latency_ms: f32,
     pub total_latency_ms: f32,
     pub bitrate_bps: u32,
+}
+
+/// Where slave-side video production goes for a given `VideoMode` -- the
+/// server negotiates the mode, `slave/src/main.rs` only ever calls through
+/// this trait, and the concrete backend is picked once at `start`. Only one
+/// backend exists today (`RawRtpUdp`, matching `VideoMode::RawRtpUdp`); a
+/// future one (e.g. WebRTC) is a new impl, not a rewrite of the call sites.
+pub trait VideoSource: Sized {
+    fn start(
+        mode: &VideoMode,
+        server_ip: IpAddr,
+        on_stats: impl Fn(StreamerStats) + Send + 'static,
+    ) -> Result<Self>;
+
+    /// Ask the encoder for an IDR keyframe.
+    async fn request_keyframe(&self) -> Result<()>;
+
+    /// Retune the encoder's target bitrate.
+    async fn set_bitrate(&self, bps: u32) -> Result<()>;
 }
 
 /// Parses lines shaped like:
@@ -42,20 +59,45 @@ fn extract_after(line: &str, marker: &str) -> Option<f32> {
     rest[..end].parse::<f32>().ok()
 }
 
-impl Media {
-    pub fn start_stream(
-        video_port: u16,
-        _audio_port: u16,
+/// Video over raw RTP packets sent directly to the server's relay port --
+/// exec's the C++ streamer, which talks straight to the Pi's hardware H.264
+/// encoder. This is `VideoMode::RawRtpUdp`'s slave-side implementation.
+pub struct RawRtpUdp {
+    video: Child,
+}
+
+impl VideoSource for RawRtpUdp {
+    fn start(
+        mode: &VideoMode,
+        server_ip: IpAddr,
         on_stats: impl Fn(StreamerStats) + Send + 'static,
     ) -> Result<Self> {
+        let video_port = match mode {
+            VideoMode::RawRtpUdp { video_port } => *video_port,
+        };
+
         Ok(Self {
-            video: Media::start_video(video_port, on_stats)?,
+            video: Self::start_video(server_ip, video_port, on_stats)?,
         })
     }
 
-    fn start_video(port: u16, on_stats: impl Fn(StreamerStats) + Send + 'static) -> Result<Child> {
+    async fn request_keyframe(&self) -> Result<()> {
+        tokio::fs::write("/tmp/streamer_ctrl", "idr\n").await
+    }
+
+    async fn set_bitrate(&self, bps: u32) -> Result<()> {
+        tokio::fs::write("/tmp/streamer_ctrl", format!("{bps}\n")).await
+    }
+}
+
+impl RawRtpUdp {
+    fn start_video(
+        host: IpAddr,
+        port: u16,
+        on_stats: impl Fn(StreamerStats) + Send + 'static,
+    ) -> Result<Child> {
         let mut video = Command::new("./rpicam_stream/build/streamer")
-            .args(["--host", "37.59.106.4", "--port", &format!("{port}")])
+            .args(["--host", &host.to_string(), "--port", &format!("{port}")])
             .stdout(Stdio::piped())
             .spawn()?;
 

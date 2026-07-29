@@ -152,6 +152,7 @@ dependencies = [
  "anyhow",
  "crossbeam-channel",
  "laminar",
+ "parking_lot",
  "rkyv",
  "serde",
  "tokio",

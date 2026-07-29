@@ -1,7 +1,10 @@
 use anyhow::{Context, Result};
-use common::{ArchivedMessage, Message, PacketType, Socket, SocketEvent};
+use common::link::PingTracker;
+use common::{
+    ArchivedMessage, ArchivedServerToClient, ArchivedVideoMode, ClientMessage, Message,
+    PacketType, PilotCommand, Socket, SocketEvent, VideoMode,
+};
 use dotenv::dotenv;
-use gstreamer as gst;
 use gstreamer_app as gst_app;
 use parking_lot::Mutex;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
@@ -9,25 +12,35 @@ use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
 use std::env;
-use tokio::net::UdpSocket;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::stats::Stats;
+use crate::video::{RawRtpUdp, VideoReceiver};
 
 const SERVER_PORT: u16 = 9500;
 const SLAVE: &str = "FlashMcqueen";
 
+/// How long the client can go without a `ServerClientPong` before it assumes
+/// the server forgot about it (most likely a server restart) and resends
+/// `MasterSubscribe` to re-register.
+const PONG_STALE: Duration = Duration::from_secs(2);
+
 pub struct AppState {
     socket: Socket,
-    server: SocketAddr,
+    pub(crate) server: SocketAddr,
     uuid: Mutex<Uuid>,
-    last_ping: Mutex<Instant>,
-    announce_id: Mutex<u16>,
+    ping: PingTracker,
+    last_pong: Mutex<Instant>,
     pub appsrc: Mutex<Option<gst_app::AppSrc>>,
     pub stats: Stats,
     last_keyframe_request: Mutex<Option<Instant>>,
+    /// Whether `announce_loop`/`run_abr` have been spawned. Set once on the
+    /// first `ServerClientConnected` and left set across a later resubscribe
+    /// -- those loops don't depend on which server session we're in, they'd
+    /// just duplicate traffic if spawned twice.
+    connected: Mutex<bool>,
 }
 
 impl AppState {
@@ -49,10 +62,11 @@ impl AppState {
             server,
             appsrc: Mutex::new(None),
             uuid: Mutex::new(Uuid::nil()),
-            last_ping: Mutex::new(Instant::now()),
+            ping: PingTracker::new(),
+            last_pong: Mutex::new(Instant::now()),
             stats: Stats::new(),
-            announce_id: Mutex::new(0),
             last_keyframe_request: Mutex::new(None),
+            connected: Mutex::new(false),
         })
     }
 
@@ -78,9 +92,10 @@ impl AppState {
 
         if let Err(e) = self.socket.send(
             &self.server,
-            &Message::MasterKeyframe {
+            &Message::Client(ClientMessage::Pilot {
                 slave_id: SLAVE.to_string(),
-            },
+                cmd: PilotCommand::KeyframeRequest,
+            }),
             PacketType::Reliable,
         ) {
             warn!(error = ?e, "failed to request keyframe");
@@ -89,56 +104,56 @@ impl AppState {
         }
     }
 
-    fn receive_video(self: Arc<AppState>, port: u16) {
+    /// Spawns the network-receive side of whichever `VideoReceiver` backend
+    /// handles `mode`. The pipeline itself (`RawRtpUdp::build_pipeline`) was
+    /// already built at window creation, before `mode` was known -- see
+    /// `video::VideoReceiver` for why.
+    fn start_video(self: Arc<AppState>, mode: VideoMode) {
         tokio::spawn(async move {
-            if let Err(e) = self.receive_video_loop(port).await {
+            if let Err(e) = RawRtpUdp::run(self.clone(), mode).await {
                 error!(error = ?e, "video receive loop failed");
             }
         });
     }
 
-    async fn receive_video_loop(&self, port: u16) -> Result<()> {
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        debug!("Send to {}:{port}", self.server.ip());
-        socket
-            .send_to(&[1], format!("{}:{port}", self.server.ip()))
-            .await?;
-
-        let mut buffer = [0u8; 1 << 18];
-        loop {
-            let (size, _) = socket.recv_from(&mut buffer).await?;
-            self.stats.note_bytes(size);
-
-            let mut gst_buffer =
-                gst::Buffer::with_size(size).context("failed to allocate gst buffer")?;
-            gst_buffer
-                .get_mut()
-                .context("gst buffer unexpectedly shared")?
-                .copy_from_slice(0, &buffer[..size])
-                .map_err(|_| anyhow::anyhow!("buffer too small for received packet"))?;
-
-            if let Some(appsrc) = self.appsrc.lock().as_mut() {
-                appsrc.push_buffer(gst_buffer)?;
-            }
-        }
-    }
-
     fn announce_loop(&self) -> Result<()> {
-        loop {
-            *self.last_ping.lock() = Instant::now();
-            *self.announce_id.lock() += 1;
-
-            self.socket.send(
-                &self.server,
-                &Message::MasterAnnounce {
+        let mut last_resubscribe = Instant::now();
+        common::link::run_announce_loop(
+            &self.socket,
+            &self.server,
+            &self.ping,
+            Duration::from_millis(100),
+            |packet_id| {
+                Message::Client(ClientMessage::Announce {
                     uuid: self.uuid.lock().to_string(),
-                    packet_id: *self.announce_id.lock(),
+                    packet_id,
                     bitrate: *self.stats.target_bitrate.lock(),
-                },
-                PacketType::Unreliable,
-            )?;
-            std::thread::sleep(Duration::from_millis(100));
-        }
+                })
+            },
+            || {
+                // The server stays silent on MasterAnnounce when it doesn't
+                // recognize our uuid (see server's MasterAnnounce handler) --
+                // most likely because it restarted and lost our
+                // registration. Re-send MasterSubscribe, throttled so a
+                // genuinely stale link doesn't turn into a resubscribe every
+                // 100ms.
+                if self.last_pong.lock().elapsed() > PONG_STALE
+                    && last_resubscribe.elapsed() > PONG_STALE
+                {
+                    warn!("No pong from server in {PONG_STALE:?}, resubscribing");
+                    if let Err(e) = self.socket.send(
+                        &self.server,
+                        &Message::Client(ClientMessage::Subscribe {
+                            slave_id: SLAVE.to_string(),
+                        }),
+                        PacketType::Reliable,
+                    ) {
+                        warn!(error = ?e, "failed to resubscribe");
+                    }
+                    last_resubscribe = Instant::now();
+                }
+            },
+        )
     }
 
     async fn run_abr(self: Arc<AppState>) {
@@ -181,38 +196,60 @@ impl AppState {
         _addr: SocketAddr,
         msg: &ArchivedMessage,
     ) -> Result<()> {
+        let ArchivedMessage::ToClient(msg) = msg else {
+            // A client only ever legitimately receives messages addressed to it.
+            return Ok(());
+        };
+
         match msg {
-            ArchivedMessage::ServerClientConnected {
+            ArchivedServerToClient::Connected {
                 uuid,
-                video_port,
+                video,
                 audio_port: _,
             } => {
                 info!("Connected to the server");
                 *self.uuid.lock() = Uuid::from_str(uuid)?;
+                *self.last_pong.lock() = Instant::now();
                 self.stats.mark_connected();
-                self.clone().receive_video(video_port.into());
+
+                let mode = match video {
+                    ArchivedVideoMode::RawRtpUdp { video_port } => VideoMode::RawRtpUdp {
+                        video_port: video_port.into(),
+                    },
+                };
+                self.clone().start_video(mode);
 
                 // The stream is already running and its opening IDR is long
                 // gone, so without this we would decode nothing until the GOP
                 // fallback fires.
                 self.request_keyframe();
 
-                let state_clone = self.clone();
-                tokio::spawn(async move { state_clone.announce_loop() });
-                let state_clone = self.clone();
-                tokio::spawn(async move { state_clone.run_abr().await });
+                // Only spawn these the first time: a resubscribe (server
+                // restart) re-enters this arm with a fresh uuid/video_port,
+                // but announce_loop/run_abr already run against `self` and
+                // would just duplicate traffic if spawned again.
+                let mut connected = self.connected.lock();
+                if !*connected {
+                    *connected = true;
+                    drop(connected);
+
+                    let state_clone = self.clone();
+                    tokio::spawn(async move { state_clone.announce_loop() });
+                    let state_clone = self.clone();
+                    tokio::spawn(async move { state_clone.run_abr().await });
+                }
             }
-            ArchivedMessage::ServerClientPong { latency, packet_id } => {
+            ArchivedServerToClient::Pong { latency, packet_id } => {
+                *self.last_pong.lock() = Instant::now();
+
                 let latency: u16 = latency.into();
                 self.stats.note_slave_ping(latency);
 
-                let packet_id: u16 = packet_id.into();
-                if packet_id == *self.announce_id.lock() {
-                    let cl_latency = self.last_ping.lock().elapsed().as_millis() as f64;
-                    self.stats.note_client_ping(cl_latency);
+                if let Some(rtt) = self.ping.note_pong(packet_id.into()) {
+                    self.stats.note_client_ping(rtt.as_millis() as f64);
                 }
             }
-            ArchivedMessage::ServerClientSlaveStats {
+            ArchivedServerToClient::SlaveStats {
                 capture_latency_ms,
                 encode_latency_ms,
                 total_latency_ms,
@@ -225,7 +262,6 @@ impl AppState {
                     bitrate_bps.into(),
                 );
             }
-            _ => {}
         };
 
         Ok(())
@@ -256,13 +292,15 @@ impl AppState {
 pub async fn run(state: Arc<AppState>) -> Result<()> {
     state.socket.send(
         &state.server,
-        &Message::MasterSubscribe {
+        &Message::Client(ClientMessage::Subscribe {
             slave_id: SLAVE.to_string(),
-        },
+        }),
         PacketType::Reliable,
     )?;
 
     loop {
-        state.fetch_packets().await?;
+        if let Err(e) = state.fetch_packets().await {
+            error!(error = ?e, "packet fetching failed, dropping packet");
+        }
     }
 }
