@@ -1,6 +1,9 @@
-use std::io::Result;
+use std::io::{BufRead, BufReader, Error, ErrorKind, Result};
 use std::process::{Child, Command, Stdio};
-use tracing::{debug, info};
+use std::sync::mpsc;
+use std::thread;
+use std::time::Duration;
+use tracing::{debug, info, warn};
 
 pub struct Media {
     video: Child,
@@ -15,52 +18,63 @@ impl Media {
     }
 
     fn start_video(port: u16) -> Result<Child> {
-        // --profile baseline // but make freeze pipeline ?
-
         let mut video = Command::new("./rpicam_stream/build/streamer")
             .args(["--host", "37.59.106.4", "--port", &format!("{port}")])
+            .stdout(Stdio::piped())
             .spawn()?;
 
-        // let mut rpicam = Command::new("rpicam-vid")
-        //     .args([
-        //         "-t", "0",
-        //         "--codec", "h264",
-        //         "--inline",
-        //         "--level", "4.1",
-        //         "--intra", "10",
-        //         "--width", "720",
-        //         "--height", "480",
-        //         "--framerate", "60",
-        //         "--bitrate", "500000",
-        //         "-o", "-", // stdout
-        //     ])
-        //     .stdout(Stdio::piped())
-        //     .spawn()?;
-        //
-        // // Get rpicam stdout
-        // let rpicam_stdout = rpicam.stdout.take()
-        //     .expect("Failed to capture rpicam stdout");
-        //
-        // // Spawn gst-launch-1.0
-        // let video = Command::new("gst-launch-1.0")
-        //     .arg("-q")
-        //     .args([
-        //         "fdsrc",
-        //         "!", "queue",
-        //         "!", "h264parse",
-        //         "!", "queue",
-        //         "!", "rtph264pay", "config-interval=-1", "pt=96", "mtu=1200",
-        //         "!", "queue",
-        //         "!", "udpsink", "host=37.59.106.4", &format!("port={port}"),
-        //     ])
-        //     .stdin(Stdio::from(rpicam_stdout))
-        //     .spawn()?;
+        let stdout = video
+            .stdout
+            .take()
+            .ok_or_else(|| Error::new(ErrorKind::Other, "failed to capture streamer stdout"))?;
 
-        info!("Camera video started.");
-        Ok(video)
+        let (ready_tx, ready_rx) = mpsc::channel::<()>();
+
+        thread::spawn(move || {
+            let reader = BufReader::new(stdout);
+            let mut ready_tx = Some(ready_tx);
+
+            for line in reader.lines() {
+                match line {
+                    Ok(line) => {
+                        debug!(target: "streamer_stdout", "{line}");
+                        if line.contains("[CTRL] Ready") {
+                            if let Some(tx) = ready_tx.take() {
+                                let _ = tx.send(());
+                            }
+                        }
+                        // on continue à lire même après Ready pour ne pas bloquer
+                        // le pipe si le process continue d'écrire sur stdout
+                    }
+                    Err(e) => {
+                        warn!("error reading streamer stdout: {e}");
+                        break;
+                    }
+                }
+            }
+        });
+
+        // Attend le signal de readiness, avec timeout pour ne pas bloquer
+        // indéfiniment si le process crash avant d'afficher la ligne
+        match ready_rx.recv_timeout(Duration::from_secs(10)) {
+            Ok(()) => {
+                info!("Camera video started.");
+                Ok(video)
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let _ = video.kill();
+                Err(Error::new(
+                    ErrorKind::TimedOut,
+                    "timed out waiting for streamer [CTRL] Ready",
+                ))
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                let _ = video.kill();
+                Err(Error::new(
+                    ErrorKind::Other,
+                    "streamer process exited before signaling ready",
+                ))
+            }
+        }
     }
-
-    // fn start_audio() -> Result<Child> {
-    //     Ok()
-    // }
 }
