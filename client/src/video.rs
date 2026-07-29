@@ -1,8 +1,8 @@
-use anyhow::{Error, Result};
+use anyhow::Result;
 use gstreamer::Registry;
 use gstreamer::glib::object::{Cast, ObjectExt};
 use gstreamer::prelude::*;
-use gstreamer::{self as gst, element_error};
+use gstreamer::{self as gst};
 use gstreamer_app as gst_app;
 use parking_lot::Mutex;
 use std::sync::Arc;
@@ -10,26 +10,8 @@ use std::time::Duration;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-use derive_more::derive::{Display, Error};
-
-#[derive(Debug, Display, Error)]
-#[display("Received error from {src}: {error} (debug: {debug:?})")]
-struct ErrorMessage {
-    src: glib::GString,
-    error: glib::Error,
-    debug: Option<glib::GString>,
-}
-
-use crate::app::{AppState, ema_average};
-
-#[derive(Clone, Copy)]
-pub struct PacketLoss {
-    pub num_lost: u64,
-    pub num_pushed: u64,
-    pub num_duplicates: u64,
-    pub avg_jitter: u64,
-    pub loss_pct: f64,
-}
+use crate::app::AppState;
+use crate::stats::PacketLoss;
 
 fn choose_h264_decoder() -> &'static str {
     let registry = Registry::get();
@@ -90,6 +72,7 @@ pub fn build_video(
     parse.set_property_from_str("update-timecode", "false"); // NOTE: may is wrong
 
     let decoder = choose_h264_decoder();
+    *state.stats.decoder_name.lock() = decoder;
     let dec = gst::ElementFactory::make(decoder).build()?;
     if decoder == "avdec_h264" {
         dec.set_property_from_str("lowres", "0");
@@ -163,9 +146,11 @@ pub fn build_video(
         .unwrap()
         .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
             if let Some(t) = *entry_time.lock() {
-                let mut decode_latency = state_clone2.decode_latency.lock();
-                *decode_latency = ema_average(*decode_latency, t.elapsed().as_secs_f64() * 1000f64);
+                state_clone2
+                    .stats
+                    .note_decode_latency(t.elapsed().as_secs_f64() * 1000f64);
             }
+            state_clone2.stats.note_frame();
             gst::PadProbeReturn::Ok
         });
 
@@ -191,31 +176,33 @@ pub fn build_video(
         // Polled fast because this drives keyframe recovery, not just the
         // stats overlay: every tick spent here is time the picture stays
         // broken after a loss.
-        let mut last_lost: u64 = 0;
         loop {
             tokio::time::sleep(Duration::from_millis(250)).await;
-            let stats = jitter_clone.property::<gst::Structure>("stats");
+
+            // Also drives the fps/received-bitrate rate counters: they only
+            // actually recompute once a second has passed, so polling them
+            // here more often than that is free.
+            state_clone.stats.tick_rates();
+
+            let jitter_stats = jitter_clone.property::<gst::Structure>("stats");
             // Fields: num-pushed, num-lost, num-late, num-duplicates, rtx-count...
-            let num_lost = stats.get::<u64>("num-late").unwrap_or(0); // oldly num-lost
-            let num_pushed = stats.get::<u64>("num-pushed").unwrap_or(0);
-            let num_duplicates = stats.get::<u64>("num-duplicates").unwrap_or(0);
-            let avg_jitter = stats.get::<u64>("avg-jitter").unwrap_or(0);
-            let num_pushed = stats.get::<u64>("num-pushed").unwrap_or(0);
+            let num_lost = jitter_stats.get::<u64>("num-late").unwrap_or(0); // oldly num-lost
+            let num_pushed = jitter_stats.get::<u64>("num-pushed").unwrap_or(0);
+            let num_duplicates = jitter_stats.get::<u64>("num-duplicates").unwrap_or(0);
+            let avg_jitter = jitter_stats.get::<u64>("avg-jitter").unwrap_or(0);
             let loss_pct = if num_pushed > 0 {
                 num_lost as f64 / (num_lost + num_pushed) as f64 * 100.0
             } else {
                 0.0
             };
-            {
-                let mut loss = state_clone.loss.lock();
-                loss.num_lost = num_lost;
-                loss.num_pushed = num_pushed;
-                loss.num_duplicates = num_duplicates;
-                loss.avg_jitter = avg_jitter;
-                loss.loss_pct = loss_pct;
-            }
 
-            last_lost = num_lost;
+            *state_clone.stats.loss.lock() = PacketLoss {
+                num_lost,
+                num_pushed,
+                num_duplicates,
+                avg_jitter,
+                loss_pct,
+            };
         }
     });
 

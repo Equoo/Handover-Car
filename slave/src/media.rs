@@ -10,14 +10,50 @@ pub struct Media {
     // audio: Child
 }
 
+/// One `[LATENCY]` line parsed from the streamer's stdout, printed every ~2s.
+#[derive(Debug, Clone, Copy)]
+pub struct StreamerStats {
+    pub capture_latency_ms: f32,
+    pub encode_latency_ms: f32,
+    pub total_latency_ms: f32,
+    pub bitrate_bps: u32,
+}
+
+/// Parses lines shaped like:
+/// `[LATENCY]  capture=1.234 ms  encode=5.678 ms  total=6.912 ms  bitrate=1000 kbps`
+fn parse_latency_line(line: &str) -> Option<StreamerStats> {
+    if !line.starts_with("[LATENCY]") {
+        return None;
+    }
+    Some(StreamerStats {
+        capture_latency_ms: extract_after(line, "capture=")?,
+        encode_latency_ms: extract_after(line, "encode=")?,
+        total_latency_ms: extract_after(line, "total=")?,
+        bitrate_bps: (extract_after(line, "bitrate=")? * 1000.0) as u32,
+    })
+}
+
+fn extract_after(line: &str, marker: &str) -> Option<f32> {
+    let start = line.find(marker)? + marker.len();
+    let rest = &line[start..];
+    let end = rest
+        .find(|c: char| !c.is_ascii_digit() && c != '.')
+        .unwrap_or(rest.len());
+    rest[..end].parse::<f32>().ok()
+}
+
 impl Media {
-    pub fn start_stream(video_port: u16, _audio_port: u16) -> Result<Self> {
+    pub fn start_stream(
+        video_port: u16,
+        _audio_port: u16,
+        on_stats: impl Fn(StreamerStats) + Send + 'static,
+    ) -> Result<Self> {
         Ok(Self {
-            video: Media::start_video(video_port)?,
+            video: Media::start_video(video_port, on_stats)?,
         })
     }
 
-    fn start_video(port: u16) -> Result<Child> {
+    fn start_video(port: u16, on_stats: impl Fn(StreamerStats) + Send + 'static) -> Result<Child> {
         let mut video = Command::new("./rpicam_stream/build/streamer")
             .args(["--host", "37.59.106.4", "--port", &format!("{port}")])
             .stdout(Stdio::piped())
@@ -42,6 +78,8 @@ impl Media {
                             if let Some(tx) = ready_tx.take() {
                                 let _ = tx.send(());
                             }
+                        } else if let Some(stats) = parse_latency_line(&line) {
+                            on_stats(stats);
                         }
                         // on continue à lire même après Ready pour ne pas bloquer
                         // le pipe si le process continue d'écrire sur stdout

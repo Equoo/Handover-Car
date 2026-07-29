@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use common::{ArchivedMessage, Message, PacketType, Socket, SocketEvent};
 use dotenv::dotenv;
 use gstreamer as gst;
@@ -8,13 +8,13 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use std::{env, thread};
+use std::env;
 use tokio::net::UdpSocket;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::video::PacketLoss;
+use crate::stats::Stats;
 
 const SERVER_PORT: u16 = 9500;
 const SLAVE: &str = "FlashMcqueen";
@@ -22,29 +22,12 @@ const SLAVE: &str = "FlashMcqueen";
 pub struct AppState {
     socket: Socket,
     server: SocketAddr,
-    // tx: mpsc::Sender<AppEvent>,
     uuid: Mutex<Uuid>,
     last_ping: Mutex<Instant>,
     announce_id: Mutex<u16>,
     pub appsrc: Mutex<Option<gst_app::AppSrc>>,
-    pub decode_latency: Mutex<f64>,
-    pub encode_latency: Mutex<f64>,
-    pub slave_latency: Mutex<u16>,
-    pub client_latency: Mutex<u16>,
-    pub fps: Mutex<u8>,
-    pub bitrate: Mutex<u32>,
-    pub loss: Mutex<PacketLoss>,
+    pub stats: Stats,
     last_keyframe_request: Mutex<Option<Instant>>,
-}
-
-enum AppEvent {
-    FrameStats { latency_ms: u64 },
-    Error(String),
-}
-
-const ALPHA: f64 = 0.2;
-pub fn ema_average(average: f64, value: f64) -> f64 {
-    ALPHA * value + (1.0f64 - ALPHA) * average
 }
 
 impl AppState {
@@ -67,14 +50,8 @@ impl AppState {
             appsrc: Mutex::new(None),
             uuid: Mutex::new(Uuid::nil()),
             last_ping: Mutex::new(Instant::now()),
-            decode_latency: Mutex::new(0f64),
-            encode_latency: Mutex::new(0f64),
-            slave_latency: Mutex::new(0),
-            client_latency: Mutex::new(0),
+            stats: Stats::new(),
             announce_id: Mutex::new(0),
-            fps: Mutex::new(0),
-            bitrate: Mutex::new(500000),
-            loss: Mutex::new(PacketLoss {num_lost: 0, num_pushed: 0, loss_pct: 0f64, num_duplicates: 0, avg_jitter: 0}),
             last_keyframe_request: Mutex::new(None),
         })
     }
@@ -114,31 +91,36 @@ impl AppState {
 
     fn receive_video(self: Arc<AppState>, port: u16) {
         tokio::spawn(async move {
-            let socket = UdpSocket::bind("0.0.0.0:0").await.unwrap();
-            debug!("Send to {}:{port}", self.server.ip().to_string());
-            socket
-                .send_to(&[1], format!("{}:{port}", self.server.ip()))
-                .await
-                .unwrap();
-
-            let mut buffer = [0u8; 1 << 18];
-            loop {
-                if let Ok((size, _)) = socket.recv_from(&mut buffer).await {
-                    let mut gst_buffer = gst::Buffer::with_size(size).unwrap();
-                    {
-                        let buf = gst_buffer.get_mut().unwrap();
-                        buf.copy_from_slice(0, &buffer[..size]).unwrap();
-                    }
-                    if let Some(appsrc) = self.appsrc.lock().as_mut() {
-                        appsrc.push_buffer(gst_buffer)?;
-                    }
-                }
-                if false {
-                    break;
-                }
+            if let Err(e) = self.receive_video_loop(port).await {
+                error!(error = ?e, "video receive loop failed");
             }
-            Ok::<(), anyhow::Error>(())
         });
+    }
+
+    async fn receive_video_loop(&self, port: u16) -> Result<()> {
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        debug!("Send to {}:{port}", self.server.ip());
+        socket
+            .send_to(&[1], format!("{}:{port}", self.server.ip()))
+            .await?;
+
+        let mut buffer = [0u8; 1 << 18];
+        loop {
+            let (size, _) = socket.recv_from(&mut buffer).await?;
+            self.stats.note_bytes(size);
+
+            let mut gst_buffer =
+                gst::Buffer::with_size(size).context("failed to allocate gst buffer")?;
+            gst_buffer
+                .get_mut()
+                .context("gst buffer unexpectedly shared")?
+                .copy_from_slice(0, &buffer[..size])
+                .map_err(|_| anyhow::anyhow!("buffer too small for received packet"))?;
+
+            if let Some(appsrc) = self.appsrc.lock().as_mut() {
+                appsrc.push_buffer(gst_buffer)?;
+            }
+        }
     }
 
     fn announce_loop(&self) -> Result<()> {
@@ -151,7 +133,7 @@ impl AppState {
                 &Message::MasterAnnounce {
                     uuid: self.uuid.lock().to_string(),
                     packet_id: *self.announce_id.lock(),
-                    bitrate: *self.bitrate.lock()
+                    bitrate: *self.stats.target_bitrate.lock(),
                 },
                 PacketType::Unreliable,
             )?;
@@ -166,8 +148,8 @@ impl AppState {
         loop {
             interval.tick().await;
 
-            let losses = *self.loss.lock();
-            let decode_latency = *self.decode_latency.lock();
+            let losses = *self.stats.loss.lock();
+            let decode_latency = *self.stats.decode_latency.lock();
             let loss = losses.num_lost as f32 / (losses.num_pushed as f32).max(1f32);
 
             // AIMD
@@ -190,13 +172,13 @@ impl AppState {
                 bitrate / 1000
             );
 
-            *self.bitrate.lock() = bitrate;
+            *self.stats.target_bitrate.lock() = bitrate;
         }
     }
 
     async fn handle_messages(
         self: &Arc<AppState>,
-        addr: SocketAddr,
+        _addr: SocketAddr,
         msg: &ArchivedMessage,
     ) -> Result<()> {
         match msg {
@@ -207,6 +189,7 @@ impl AppState {
             } => {
                 info!("Connected to the server");
                 *self.uuid.lock() = Uuid::from_str(uuid)?;
+                self.stats.mark_connected();
                 self.clone().receive_video(video_port.into());
 
                 // The stream is already running and its opening IDR is long
@@ -215,22 +198,32 @@ impl AppState {
                 self.request_keyframe();
 
                 let state_clone = self.clone();
-                let announce_thread = tokio::spawn(async move { state_clone.announce_loop() });
+                tokio::spawn(async move { state_clone.announce_loop() });
                 let state_clone = self.clone();
-                let abr_thread = tokio::spawn(async move { state_clone.run_abr().await });
+                tokio::spawn(async move { state_clone.run_abr().await });
             }
             ArchivedMessage::ServerClientPong { latency, packet_id } => {
                 let latency: u16 = latency.into();
-                let mut slave_latency = self.slave_latency.lock();
-
-                *slave_latency = ema_average(*slave_latency as f64, latency as f64) as u16;
+                self.stats.note_slave_ping(latency);
 
                 let packet_id: u16 = packet_id.into();
                 if packet_id == *self.announce_id.lock() {
-                    let mut client_latency = self.client_latency.lock();
                     let cl_latency = self.last_ping.lock().elapsed().as_millis() as f64;
-                    *client_latency = ema_average(*client_latency as f64, cl_latency) as u16;
+                    self.stats.note_client_ping(cl_latency);
                 }
+            }
+            ArchivedMessage::ServerClientSlaveStats {
+                capture_latency_ms,
+                encode_latency_ms,
+                total_latency_ms,
+                bitrate_bps,
+            } => {
+                self.stats.note_slave_stats(
+                    capture_latency_ms.into(),
+                    encode_latency_ms.into(),
+                    total_latency_ms.into(),
+                    bitrate_bps.into(),
+                );
             }
             _ => {}
         };
@@ -272,6 +265,4 @@ pub async fn run(state: Arc<AppState>) -> Result<()> {
     loop {
         state.fetch_packets().await?;
     }
-
-    // Ok(())
 }
