@@ -484,8 +484,8 @@ static constexpr const char *CTRL_FIFO = "/tmp/streamer_ctrl";
 // Both only raise a flag; the encoder thread applies it, so every ioctl on
 // the encoder fd stays on one thread.
 static void handle_command(std::string s) {
-	s.erase(0, s.find_first_not_of(" \t\r" << std::endl));
-	s.erase(s.find_last_not_of(" \t\r" << std::endl) + 1);
+	s.erase(0, s.find_first_not_of(" \t\r\n"));
+	s.erase(s.find_last_not_of(" \t\r\n") + 1);
 	if (s.empty()) return;
 
 	if (s == "idr" || s == "key") {
