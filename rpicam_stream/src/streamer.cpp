@@ -199,7 +199,7 @@ class V4L2H264Encoder {
 		buf.sequence = seq;
 
 		if (ioctl(fd_, VIDIOC_QBUF, &buf) < 0) {
-			std::cerr << "[ENC] QBUF input failed\n";
+			std::cerr << "[ENC] QBUF input failed" << std::endl;
 			return false;
 		}
 		return true;
@@ -210,7 +210,7 @@ class V4L2H264Encoder {
 		ctrl.id = V4L2_CID_MPEG_VIDEO_BITRATE;
 		ctrl.value = bps;
 		if (xioctl(fd_, VIDIOC_S_CTRL, &ctrl) < 0)
-			std::cerr << "[ENC] Failed to set bitrate to " << bps << "\n";
+			std::cerr << "[ENC] Failed to set bitrate to " << bps << "" << std::endl;
 
 		// NOTE: V4L2_CID_MPEG_VIDEO_BITRATE_PEAK is not implemented by
 		// bcm2835-codec (absent from --list-ctrls), so it is not set here.
@@ -223,7 +223,8 @@ class V4L2H264Encoder {
 		ctrl.id = V4L2_CID_MPEG_VIDEO_FORCE_KEY_FRAME;
 		ctrl.value = 1;
 		if (xioctl(fd_, VIDIOC_S_CTRL, &ctrl) < 0)
-			std::cerr << "[ENC] force keyframe failed: " << strerror(errno) << "\n";
+			std::cerr << "[ENC] force keyframe failed: " << strerror(errno) << ""
+					  << std::endl;
 	}
 
    private:
@@ -404,7 +405,7 @@ class V4L2H264Encoder {
 				v4l2_event ev{};
 				xioctl(fd_, VIDIOC_DQEVENT, &ev);
 				if (ev.type == V4L2_EVENT_EOS) {
-					std::cerr << "[ENC] EOS event\n";
+					std::cerr << "[ENC] EOS event" << std::endl;
 					running_ = false;
 				}
 			}
@@ -483,13 +484,13 @@ static constexpr const char *CTRL_FIFO = "/tmp/streamer_ctrl";
 // Both only raise a flag; the encoder thread applies it, so every ioctl on
 // the encoder fd stays on one thread.
 static void handle_command(std::string s) {
-	s.erase(0, s.find_first_not_of(" \t\r\n"));
-	s.erase(s.find_last_not_of(" \t\r\n") + 1);
+	s.erase(0, s.find_first_not_of(" \t\r" << std::endl));
+	s.erase(s.find_last_not_of(" \t\r" << std::endl) + 1);
 	if (s.empty()) return;
 
 	if (s == "idr" || s == "key") {
 		g_force_keyframe.store(true);
-		std::cout << "[CTRL] Keyframe requested\n";
+		std::cout << "[CTRL] Keyframe requested" << std::endl;
 		return;
 	}
 
@@ -499,26 +500,27 @@ static void handle_command(std::string s) {
 		// and re-applying the same value churns the encoder's rate control.
 		if (g_bitrate.exchange(bps) != bps) {
 			g_bitrate_changed.store(true);
-			std::cout << "[CTRL] Bitrate -> " << bps / 1000 << " kbps\n";
+			std::cout << "[CTRL] Bitrate -> " << bps / 1000 << " kbps" << std::endl;
 		}
 	} catch (...) {
-		std::cerr << "[CTRL] Unrecognised command: " << s << "\n";
+		std::cerr << "[CTRL] Unrecognised command: " << s << "" << std::endl;
 	}
 }
 
 static void stdin_reader_thread() {
 	std::string line;
 	while (g_running && std::getline(std::cin, line)) handle_command(line);
-	std::cerr << "[CTRL] stdin closed\n";
+	std::cerr << "[CTRL] stdin closed" << std::endl;
 }
 
 static void fifo_reader_thread() {
 	unlink(CTRL_FIFO);
 	if (mkfifo(CTRL_FIFO, 0666) < 0) {
-		std::cerr << "[CTRL] mkfifo failed: " << strerror(errno) << "\n";
+		std::cerr << "[CTRL] mkfifo failed: " << strerror(errno) << "" << std::endl;
 		return;
 	}
-	std::cout << "[CTRL] Ready: echo <bps>|idr > " << CTRL_FIFO << "\n";
+	std::cout << "[CTRL] Ready: echo <bps>|idr > " << CTRL_FIFO << "" << std::endl;
+	fflush(stdout);
 
 	while (g_running) {
 		int fd = open(CTRL_FIFO, O_RDONLY);
@@ -556,8 +558,8 @@ static gboolean bus_callback(GstBus *, GstMessage *msg, gpointer) {
 			GError *err = nullptr;
 			gchar *dbg = nullptr;
 			gst_message_parse_error(msg, &err, &dbg);
-			std::cerr << "[GST ERROR] " << err->message << "\n";
-			if (dbg) std::cout << "[GST DEBUG] " << dbg << "\n";
+			std::cerr << "[GST ERROR] " << err->message << "" << std::endl;
+			if (dbg) std::cout << "[GST DEBUG] " << dbg << "" << std::endl;
 			g_error_free(err);
 			g_free(dbg);
 			g_running = false;
@@ -565,7 +567,7 @@ static gboolean bus_callback(GstBus *, GstMessage *msg, gpointer) {
 			break;
 		}
 		case GST_MESSAGE_EOS:
-			std::cout << "[GST] EOS\n";
+			std::cout << "[GST] EOS" << std::endl;
 			g_running = false;
 			g_queue_cv.notify_all();
 			break;
@@ -588,7 +590,7 @@ static bool build_pipeline(const std::string &host, uint16_t port) {
 	auto *sink = gst_element_factory_make("udpsink", "sink");
 
 	if (!g_pipeline || !g_appsrc || !parse || !pay || !sink) {
-		std::cerr << "[GST] Failed to create elements\n";
+		std::cerr << "[GST] Failed to create elements" << std::endl;
 		return false;
 	}
 
@@ -611,7 +613,7 @@ static bool build_pipeline(const std::string &host, uint16_t port) {
 	gst_bin_add_many(GST_BIN(g_pipeline), g_appsrc, parse, pay, sink, nullptr);
 
 	if (!gst_element_link_many(g_appsrc, parse, pay, sink, nullptr)) {
-		std::cerr << "[GST] Failed to link pipeline\n";
+		std::cerr << "[GST] Failed to link pipeline" << std::endl;
 		return false;
 	}
 
@@ -674,7 +676,7 @@ static void on_request_completed(Request *request) {
 			void *base = mmap(nullptr, len, PROT_READ, MAP_SHARED, fd, 0);
 			if (base == MAP_FAILED) {
 				std::cerr << "[CAP] mmap failed for fd=" << fd << ": "
-						  << strerror(errno) << "\n";
+						  << strerror(errno) << "" << std::endl;
 				map_ok = false;
 				break;
 			}
@@ -726,7 +728,7 @@ static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
 		// whether the client ever received one.
 		if (keyframe)
 			std::cout << "[ENC] IDR emitted at frame " << seq << " (" << size
-					  << " bytes)\n";
+					  << " bytes)" << std::endl;
 
 		// Latency: encode done
 		{
@@ -760,7 +762,7 @@ static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
 
 		GstFlowReturn ret = gst_app_src_push_buffer(GST_APP_SRC(g_appsrc), buf);
 		if (ret != GST_FLOW_OK)
-			std::cerr << "[GST] appsrc push error: " << ret << "\n";
+			std::cerr << "[GST] appsrc push error: " << ret << "" << std::endl;
 	};
 
 	try {
@@ -797,7 +799,7 @@ static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
 
 		enc.stop();
 	} catch (const std::exception &e) {
-		std::cerr << "[ENC] Fatal: " << e.what() << "\n";
+		std::cerr << "[ENC] Fatal: " << e.what() << "" << std::endl;
 		g_running = false;
 		g_queue_cv.notify_all();
 	}
@@ -812,12 +814,12 @@ static std::shared_ptr<Camera> setup_camera(
 	std::vector<std::unique_ptr<Request>> &requests_out,
 	FrameBufferAllocator *&alloc_out, unsigned int &stride_out) {
 	if (mgr.cameras().empty()) {
-		std::cerr << "[CAM] No cameras found\n";
+		std::cerr << "[CAM] No cameras found" << std::endl;
 		return nullptr;
 	}
 	auto cam = mgr.cameras()[0];
 	if (cam->acquire()) {
-		std::cerr << "[CAM] Failed to acquire\n";
+		std::cerr << "[CAM] Failed to acquire" << std::endl;
 		return nullptr;
 	}
 
@@ -833,14 +835,14 @@ static std::shared_ptr<Camera> setup_camera(
 		case CameraConfiguration::Valid:
 			break;
 		case CameraConfiguration::Adjusted:
-			std::cout << "[CAM] Config adjusted\n";
+			std::cout << "[CAM] Config adjusted" << std::endl;
 			break;
 		case CameraConfiguration::Invalid:
-			std::cerr << "[CAM] Invalid config\n";
+			std::cerr << "[CAM] Invalid config" << std::endl;
 			return nullptr;
 	}
 	if (cam->configure(config.get())) {
-		std::cerr << "[CAM] Configure failed\n";
+		std::cerr << "[CAM] Configure failed" << std::endl;
 		return nullptr;
 	}
 
@@ -849,7 +851,7 @@ static std::shared_ptr<Camera> setup_camera(
 	alloc_out = new FrameBufferAllocator(cam);
 	Stream *stream = scfg.stream();
 	if (alloc_out->allocate(stream) < 0) {
-		std::cerr << "[CAM] Alloc failed\n";
+		std::cerr << "[CAM] Alloc failed" << std::endl;
 		return nullptr;
 	}
 
@@ -896,22 +898,33 @@ int main(int argc, char *argv[]) {
 			gop = std::stoul(argv[++i]);
 			gop_given = true;
 		} else if (a == "--help") {
-			std::cout
-				<< "Usage: streamer [options]\n"
-				   "  --host     <ip>   Destination IP    (default: 127.0.0.1)\n"
-				   "  --port     <n>    Destination port  (default: 9600)\n"
-				   "  --width    <px>   Frame width        (default: 720)\n"
-				   "  --height   <px>   Frame height       (default: 480)\n"
-				   "  --fps      <n>    Framerate          (default: 60)\n"
-				   "  --bitrate  <bps>  Initial bitrate    (default: 1000000)\n"
-				   "  --gop      <n>    Frames between forced keyframes\n"
-				   "                    (default: fps*10, 0 = only on request)\n"
-				   "\nControl while running:\n"
-				   "  echo 500000 > /tmp/streamer_ctrl   set bitrate\n"
-				   "  echo idr    > /tmp/streamer_ctrl   force a keyframe\n";
+			std::cout << "Usage: streamer [options]"
+					  << std::endl
+				"  --host     <ip>   Destination IP    (default: 127.0.0.1)"
+					  << std::endl
+				"  --port     <n>    Destination port  (default: 9600)"
+					  << std::endl
+				"  --width    <px>   Frame width        (default: 720)"
+					  << std::endl
+				"  --height   <px>   Frame height       (default: 480)"
+					  << std::endl
+				"  --fps      <n>    Framerate          (default: 60)"
+					  << std::endl
+				"  --bitrate  <bps>  Initial bitrate    (default: 1000000)"
+					  << std::endl
+				"  --gop      <n>    Frames between forced keyframes"
+					  << std::endl
+				"                    (default: fps*10, 0 = only on request)"
+					  << std::endl "\nControl while running:"
+					  << std::endl "  echo 500000 > /tmp/streamer_ctrl   set bitrate"
+					  << std::endl
+				"  echo idr    > /tmp/streamer_ctrl   force a keyframe"
+					  << std::endl;
 			return 0;
 		}
 	}
+
+	setvbuf(stdout, NULL, _IOLBF, 0);
 
 	// Long GOP by default: keyframes are requested on demand, and this is only
 	// the fallback if a request never arrives.
@@ -921,7 +934,7 @@ int main(int argc, char *argv[]) {
 
 	std::cout << "[STREAMER] " << width << "x" << height << "@" << fps << "fps → "
 			  << host << ":" << port << "  bitrate=" << bitrate / 1000
-			  << "kbps  gop=" << gop << "\n";
+			  << "kbps  gop=" << gop << "" << std::endl;
 
 	std::signal(SIGINT, on_signal);
 	std::signal(SIGTERM, on_signal);
@@ -930,7 +943,7 @@ int main(int argc, char *argv[]) {
 
 	CameraManager cam_mgr;
 	if (cam_mgr.start()) {
-		std::cerr << "[CAM] CameraManager start failed\n";
+		std::cerr << "[CAM] CameraManager start failed" << std::endl;
 		return 1;
 	}
 
@@ -947,7 +960,7 @@ int main(int argc, char *argv[]) {
 
 	ControlList cam_controls(cam->controls());
 	if (cam->start(&cam_controls)) {
-		std::cerr << "[CAM] Start failed\n";
+		std::cerr << "[CAM] Start failed" << std::endl;
 		return 1;
 	}
 
@@ -972,7 +985,8 @@ int main(int argc, char *argv[]) {
 					  << "  capture=" << g_capture_latency_ms << " ms"
 					  << "  encode=" << g_encode_latency_ms << " ms"
 					  << "  total=" << g_total_latency_ms << " ms"
-					  << "  bitrate=" << g_bitrate.load() / 1000 << " kbps\n";
+					  << "  bitrate=" << g_bitrate.load() / 1000 << " kbps"
+					  << std::endl;
 		}
 		g_main_loop_quit(loop);
 	});
@@ -994,6 +1008,6 @@ int main(int argc, char *argv[]) {
 	gst_element_set_state(g_pipeline, GST_STATE_NULL);
 	gst_object_unref(g_pipeline);
 
-	std::cout << "[STREAMER] Done\n";
+	std::cout << "[STREAMER] Done" << std::endl;
 	return 0;
 }

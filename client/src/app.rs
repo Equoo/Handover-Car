@@ -161,7 +161,7 @@ impl AppState {
 
     async fn run_abr(self: Arc<AppState>) {
         let mut interval = tokio::time::interval(Duration::from_secs(3));
-        let mut bitrate: u32 = 1_000_000;
+        let mut bitrate: u32 = 500_000;
 
         loop {
             interval.tick().await;
@@ -172,16 +172,16 @@ impl AppState {
 
             // AIMD
             bitrate = if loss > 0.05 {
-                (bitrate as f64 * 0.7) as u32 // cut 30% on bad loss
+                (bitrate as f64 * 0.6) as u32 // cut 40% on bad loss
             } else if loss > 0.02 {
-                (bitrate as f64 * 0.9) as u32 // cut 10% on mild loss
+                (bitrate as f64 * 0.75) as u32 // cut 25% on mild loss
             } else if decode_latency > 10.0 {
                 bitrate // hold if decoder struggling
             } else {
                 bitrate + 25_000 // additive increase
             };
 
-            bitrate = bitrate.clamp(200_000, 4_000_000);
+            bitrate = bitrate.clamp(100_000, 3_000_000);
 
             tracing::info!(
                 "ABR: loss={:.1}% latency={:.1}ms → {}kbps",
