@@ -3,14 +3,13 @@ use std::str::FromStr;
 use std::sync::Arc;
 
 use anyhow::Result;
-use gtk::Application;
-use gtk::prelude::*;
 use tracing::error;
 use tracing::level_filters::LevelFilter;
 
 use crate::app::AppState;
 
 mod app;
+mod latency_test;
 mod metrics;
 mod overlay;
 mod stats;
@@ -25,30 +24,36 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    gtk::init().unwrap();
-    gstreamer::init().unwrap();
+    gstreamer::init()?;
 
-    let app = Application::builder()
-        .application_id("com.rc.client")
-        .build();
+    let state = Arc::new(AppState::new()?);
 
-    let state = Arc::new(AppState::new().unwrap());
-
+    // Networking/control logic runs on tokio, independent of the UI's own
+    // (winit-driven) event loop below.
     let state_clone = state.clone();
-    app.connect_activate(move |app| {
-        if let Err(e) = ui::build(app, state_clone.clone()) {
-            error!(error = ?e, "ui building fatal error");
-            app.quit();
-        }
-    });
-
-    // Networking/control logic runs on tokio, independent of the GTK main loop.
     tokio::spawn(async move {
-        if let Err(e) = app::run(state).await {
+        if let Err(e) = app::run(state_clone).await {
             error!(error = ?e, "fatal error");
         }
     });
 
-    app.run();
+    let native_options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1280.0, 720.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Rc car client",
+        native_options,
+        Box::new(move |cc| match ui::App::new(cc, state) {
+            Ok(app) => Ok(Box::new(app) as Box<dyn eframe::App>),
+            Err(e) => {
+                error!(error = ?e, "ui building fatal error");
+                Err(format!("{e:?}").into())
+            }
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("eframe run failed: {e}"))?;
+
     Ok(())
 }

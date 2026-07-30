@@ -12,10 +12,10 @@ tracing-subscriber = { workspace = true }
 parking_lot = { workspace = true }
 uuid = { workspace = true }
 gstreamer-video = "0.23"
-gtk = { version = "0.9", package = "gtk4" }
-gdk = { version = "0.9", package = "gdk4" }
 glib = "0.20"
 gstreamer = "0.23"
 gstreamer-app = "0.23"
 dotenv = "0.15.0"
 num-traits = "0.2.19"
+egui = "0.29"
+eframe = "0.29"

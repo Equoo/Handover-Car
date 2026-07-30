@@ -1,10 +1,13 @@
 use anyhow::{Context, Result};
 use common::VideoMode;
+use egui::ColorImage;
 use gstreamer::Registry;
 use gstreamer::glib::object::{Cast, ObjectExt};
 use gstreamer::prelude::*;
 use gstreamer::{self as gst};
 use gstreamer_app as gst_app;
+use gstreamer_video as gst_video;
+use gstreamer_video::prelude::*;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,19 +45,75 @@ fn choose_h264_decoder() -> &'static str {
     }
 }
 
+/// Copies a `video/x-raw,format=RGBA` buffer into a tightly-packed pixel
+/// vector egui can use directly, accounting for row stride (GStreamer often
+/// pads rows wider than `width * 4` for alignment).
+fn copy_rgba_tight(buffer: &gst::BufferRef, caps: &gst::CapsRef) -> Option<(usize, usize, Vec<u8>)> {
+    let info = gst_video::VideoInfo::from_caps(caps).ok()?;
+    let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info).ok()?;
+
+    let width = frame.width() as usize;
+    let height = frame.height() as usize;
+    let stride = frame.plane_stride()[0] as usize;
+    let data = frame.plane_data(0).ok()?;
+
+    let mut pixels = Vec::with_capacity(width * height * 4);
+    for y in 0..height {
+        let start = y * stride;
+        let row = data.get(start..start + width * 4)?;
+        pixels.extend_from_slice(row);
+    }
+
+    Some((width, height, pixels))
+}
+
+/// Averages a strided subset of an RGBA buffer's pixels into an RGB color.
+/// Used only by the latency test (see `latency_test.rs`): a solid-color
+/// frame doesn't need every pixel sampled to get an accurate average, so
+/// this stays cheap even at 720p and up.
+fn sample_average_color(buffer: &gst::BufferRef, caps: &gst::CapsRef) -> Option<[u8; 3]> {
+    const STEP: usize = 8;
+
+    let info = gst_video::VideoInfo::from_caps(caps).ok()?;
+    let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info).ok()?;
+
+    let width = frame.width() as usize;
+    let height = frame.height() as usize;
+    let stride = frame.plane_stride()[0] as usize;
+    let data = frame.plane_data(0).ok()?;
+
+    let (mut r_sum, mut g_sum, mut b_sum, mut n) = (0u64, 0u64, 0u64, 0u64);
+    let mut y = 0;
+    while y < height {
+        let Some(row) = data.get(y * stride..) else {
+            break;
+        };
+        let mut x = 0;
+        while x * 4 + 2 < row.len() && x < width {
+            let px = x * 4;
+            r_sum += row[px] as u64;
+            g_sum += row[px + 1] as u64;
+            b_sum += row[px + 2] as u64;
+            n += 1;
+            x += STEP;
+        }
+        y += STEP;
+    }
+
+    (n > 0).then_some([(r_sum / n) as u8, (g_sum / n) as u8, (b_sum / n) as u8])
+}
+
 /// How the client receives and decodes video for a given `VideoMode`. Only
 /// one mode is implemented today (`RawRtpUdp`, below); a future mode (e.g.
 /// WebRTC) is a new impl of this trait, not a rewrite of `ui.rs`/`app.rs`'s
 /// call sites.
 pub trait VideoReceiver {
-    /// Builds the pipeline that decodes onto `sink`. Called once at window
-    /// creation, before the server (and so the negotiated `VideoMode`) is
-    /// known -- with a single mode implemented there's nothing to select
+    /// Builds the pipeline and starts it decoding into `state.latest_frame`
+    /// (picked up by `ui.rs`'s `update()` loop each repaint). Called once at
+    /// app creation -- before the server (and so the negotiated `VideoMode`)
+    /// is known, with a single mode implemented there's nothing to select
     /// yet, but this is the seam a mode-aware choice would hook into.
-    fn build_pipeline(
-        sink: &gst::Element,
-        state: Arc<AppState>,
-    ) -> Result<(gst::Pipeline, gst_app::AppSrc)>;
+    fn build_pipeline(state: Arc<AppState>) -> Result<(gst::Pipeline, gst_app::AppSrc)>;
 
     /// Receives video over the network per `mode` and pushes it into
     /// `state.appsrc`. Runs until a fatal setup error occurs; per-packet
@@ -63,16 +122,15 @@ pub trait VideoReceiver {
 }
 
 /// Raw RTP packets read straight off a UDP socket into an `appsrc`, decoded
-/// by a `rtpjitterbuffer` -> depay -> parse -> decode -> convert chain. This
-/// is `VideoMode::RawRtpUdp`'s client-side implementation.
+/// by a `rtpjitterbuffer` -> depay -> parse -> decode -> convert chain, and
+/// handed to an `appsink` that copies each frame into `state.latest_frame`
+/// for `ui.rs` to paint. This is `VideoMode::RawRtpUdp`'s client-side
+/// implementation.
 pub struct RawRtpUdp;
 
 impl VideoReceiver for RawRtpUdp {
     // for NVDEC: need 4:2:0, not 4:4:4
-    fn build_pipeline(
-        sink: &gst::Element,
-        state: Arc<AppState>,
-    ) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
+    fn build_pipeline(state: Arc<AppState>) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
         let caps = gst::Caps::builder("application/x-rtp")
             .field("media", "video")
             .field("encoding-name", "H264")
@@ -124,9 +182,16 @@ impl VideoReceiver for RawRtpUdp {
         caps_filter.set_property(
             "caps",
             gst::Caps::builder("video/x-raw")
-                .field("format", "BGRx")
+                .field("format", "RGBA")
                 .build(),
         );
+
+        let appsink_elem = gst::ElementFactory::make("appsink").build()?;
+        appsink_elem.set_property("sync", false);
+        // Live display: always show the newest frame, drop anything older
+        // that piles up rather than presenting stale video.
+        appsink_elem.set_property("max-buffers", 1u32);
+        appsink_elem.set_property("drop", true);
 
         pipeline.add_many([
             &src,
@@ -136,7 +201,7 @@ impl VideoReceiver for RawRtpUdp {
             &dec,
             &conv,
             &caps_filter,
-            sink,
+            &appsink_elem,
         ])?;
 
         gst::Element::link_many([
@@ -147,7 +212,7 @@ impl VideoReceiver for RawRtpUdp {
             &dec,
             &conv,
             &caps_filter,
-            sink,
+            &appsink_elem,
         ])?;
 
         // jitter.connect("request-fec-decoder", false, |values| {
@@ -210,6 +275,33 @@ impl VideoReceiver for RawRtpUdp {
             gst::PadProbeReturn::Ok
         });
 
+        // Feeds the camera-on-screen latency test (see `latency_test.rs`).
+        // Sampled after `caps_filter` rather than off the decoder directly,
+        // since that's the one point in the pipeline where the format is
+        // guaranteed `RGBA` instead of whatever the decoder happened to
+        // negotiate. Bails out before touching the buffer at all when the
+        // test isn't running, so this costs nothing during normal driving.
+        let state_clone4 = state.clone();
+        caps_filter
+            .static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |pad, probe_info| {
+                if !state_clone4.latency_test.is_enabled() {
+                    return gst::PadProbeReturn::Ok;
+                }
+
+                if let Some(rgb) = probe_info
+                    .buffer()
+                    .zip(pad.current_caps())
+                    .and_then(|(buffer, caps)| sample_average_color(buffer, &caps))
+                    && let Some(rtt_ms) = state_clone4.latency_test.observe_frame_color(rgb)
+                {
+                    state_clone4.stats.note_measured_glass_to_glass(rtt_ms);
+                }
+
+                gst::PadProbeReturn::Ok
+            });
+
         let jitter_clone = jitter.clone();
         let state_clone = state.clone();
         tokio::spawn(async move {
@@ -251,6 +343,31 @@ impl VideoReceiver for RawRtpUdp {
                 };
             }
         });
+
+        let appsink = appsink_elem
+            .dynamic_cast::<gst_app::AppSink>()
+            .map_err(|_| anyhow::anyhow!("dynamic cast of appsink failed"))?;
+
+        let state_video = state.clone();
+        appsink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                    let caps = sample.caps().ok_or(gst::FlowError::Error)?;
+
+                    if let Some((width, height, pixels)) = copy_rgba_tight(buffer, caps) {
+                        let image = ColorImage::from_rgba_unmultiplied([width, height], &pixels);
+                        *state_video.latest_frame.lock() = Some(image);
+                        if let Some(ctx) = state_video.egui_ctx.get() {
+                            ctx.request_repaint();
+                        }
+                    }
+
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
 
         match src.dynamic_cast::<gst_app::AppSrc>() {
             Ok(appsrc_casted) => Ok((pipeline, appsrc_casted)),

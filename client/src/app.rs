@@ -5,17 +5,20 @@ use common::{
     PacketType, PilotCommand, Socket, SocketEvent, VideoMode,
 };
 use dotenv::dotenv;
+use egui::ColorImage;
 use gstreamer_app as gst_app;
 use parking_lot::Mutex;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::time::Duration;
 use std::env;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::latency_test::LatencyTest;
 use crate::stats::Stats;
 use crate::video::{RawRtpUdp, VideoReceiver};
 
@@ -35,6 +38,15 @@ pub struct AppState {
     last_pong: Mutex<Instant>,
     pub appsrc: Mutex<Option<gst_app::AppSrc>>,
     pub stats: Stats,
+    pub latency_test: LatencyTest,
+    /// Latest decoded video frame, written by the `appsink` callback in
+    /// `video.rs` and consumed (via `take`) by `ui.rs`'s `update()` each
+    /// repaint -- replaces what `gtk4paintablesink` used to do for free.
+    pub latest_frame: Mutex<Option<ColorImage>>,
+    /// Set once at app creation (see `ui.rs`), read by the `appsink`
+    /// callback to request a repaint the moment a new frame lands rather
+    /// than waiting on a poll/vsync timer.
+    pub egui_ctx: OnceLock<egui::Context>,
     last_keyframe_request: Mutex<Option<Instant>>,
     /// Whether `announce_loop`/`run_abr` have been spawned. Set once on the
     /// first `ServerClientConnected` and left set across a later resubscribe
@@ -65,6 +77,9 @@ impl AppState {
             ping: PingTracker::new(),
             last_pong: Mutex::new(Instant::now()),
             stats: Stats::new(),
+            latency_test: LatencyTest::new(),
+            latest_frame: Mutex::new(None),
+            egui_ctx: OnceLock::new(),
             last_keyframe_request: Mutex::new(None),
             connected: Mutex::new(false),
         })

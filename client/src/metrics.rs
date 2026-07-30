@@ -16,6 +16,7 @@ pub enum MetricId {
     CaptureLatency,
     EncodeLatency,
     GlassToGlass,
+    MeasuredGlassToGlass,
     ClientPing,
     SlavePing,
     RoundTrip,
@@ -71,6 +72,15 @@ pub const METRICS: &[MetricDef] = &[
             let network = *s.client_ping.lock() as f64 + *s.slave_ping.lock() as f64;
             let total = *s.encoder_latency.lock() + network + *s.decode_latency.lock();
             format!("Glass-to-glass ~{}", fmt_ms(total))
+        },
+    },
+    MetricDef {
+        id: MetricId::MeasuredGlassToGlass,
+        key: 'm',
+        label: "Glass-to-glass measured (camera-on-screen test, [T])",
+        format: |s| match *s.measured_glass_to_glass_ms.lock() {
+            Some(ms) => format!("Glass-to-glass (measured): {}", fmt_ms(ms)),
+            None => "Glass-to-glass (measured): no signal yet".to_string(),
         },
     },
     MetricDef {
@@ -149,6 +159,10 @@ pub const METRICS: &[MetricDef] = &[
 pub const HELP_KEY: char = 'h';
 pub const SHOW_ALL_KEY: char = 'a';
 pub const HIDE_ALL_KEY: char = '0';
+/// Toggles the camera-on-screen latency test (see `latency_test.rs`).
+/// Handled directly in `overlay.rs`, not by `Visibility`, since it has a
+/// real side effect (flashing the screen) rather than showing/hiding a label.
+pub const LATENCY_TEST_KEY: char = 't';
 
 const DEFAULT_ENABLED: &[MetricId] = &[
     MetricId::Fps,
