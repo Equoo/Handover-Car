@@ -58,7 +58,17 @@ static std::unordered_map<uint64_t, std::chrono::steady_clock::time_point>
 static double g_capture_latency_ms = 0.0;
 static double g_encode_latency_ms = 0.0;
 static double g_total_latency_ms = 0.0;
-static uint64_t g_frame_seq = 0;
+// Atomic: incremented on the libcamera callback thread, read from the
+// logging thread for the periodic captured-fps figure below.
+static std::atomic<uint64_t> g_frame_seq{0};
+
+// Frames captured by libcamera but discarded before ever reaching the
+// network -- invisible to the client, which only sees what it receives.
+// Split by stage so a fps drop can be traced to "camera not producing frames"
+// vs "queue full" vs "V4L2 encoder input starved" instead of guessed at.
+static std::atomic<uint64_t> g_queue_drops{0};
+static std::atomic<uint64_t> g_encoder_drops{0};
+static std::atomic<uint64_t> g_encoded_count{0};
 
 // ─── Global state ────────────────────────────────────────────────────────────
 
@@ -655,7 +665,7 @@ static void on_request_completed(Request *request) {
 		frame.data.resize(total);
 		frame.width = stream->configuration().size.width;
 		frame.height = stream->configuration().size.height;
-		frame.seq = g_frame_seq++;
+		frame.seq = g_frame_seq.fetch_add(1, std::memory_order_relaxed);
 		frame.timestamp_us = sensor_ts_ns ? (*sensor_ts_ns / 1000) : 0;
 
 		// Group planes by fd, find total mapped length needed per fd
@@ -699,6 +709,8 @@ static void on_request_completed(Request *request) {
 			std::lock_guard<std::mutex> lock(g_queue_mutex);
 			if (g_frame_queue.size() < MAX_QUEUE)
 				g_frame_queue.push(std::move(frame));
+			else
+				g_queue_drops.fetch_add(1, std::memory_order_relaxed);
 		}
 		g_queue_cv.notify_one();
 	}
@@ -722,6 +734,8 @@ static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
 		if (keyframe)
 			std::cout << "[ENC] IDR emitted at frame " << seq << " (" << size
 					  << " bytes)" << std::endl;
+
+		g_encoded_count.fetch_add(1, std::memory_order_relaxed);
 
 		// Latency: encode done
 		{
@@ -785,8 +799,15 @@ static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
 				g_encode_entry[frame.seq] = std::chrono::steady_clock::now();
 			}
 
-			enc.encode(frame.data.data(), frame.data.size(), frame.timestamp_us,
-					   frame.seq);
+			if (!enc.encode(frame.data.data(), frame.data.size(),
+							frame.timestamp_us, frame.seq)) {
+				g_encoder_drops.fetch_add(1, std::memory_order_relaxed);
+				// No free V4L2 input buffer, so this frame will never reach
+				// on_encoded -- erase its entry now or it sits in the map
+				// forever.
+				std::lock_guard<std::mutex> lock(g_latency_mutex);
+				g_encode_entry.erase(frame.seq);
+			}
 		}
 
 		enc.stop();
@@ -966,14 +987,40 @@ int main(int argc, char *argv[]) {
 
 	GMainLoop *loop = g_main_loop_new(nullptr, FALSE);
 	std::thread glib_thread([&loop] {
+		constexpr double interval_s = 2.0;
+		uint64_t prev_captured = g_frame_seq.load(std::memory_order_relaxed);
+		uint64_t prev_encoded = g_encoded_count.load(std::memory_order_relaxed);
+		uint64_t prev_queue_drops = g_queue_drops.load(std::memory_order_relaxed);
+		uint64_t prev_encoder_drops = g_encoder_drops.load(std::memory_order_relaxed);
+
 		while (g_running) {
-			std::this_thread::sleep_for(std::chrono::seconds(2));
+			std::this_thread::sleep_for(std::chrono::duration<double>(interval_s));
+
+			uint64_t captured = g_frame_seq.load(std::memory_order_relaxed);
+			uint64_t encoded = g_encoded_count.load(std::memory_order_relaxed);
+			uint64_t queue_drops = g_queue_drops.load(std::memory_order_relaxed);
+			uint64_t encoder_drops = g_encoder_drops.load(std::memory_order_relaxed);
+
+			double captured_fps = (captured - prev_captured) / interval_s;
+			double encoded_fps = (encoded - prev_encoded) / interval_s;
+			uint64_t new_queue_drops = queue_drops - prev_queue_drops;
+			uint64_t new_encoder_drops = encoder_drops - prev_encoder_drops;
+
+			prev_captured = captured;
+			prev_encoded = encoded;
+			prev_queue_drops = queue_drops;
+			prev_encoder_drops = encoder_drops;
+
 			std::lock_guard<std::mutex> lock(g_latency_mutex);
 			std::cout << "[LATENCY]"
 					  << "  capture=" << g_capture_latency_ms << " ms"
 					  << "  encode=" << g_encode_latency_ms << " ms"
 					  << "  total=" << g_total_latency_ms << " ms"
 					  << "  bitrate=" << g_bitrate.load() / 1000 << " kbps"
+					  << "  | captured=" << captured_fps << " fps"
+					  << "  encoded=" << encoded_fps << " fps"
+					  << "  queue_drops=" << new_queue_drops
+					  << "  encoder_drops=" << new_encoder_drops
 					  << std::endl;
 		}
 		g_main_loop_quit(loop);
