@@ -29,6 +29,7 @@
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include <atomic>
@@ -52,8 +53,6 @@ using namespace libcamera;
 // ─── Latency tracking ────────────────────────────────────────────────────────
 
 static std::mutex g_latency_mutex;
-static std::unordered_map<uint64_t, std::chrono::steady_clock::time_point>
-	g_capture_entry;
 static std::unordered_map<uint64_t, std::chrono::steady_clock::time_point>
 	g_encode_entry;
 static double g_capture_latency_ms = 0.0;
@@ -458,7 +457,6 @@ struct Frame {
 	uint32_t width;
 	uint32_t height;
 	int64_t timestamp_us;
-	std::chrono::steady_clock::time_point capture_start;
 	uint64_t seq;
 };
 
@@ -630,20 +628,23 @@ static bool build_pipeline(const std::string &host, uint16_t port) {
 static void on_request_completed(Request *request) {
 	if (request->status() == Request::RequestCancelled) return;
 
-	auto capture_end = std::chrono::steady_clock::now();
-	std::chrono::steady_clock::time_point capture_start;
-	{
+	// Real capture latency: from the sensor's own exposure timestamp
+	// (SensorTimestamp, nanoseconds on the same CLOCK_MONOTONIC domain
+	// std::chrono::steady_clock uses on Linux) to the moment userspace is
+	// told the request completed. This replaces a previous measurement that
+	// timed how long it took a *recycled* request buffer to complete again
+	// -- which mostly reported libcamera's request-pool depth (number of
+	// buffers in flight / fps) rather than anything about this frame's
+	// actual capture time.
+	auto &metadata = request->metadata();
+	auto sensor_ts_ns = metadata.get(controls::SensorTimestamp);
+	if (sensor_ts_ns) {
+		struct timespec now_ts;
+		clock_gettime(CLOCK_MONOTONIC, &now_ts);
+		int64_t now_ns = (int64_t)now_ts.tv_sec * 1'000'000'000 + now_ts.tv_nsec;
+
 		std::lock_guard<std::mutex> lock(g_latency_mutex);
-		auto it = g_capture_entry.find(request->cookie());
-		if (it != g_capture_entry.end()) {
-			capture_start = it->second;
-			g_capture_latency_ms = std::chrono::duration<double, std::milli>(
-									   capture_end - capture_start)
-									   .count();
-			g_capture_entry.erase(it);
-		} else {
-			capture_start = capture_end;
-		}
+		g_capture_latency_ms = (now_ns - *sensor_ts_ns) / 1'000'000.0;
 	}
 
 	for (auto &[stream, fb] : request->buffers()) {
@@ -654,12 +655,8 @@ static void on_request_completed(Request *request) {
 		frame.data.resize(total);
 		frame.width = stream->configuration().size.width;
 		frame.height = stream->configuration().size.height;
-		frame.capture_start = capture_start;
 		frame.seq = g_frame_seq++;
-
-		auto &metadata = request->metadata();
-		auto ts = metadata.get(controls::SensorTimestamp);
-		frame.timestamp_us = ts ? (*ts / 1000) : 0;
+		frame.timestamp_us = sensor_ts_ns ? (*sensor_ts_ns / 1000) : 0;
 
 		// Group planes by fd, find total mapped length needed per fd
 		std::unordered_map<int, size_t> fd_total_len;
@@ -708,10 +705,6 @@ static void on_request_completed(Request *request) {
 
 	if (g_running) {
 		request->reuse(Request::ReuseBuffers);
-		{
-			std::lock_guard<std::mutex> lock(g_latency_mutex);
-			g_capture_entry[request->cookie()] = std::chrono::steady_clock::now();
-		}
 		s_cam->queueRequest(request);
 	}
 }
@@ -740,10 +733,9 @@ static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
 						std::chrono::steady_clock::now() - it->second)
 						.count();
 
-				// Total: from capture submit to encoded output
-				// capture_start is stored in g_encode_entry mapped by seq
-				// (we'd need to thread it through — encode_entry reused here
-				//  stores encode-start, so total = capture_latency + encode_latency)
+				// Total: sensor exposure to encoded output. Both terms are
+				// now real per-frame measurements (see on_request_completed
+				// for capture), not just an approximation.
 				g_total_latency_ms = g_capture_latency_ms + g_encode_latency_ms;
 				g_encode_entry.erase(it);
 			}
@@ -965,10 +957,6 @@ int main(int argc, char *argv[]) {
 	}
 
 	for (auto &req : requests) {
-		{
-			std::lock_guard<std::mutex> lock(g_latency_mutex);
-			g_capture_entry[req->cookie()] = std::chrono::steady_clock::now();
-		}
 		cam->queueRequest(req.get());
 	}
 
