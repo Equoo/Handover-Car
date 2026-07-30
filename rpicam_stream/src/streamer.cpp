@@ -868,11 +868,6 @@ static std::shared_ptr<Camera> setup_camera(
 		return nullptr;
 	}
 
-	ControlList controls(cam->controls());
-	int64_t frame_duration = 1'000'000 / fps;
-	controls.set(controls::FrameDurationLimits,
-				 Span<const int64_t, 2>({frame_duration, frame_duration}));
-
 	for (const auto &fb : alloc_out->buffers(stream)) {
 		auto req = cam->createRequest();
 		if (!req || req->addBuffer(stream, fb.get())) return nullptr;
@@ -972,6 +967,13 @@ int main(int argc, char *argv[]) {
 	gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
 
 	ControlList cam_controls(cam->controls());
+	// Pin the frame duration to the requested fps. Without this the AEC/AGC
+	// algorithm is free to stretch exposure time (and so frame duration) as
+	// long as it wants for the scene's lighting, silently capping the actual
+	// capture rate far below what was requested -- gain compensates instead.
+	int64_t frame_duration = 1'000'000 / fps;
+	cam_controls.set(controls::FrameDurationLimits,
+					  Span<const int64_t, 2>({frame_duration, frame_duration}));
 	if (cam->start(&cam_controls)) {
 		std::cerr << "[CAM] Start failed" << std::endl;
 		return 1;
