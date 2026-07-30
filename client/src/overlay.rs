@@ -1,131 +1,152 @@
-//! The on-screen stats panel and its keyboard-driven help panel.
+//! The on-screen stats panel, help panel, and camera-on-screen latency-test
+//! flash layer, all drawn as part of `ui.rs`'s `update()` loop rather than as
+//! a separate widget tree (egui is immediate-mode: there's nothing to build
+//! once and mutate later, just "draw the current state" every frame).
 //!
-//! Everything shown here comes straight from the `METRICS` registry in
-//! `metrics.rs`: one label per entry, shown/hidden per `Visibility`, and the
-//! same list doubles as the content of the help panel so the two can never
-//! drift apart.
+//! Everything the stats/help panels show comes straight from the `METRICS`
+//! registry in `metrics.rs`: one label per entry, shown/hidden per
+//! `Visibility`, and the same list doubles as the content of the help panel
+//! so the two can never drift apart.
 
 use std::sync::Arc;
 use std::time::Duration;
 
-use gtk::prelude::*;
-use gtk::{ApplicationWindow, Box as GtkBox, EventControllerKey, Label, Orientation, Overlay};
+use eframe::egui;
 
 use crate::app::AppState;
-use crate::metrics::{HELP_KEY, HIDE_ALL_KEY, METRICS, SHOW_ALL_KEY, Visibility};
+use crate::latency_test::FLASH_INTERVAL_MS;
+use crate::metrics::{HELP_KEY, HIDE_ALL_KEY, LATENCY_TEST_KEY, METRICS, SHOW_ALL_KEY, Visibility};
 
-const CSS: &str = "
-box.stats-panel, box.help-panel {
-    background-color: rgba(0, 0, 0, 0.7);
-    border-radius: 10px;
-    padding: 15px;
-}
-box.stats-panel label, box.help-panel label {
-    color: white;
-    font-size: 16px;
-    font-weight: bold;
-    font-family: monospace;
-}
-box.help-panel label {
-    font-size: 13px;
-    font-weight: normal;
-}
-";
-
-fn build_stats_box() -> (GtkBox, Vec<Label>) {
-    let stats_box = GtkBox::new(Orientation::Vertical, 5);
-    stats_box.add_css_class("stats-panel");
-    stats_box.set_halign(gtk::Align::End);
-    stats_box.set_valign(gtk::Align::Start);
-    stats_box.set_margin_top(10);
-    stats_box.set_margin_end(10);
-
-    let labels: Vec<Label> = METRICS
-        .iter()
-        .map(|_| {
-            let label = Label::new(None);
-            label.set_halign(gtk::Align::Start);
-            label
-        })
-        .collect();
-    for label in &labels {
-        stats_box.append(label);
-    }
-
-    (stats_box, labels)
+fn panel_frame() -> egui::Frame {
+    egui::Frame::none()
+        .fill(egui::Color32::from_black_alpha(180))
+        .rounding(10.0)
+        .inner_margin(12.0)
 }
 
-fn build_help_box() -> GtkBox {
-    let help_box = GtkBox::new(Orientation::Vertical, 3);
-    help_box.add_css_class("help-panel");
-    help_box.set_halign(gtk::Align::Start);
-    help_box.set_valign(gtk::Align::End);
-    help_box.set_margin_start(10);
-    help_box.set_margin_bottom(10);
-    help_box.set_visible(false);
-
-    let add_line = |text: String| {
-        let line = Label::new(Some(&text));
-        line.set_halign(gtk::Align::Start);
-        help_box.append(&line);
-    };
-
-    add_line(format!("[{HELP_KEY}] toggle this help"));
-    add_line(format!("[{SHOW_ALL_KEY}] show all metrics   [{HIDE_ALL_KEY}] hide all metrics"));
-    for metric in METRICS {
-        add_line(format!("[{}] {}", metric.key, metric.label));
-    }
-
-    help_box
+fn panel_label(text: impl Into<String>, strong: bool) -> egui::RichText {
+    let text = egui::RichText::new(text).monospace().color(egui::Color32::WHITE);
+    if strong { text.strong() } else { text.size(12.0) }
 }
 
-/// Wraps `picture` in an `Overlay` carrying the stats panel and help panel,
-/// and attaches the key controller that drives `Visibility`. `window` is
-/// where the key controller is installed (key events bubble up to it
-/// regardless of which child widget has focus).
-pub fn build(window: &ApplicationWindow, picture: &gtk::Picture, state: Arc<AppState>) -> Overlay {
-    let overlay = Overlay::new();
-    overlay.set_child(Some(picture));
+/// Owns the overlay's own UI-side state -- which metrics are shown, whether
+/// help is visible, and the latency-test flash's own timing. None of this
+/// touches `AppState`/networking, same separation the GTK version kept.
+pub struct Overlay {
+    visibility: Visibility,
+    last_flash_tick: f64,
+}
 
-    let (stats_box, labels) = build_stats_box();
-    let help_box = build_help_box();
-
-    let css_provider = gtk::CssProvider::new();
-    css_provider.load_from_data(CSS);
-    gtk::style_context_add_provider_for_display(
-        &gdk::Display::default().unwrap(),
-        &css_provider,
-        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-    );
-
-    overlay.add_overlay(&stats_box);
-    overlay.add_overlay(&help_box);
-
-    let visibility = Arc::new(Visibility::new());
-
-    let key_controller = EventControllerKey::new();
-    let visibility_for_keys = visibility.clone();
-    let help_box_for_keys = help_box.clone();
-    key_controller.connect_key_pressed(move |_, keyval, _keycode, _modifiers| {
-        if let Some(c) = keyval.to_unicode()
-            && visibility_for_keys.handle_key(c)
-        {
-            help_box_for_keys.set_visible(visibility_for_keys.help_visible());
+impl Overlay {
+    pub fn new() -> Self {
+        Self {
+            visibility: Visibility::new(),
+            last_flash_tick: 0.0,
         }
-        glib::Propagation::Proceed
-    });
-    window.add_controller(key_controller);
+    }
 
-    glib::timeout_add_local(Duration::from_millis(100), move || {
-        for (label, metric) in labels.iter().zip(METRICS.iter()) {
-            let visible = visibility.is_enabled(metric.id);
-            label.set_visible(visible);
-            if visible {
-                label.set_text(&(metric.format)(&state.stats));
+    /// Call once per frame from `ui.rs`'s `update()`.
+    pub fn draw(&mut self, ctx: &egui::Context, state: &Arc<AppState>) {
+        self.handle_keyboard(ctx, state);
+        self.draw_stats_panel(ctx, state);
+        self.draw_help_panel(ctx);
+        self.draw_flash_layer(ctx, state);
+    }
+
+    fn handle_keyboard(&self, ctx: &egui::Context, state: &Arc<AppState>) {
+        let chars: Vec<char> = ctx.input(|i| {
+            i.events
+                .iter()
+                .filter_map(|e| match e {
+                    egui::Event::Text(text) => Some(text.chars().collect::<Vec<_>>()),
+                    _ => None,
+                })
+                .flatten()
+                .collect()
+        });
+
+        for c in chars {
+            if c.to_ascii_lowercase() == LATENCY_TEST_KEY {
+                let enabled = state.latency_test.toggle();
+                ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(enabled));
+            } else {
+                self.visibility.handle_key(c);
             }
         }
-        glib::ControlFlow::Continue
-    });
+    }
 
-    overlay
+    fn draw_stats_panel(&self, ctx: &egui::Context, state: &Arc<AppState>) {
+        egui::Area::new(egui::Id::new("stats-panel"))
+            .anchor(egui::Align2::RIGHT_TOP, egui::vec2(-10.0, 10.0))
+            .show(ctx, |ui| {
+                panel_frame().show(ui, |ui| {
+                    for metric in METRICS {
+                        if self.visibility.is_enabled(metric.id) {
+                            ui.label(panel_label((metric.format)(&state.stats), true));
+                        }
+                    }
+                });
+            });
+    }
+
+    fn draw_help_panel(&self, ctx: &egui::Context) {
+        if !self.visibility.help_visible() {
+            return;
+        }
+
+        egui::Area::new(egui::Id::new("help-panel"))
+            .anchor(egui::Align2::LEFT_BOTTOM, egui::vec2(10.0, -10.0))
+            .show(ctx, |ui| {
+                panel_frame().show(ui, |ui| {
+                    ui.label(panel_label(format!("[{HELP_KEY}] toggle this help"), false));
+                    ui.label(panel_label(
+                        format!(
+                            "[{SHOW_ALL_KEY}] show all metrics   [{HIDE_ALL_KEY}] hide all metrics"
+                        ),
+                        false,
+                    ));
+                    ui.label(panel_label(
+                        format!(
+                            "[{LATENCY_TEST_KEY}] toggle glass-to-glass latency test (flashes screen)"
+                        ),
+                        false,
+                    ));
+                    for metric in METRICS {
+                        ui.label(panel_label(format!("[{}] {}", metric.key, metric.label), false));
+                    }
+                });
+            });
+    }
+
+    /// Full-window solid-color flash for the camera-on-screen latency test
+    /// (see `latency_test.rs`). Advances the palette on its own timer
+    /// (`FLASH_INTERVAL_MS`) using egui's own clock, and keeps a repaint
+    /// scheduled so the flash keeps advancing even if nothing else is
+    /// triggering redraws (e.g. no video arriving yet).
+    fn draw_flash_layer(&mut self, ctx: &egui::Context, state: &Arc<AppState>) {
+        if !state.latency_test.is_enabled() {
+            return;
+        }
+
+        let now = ctx.input(|i| i.time);
+        let interval_secs = FLASH_INTERVAL_MS as f64 / 1000.0;
+        if now - self.last_flash_tick >= interval_secs {
+            state.latency_test.tick();
+            self.last_flash_tick = now;
+        }
+        ctx.request_repaint_after(Duration::from_millis(FLASH_INTERVAL_MS));
+
+        let [r, g, b] = state.latency_test.current_color();
+        let painter = ctx.layer_painter(egui::LayerId::new(
+            egui::Order::Foreground,
+            egui::Id::new("latency-flash"),
+        ));
+        painter.rect_filled(ctx.screen_rect(), 0.0, egui::Color32::from_rgb(r, g, b));
+    }
+}
+
+impl Default for Overlay {
+    fn default() -> Self {
+        Self::new()
+    }
 }

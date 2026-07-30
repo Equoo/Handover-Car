@@ -82,6 +82,11 @@ pub struct Stats {
     pub loss: Mutex<PacketLoss>,
     pub decoder_name: Mutex<&'static str>,
     pub connected_at: Mutex<Option<Instant>>,
+    /// Measured (not estimated) glass-to-glass round-trip from the
+    /// camera-on-screen latency test in `latency_test.rs`. `None` until a
+    /// sample has actually been observed (test not running, or camera not
+    /// pointed at the screen yet).
+    pub measured_glass_to_glass_ms: Mutex<Option<f64>>,
     frames: RateCounter,
     bytes: RateCounter,
 }
@@ -100,6 +105,7 @@ impl Stats {
             loss: Mutex::new(PacketLoss::default()),
             decoder_name: Mutex::new("--"),
             connected_at: Mutex::new(None),
+            measured_glass_to_glass_ms: Mutex::new(None),
             frames: RateCounter::new(),
             bytes: RateCounter::new(),
         }
@@ -125,6 +131,15 @@ impl Stats {
     pub fn note_client_ping(&self, ms: f64) {
         let mut ping = self.client_ping.lock();
         *ping = ema_average(*ping as f64, ms) as u16;
+    }
+
+    /// Records one round-trip sample from the camera-on-screen latency test.
+    pub fn note_measured_glass_to_glass(&self, ms: f64) {
+        let mut measured = self.measured_glass_to_glass_ms.lock();
+        *measured = Some(match *measured {
+            Some(prev) => ema_average(prev, ms),
+            None => ms,
+        });
     }
 
     pub fn note_frame(&self) {
