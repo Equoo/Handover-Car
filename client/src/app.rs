@@ -217,9 +217,9 @@ impl AppState {
             // budgeted out of this separately below -- it never feeds back
             // into `link_estimate` itself, so enabling FEC doesn't make the
             // AIMD think the link got worse.
-            link_estimate = if loss_pct > 5.0 {
+            link_estimate = if loss_pct > 2.5 {
                 (link_estimate as f64 * 0.6) as u32 // cut 40% on bad loss
-            } else if loss_pct > 2.0 {
+            } else if loss_pct > 1.5 {
                 (link_estimate as f64 * 0.75) as u32 // cut 25% on mild loss
             } else if decode_latency > 10.0 {
                 link_estimate // hold if decoder struggling
