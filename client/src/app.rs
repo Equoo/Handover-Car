@@ -93,7 +93,7 @@ impl AppState {
     /// continuously and recreate exactly the bitrate spikes the long GOP was
     /// introduced to remove.
     pub fn request_keyframe(&self) {
-        const MIN_INTERVAL: Duration = Duration::from_millis(2000);
+        const MIN_INTERVAL: Duration = Duration::from_millis(5000);
 
         {
             let mut last = self.last_keyframe_request.lock();
