@@ -21,9 +21,12 @@ pub enum MetricId {
     SlavePing,
     RoundTrip,
     TargetBitrate,
+    LinkEstimateBitrate,
     EncoderBitrate,
     ReceivedBitrate,
     RtpLoss,
+    WindowedLoss,
+    FecPct,
     Decoder,
     Uptime,
 }
@@ -107,8 +110,14 @@ pub const METRICS: &[MetricDef] = &[
     MetricDef {
         id: MetricId::TargetBitrate,
         key: 'b',
-        label: "Target bitrate (ABR)",
+        label: "Target video bitrate (adaptive, post-FEC budget)",
         format: |s| format!("Target bitrate: {}kbps", *s.target_bitrate.lock() / 1000),
+    },
+    MetricDef {
+        id: MetricId::LinkEstimateBitrate,
+        key: 'k',
+        label: "Estimated link capacity (adaptive, pre-FEC budget)",
+        format: |s| format!("Link estimate: {}kbps", *s.link_estimate_bitrate.lock() / 1000),
     },
     MetricDef {
         id: MetricId::EncoderBitrate,
@@ -138,6 +147,18 @@ pub const METRICS: &[MetricDef] = &[
                 loss.avg_jitter
             )
         },
+    },
+    MetricDef {
+        id: MetricId::WindowedLoss,
+        key: 'w',
+        label: "RTP loss over a short decaying window (drives adaptive loop)",
+        format: |s| format!("Windowed loss: {:.2}%", s.windowed_loss_pct()),
+    },
+    MetricDef {
+        id: MetricId::FecPct,
+        key: 'z',
+        label: "FEC overhead currently commanded",
+        format: |s| format!("FEC: {}%", *s.target_fec_pct.lock()),
     },
     MetricDef {
         id: MetricId::Decoder,
@@ -171,6 +192,8 @@ const DEFAULT_ENABLED: &[MetricId] = &[
     MetricId::SlavePing,
     MetricId::TargetBitrate,
     MetricId::RtpLoss,
+    MetricId::WindowedLoss,
+    MetricId::FecPct,
 ];
 
 /// Which metrics are currently shown in the overlay. Purely a UI-side

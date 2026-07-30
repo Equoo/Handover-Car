@@ -34,6 +34,9 @@ pub trait VideoSource: Sized {
 
     /// Retune the encoder's target bitrate.
     async fn set_bitrate(&self, bps: u32) -> Result<()>;
+
+    /// Retune the FEC overhead percentage (0-50).
+    async fn set_fec(&self, pct: u8) -> Result<()>;
 }
 
 /// Parses lines shaped like:
@@ -87,6 +90,10 @@ impl VideoSource for RawRtpUdp {
 
     async fn set_bitrate(&self, bps: u32) -> Result<()> {
         tokio::fs::write("/tmp/streamer_ctrl", format!("{bps}\n")).await
+    }
+
+    async fn set_fec(&self, pct: u8) -> Result<()> {
+        tokio::fs::write("/tmp/streamer_ctrl", format!("fec:{pct}\n")).await
     }
 }
 

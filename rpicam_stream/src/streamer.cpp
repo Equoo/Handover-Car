@@ -6,9 +6,10 @@
  *
  * Pipeline:
  *   libcamera (YUV420) → V4L2Encoder (/dev/video11) → appsrc
- *   → h264parse → rtph264pay → udpsink
+ *   → h264parse → rtph264pay → rtpulpfecenc → udpsink
  *
  * Bitrate control: write integer bps to stdin e.g. `echo 500000`
+ * FEC control: write `fec:N` (0-50, overhead percent) e.g. `echo fec:10`
  *
  * Build:
  *   g++ streamer.cpp -o streamer \
@@ -91,7 +92,14 @@ static std::atomic<bool> g_force_keyframe{false};
 
 static GstElement *g_pipeline = nullptr;
 static GstElement *g_appsrc = nullptr;
+static GstElement *g_fecenc = nullptr;
 static Camera *s_cam = nullptr;
+
+// Payload type carrying FEC packets, distinct from the video payload (96,
+// set on rtph264pay below) so both share one RTP flow/SSRC. Must match the
+// `pt` the client's `rtpulpfecdec` is configured with (see FEC_PT in
+// client/src/video.rs).
+static constexpr gint FEC_PT = 122;
 
 // ─── RT scheduling ────────────────────────────────────────────────────────
 //
@@ -530,9 +538,15 @@ static void on_signal(int) {
 
 static constexpr const char *CTRL_FIFO = "/tmp/streamer_ctrl";
 
-// One control line: "idr" requests a keyframe, an integer sets the bitrate.
-// Both only raise a flag; the encoder thread applies it, so every ioctl on
-// the encoder fd stays on one thread.
+// One control line: "idr" requests a keyframe, "fec:N" sets FEC overhead
+// percentage, an integer sets the bitrate.
+//
+// "idr"/bitrate only raise a flag; the encoder thread applies it, so every
+// ioctl on the encoder fd stays on one thread. "fec:N" is applied directly
+// here instead: it's a plain GObject property set on `rtpulpfecenc`, which is
+// safe to do from any thread while the pipeline is PLAYING (no fd/ioctl
+// involved, unlike the V4L2 controls), so there's no need to relay it through
+// the encoder thread.
 static void handle_command(std::string s) {
 	s.erase(0, s.find_first_not_of(" \t\r\n"));
 	s.erase(s.find_last_not_of(" \t\r\n") + 1);
@@ -541,6 +555,20 @@ static void handle_command(std::string s) {
 	if (s == "idr" || s == "key") {
 		g_force_keyframe.store(true);
 		std::cout << "[CTRL] Keyframe requested" << std::endl;
+		return;
+	}
+
+	if (s.rfind("fec:", 0) == 0) {
+		try {
+			uint32_t pct = std::clamp((uint32_t)std::stoul(s.substr(4)), 0u, 50u);
+			if (g_fecenc) {
+				g_object_set(G_OBJECT(g_fecenc), "percentage", pct,
+							 "percentage-important", pct, nullptr);
+				std::cout << "[CTRL] FEC -> " << pct << "%" << std::endl;
+			}
+		} catch (...) {
+			std::cerr << "[CTRL] Bad fec command: " << s << "" << std::endl;
+		}
 		return;
 	}
 
@@ -637,12 +665,14 @@ static bool build_pipeline(const std::string &host, uint16_t port) {
 	g_appsrc = gst_element_factory_make("appsrc", "source");
 	auto *parse = gst_element_factory_make("h264parse", "parse");
 	auto *pay = gst_element_factory_make("rtph264pay", "pay");
+	auto *fecenc = gst_element_factory_make("rtpulpfecenc", "fecenc");
 	auto *sink = gst_element_factory_make("udpsink", "sink");
 
-	if (!g_pipeline || !g_appsrc || !parse || !pay || !sink) {
+	if (!g_pipeline || !g_appsrc || !parse || !pay || !fecenc || !sink) {
 		std::cerr << "[GST] Failed to create elements" << std::endl;
 		return false;
 	}
+	g_fecenc = fecenc;
 
 	// appsrc now receives H264 bitstream directly from our V4L2 encoder
 	GstCaps *caps = gst_caps_new_simple("video/x-h264", "stream-format",
@@ -667,6 +697,14 @@ static bool build_pipeline(const std::string &host, uint16_t port) {
 	g_object_set(G_OBJECT(pay), "config-interval", -1, "pt", 96, "mtu", 1200u,
 				 nullptr);
 
+	// FEC starts at 0% (clean-link default) and is retuned live by the
+	// client's adaptive loop via "fec:N" on the control FIFO -- see
+	// handle_command(). `multipacket` (default true) groups protected packets
+	// by RTP timestamp, i.e. one FEC block per video frame, which is what
+	// keeps FEC recovery within the ≤1-frame latency budget.
+	g_object_set(G_OBJECT(fecenc), "pt", FEC_PT, "percentage", 0u,
+				 "percentage-important", 0u, nullptr);
+
 	// max-bitrate paces UDP transmission (bytes smoothed at the socket
 	// rather than dumped as one burst per AU). 12 Mbps sits 1.5x above the
 	// hard bitrate ceiling enforced in handle_command(), so it only bites on
@@ -675,9 +713,9 @@ static bool build_pipeline(const std::string &host, uint16_t port) {
 				 FALSE, "async", FALSE, "max-bitrate", (guint64)12'000'000,
 				 nullptr);
 
-	gst_bin_add_many(GST_BIN(g_pipeline), g_appsrc, parse, pay, sink, nullptr);
+	gst_bin_add_many(GST_BIN(g_pipeline), g_appsrc, parse, pay, fecenc, sink, nullptr);
 
-	if (!gst_element_link_many(g_appsrc, parse, pay, sink, nullptr)) {
+	if (!gst_element_link_many(g_appsrc, parse, pay, fecenc, sink, nullptr)) {
 		std::cerr << "[GST] Failed to link pipeline" << std::endl;
 		return false;
 	}
@@ -1011,6 +1049,8 @@ int main(int argc, char *argv[]) {
 					  << "  echo 500000 > /tmp/streamer_ctrl   set bitrate"
 					  << std::endl
 					  << "  echo idr    > /tmp/streamer_ctrl   force a keyframe"
+					  << std::endl
+					  << "  echo fec:10 > /tmp/streamer_ctrl   set FEC overhead to 10%"
 					  << std::endl;
 			return 0;
 		}

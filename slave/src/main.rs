@@ -165,12 +165,17 @@ impl AppState {
                 }
             }
 
-            ArchivedServerToSlave::Pong { packet_id, bitrate } => {
+            ArchivedServerToSlave::Pong {
+                packet_id,
+                bitrate,
+                fec_pct,
+            } => {
                 if let Some(rtt) = self.ping.note_pong(packet_id.into()) {
                     *self.latency.lock() = rtt;
                 }
                 if let Some(media) = self.media.lock().await.as_ref() {
                     media.set_bitrate(bitrate.into()).await?;
+                    media.set_fec((*fec_pct).into()).await?;
                 }
             }
 
