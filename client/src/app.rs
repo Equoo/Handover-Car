@@ -183,9 +183,11 @@ impl AppState {
             let loss = losses.num_lost as f32 / (losses.num_pushed as f32).max(1f32);
 
             // AIMD
-            bitrate = if loss > 0.05 {
+            // NOTE: Don't like it because if running for 1 hours and now we having a bad connection we
+            // gonna take a long time against the bitrate go down
+            bitrate = if loss > 0.01 {
                 (bitrate as f64 * 0.6) as u32 // cut 40% on bad loss
-            } else if loss > 0.02 {
+            } else if loss > 0.005 {
                 (bitrate as f64 * 0.75) as u32 // cut 25% on mild loss
             } else if decode_latency > 10.0 {
                 bitrate // hold if decoder struggling

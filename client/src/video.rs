@@ -146,7 +146,7 @@ impl VideoReceiver for RawRtpUdp {
         src.set_property("do-timestamp", true); // true may needed but when true if receive packet before playing it warn
 
         let jitter = gst::ElementFactory::make("rtpjitterbuffer").build()?;
-        jitter.set_property("latency", 80u32);
+        jitter.set_property("latency", 60u32);
         jitter.set_property("drop-on-latency", true);
         jitter.set_property("do-lost", true);
         // `rtpjitterbuffer` only runs its "this packet is never coming, give up"
