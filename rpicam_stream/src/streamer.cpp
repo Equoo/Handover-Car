@@ -26,6 +26,8 @@
 #include <libcamera/libcamera.h>
 #include <linux/videodev2.h>
 #include <poll.h>
+#include <pthread.h>
+#include <sched.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -53,7 +55,15 @@ using namespace libcamera;
 // ─── Latency tracking ────────────────────────────────────────────────────────
 
 static std::mutex g_latency_mutex;
-static std::unordered_map<uint64_t, std::chrono::steady_clock::time_point>
+// Keyed by sensor timestamp (frame.timestamp_us), not our own per-frame
+// sequence number: bcm2835-codec does not propagate the OUTPUT buffer's
+// `sequence` field to the corresponding CAPTURE buffer (confirmed on-device
+// -- it read back as a constant 0 across hundreds of frames), so keying on
+// it made every lookup below miss after the very first frame and left
+// encode/total latency frozen. `timestamp` IS propagated end-to-end by the
+// M2M convention (also confirmed on-device: advances by a clean ~16.6 ms/
+// frame at 60fps), so it's the reliable correlator.
+static std::unordered_map<int64_t, std::chrono::steady_clock::time_point>
 	g_encode_entry;
 static double g_capture_latency_ms = 0.0;
 static double g_encode_latency_ms = 0.0;
@@ -82,6 +92,27 @@ static std::atomic<bool> g_force_keyframe{false};
 static GstElement *g_pipeline = nullptr;
 static GstElement *g_appsrc = nullptr;
 static Camera *s_cam = nullptr;
+
+// ─── RT scheduling ────────────────────────────────────────────────────────
+//
+// Promotes the calling thread to SCHED_FIFO. Requires CAP_SYS_NICE, granted
+// with `sudo setcap cap_sys_nice=eip <binary>` on the built binary after
+// each rebuild (capabilities don't survive a fresh build output). The usual
+// PAM/rtprio-rlimit route (/etc/security/limits.d) does not apply on this
+// Pi: sshd here is dropbear (reverse-tunneled for CGNAT traversal), which
+// never runs PAM session hooks, so a plain user can't self-raise. Also note
+// setcap is stripped by nosuid mounts (e.g. /tmp) -- the binary must live on
+// the regular rootfs.
+// Fails gracefully without the capability: every promoted loop below blocks
+// in poll()/condvar wait rather than spinning, so a missing capability just
+// means "no priority boost", not a functional regression.
+static void set_rt_priority(const char *name, int prio) {
+	sched_param sp{};
+	sp.sched_priority = prio;
+	if (pthread_setschedparam(pthread_self(), SCHED_FIFO, &sp) != 0)
+		std::cerr << "[RT] " << name << ": SCHED_FIFO unavailable ("
+				  << strerror(errno) << "), staying SCHED_OTHER" << std::endl;
+}
 
 // ─── V4L2 H264 Encoder (mirrors rpicam-apps H264Encoder) ─────────────────────
 //
@@ -335,11 +366,17 @@ class V4L2H264Encoder {
 		xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
 
 		ctrl.id = V4L2_CID_MPEG_VIDEO_H264_MIN_QP;
-		ctrl.value = 16;  // don't waste bits on near-perfect quality when static
+		ctrl.value = 20;  // static scenes need fewer bits; frees headroom for motion
 		xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
 
 		ctrl.id = V4L2_CID_MPEG_VIDEO_H264_MAX_QP;
-		ctrl.value = 36;  // cap how blocky it's allowed to get under motion
+		// Raised: for FPV, a briefly blockier frame beats a 200ms uplink
+		// spike. The rate controller can only shrink a burst frame by
+		// raising QP; a low cap forces it to blow the size budget instead.
+		// (bcm2835-codec exposes no macroblock/frame-level rate control or
+		// per-frame size cap to lean on instead -- confirmed absent from
+		// `v4l2-ctl -d /dev/video11 --list-ctrls-menus`.)
+		ctrl.value = 42;
 		xioctl(fd_, VIDIOC_S_CTRL, &ctrl);
 	}
 
@@ -406,6 +443,7 @@ class V4L2H264Encoder {
 	}
 
 	void poll_loop() {
+		set_rt_priority("enc-poll", 20);
 		while (running_) {
 			pollfd pfd{fd_, POLLPRI, 0};
 			int ret = poll(&pfd, 1, 200);
@@ -422,6 +460,7 @@ class V4L2H264Encoder {
 	}
 
 	void output_loop() {
+		set_rt_priority("enc-output", 40);
 		while (running_) {
 			pollfd pfd{fd_, POLLIN, 0};
 			int ret = poll(&pfd, 1, 200);
@@ -473,7 +512,10 @@ struct Frame {
 static std::queue<Frame> g_frame_queue;
 static std::mutex g_queue_mutex;
 static std::condition_variable g_queue_cv;
-static constexpr size_t MAX_QUEUE = 6;
+// 2 slots: at most one frame in flight to the encoder plus one waiting
+// (~16-33 ms standing delay at 60fps). Deeper queues only smooth over an
+// encoder that can't keep up, which for FPV should surface as drops instead.
+static constexpr size_t MAX_QUEUE = 2;
 
 // ─── Signal handler ──────────────────────────────────────────────────────────
 
@@ -607,7 +649,17 @@ static bool build_pipeline(const std::string &host, uint16_t port) {
 										G_TYPE_STRING, "byte-stream", "alignment",
 										G_TYPE_STRING, "au", nullptr);
 	g_object_set(G_OBJECT(g_appsrc), "caps", caps, "is-live", TRUE, "format",
-				 GST_FORMAT_TIME, "do-timestamp", TRUE, nullptr);
+				 GST_FORMAT_TIME,
+				 // Bound the internal queue to 2 AUs and drop the *oldest* on
+				 // overflow. GST_APP_LEAKY_TYPE_DOWNSTREAM (2) is the one
+				 // that leaks old buffers -- verified on-device against
+				 // `gst-inspect-1.0 appsrc`/`queue` wording ("Leaky on
+				 // downstream (old buffers)"); the "upstream" value (1) does
+				 // the opposite (drops the newly-pushed buffer, keeps stale
+				 // ones), which is wrong for FPV. Downstream of this is
+				 // udpsink with sync=FALSE, so a stalled socket is the only
+				 // way this queue backs up -- newest data should win.
+				 "max-buffers", 2u, "leaky-type", 2, nullptr);
 	gst_caps_unref(caps);
 
 	g_object_set(G_OBJECT(parse), "config-interval", -1, nullptr);
@@ -615,8 +667,13 @@ static bool build_pipeline(const std::string &host, uint16_t port) {
 	g_object_set(G_OBJECT(pay), "config-interval", -1, "pt", 96, "mtu", 1200u,
 				 nullptr);
 
+	// max-bitrate paces UDP transmission (bytes smoothed at the socket
+	// rather than dumped as one burst per AU). 12 Mbps sits 1.5x above the
+	// hard bitrate ceiling enforced in handle_command(), so it only bites on
+	// oversized burst frames, never on steady state.
 	g_object_set(G_OBJECT(sink), "host", host.c_str(), "port", (gint)port, "sync",
-				 FALSE, "async", FALSE, nullptr);
+				 FALSE, "async", FALSE, "max-bitrate", (guint64)12'000'000,
+				 nullptr);
 
 	gst_bin_add_many(GST_BIN(g_pipeline), g_appsrc, parse, pay, sink, nullptr);
 
@@ -636,6 +693,13 @@ static bool build_pipeline(const std::string &host, uint16_t port) {
 // ───────────────────────────────────────────────────────
 
 static void on_request_completed(Request *request) {
+	// libcamera owns this thread; promote it once, on the first callback.
+	static thread_local bool rt_done = false;
+	if (!rt_done) {
+		set_rt_priority("cam-callback", 45);
+		rt_done = true;
+	}
+
 	if (request->status() == Request::RequestCancelled) return;
 
 	// Real capture latency: from the sensor's own exposure timestamp
@@ -707,10 +771,13 @@ static void on_request_completed(Request *request) {
 
 		if (map_ok) {
 			std::lock_guard<std::mutex> lock(g_queue_mutex);
-			if (g_frame_queue.size() < MAX_QUEUE)
-				g_frame_queue.push(std::move(frame));
-			else
+			// Drop-oldest: evict stale frames so the encoder always sees the
+			// most recent capture. The counter still reflects lost frames.
+			while (g_frame_queue.size() >= MAX_QUEUE) {
+				g_frame_queue.pop();
 				g_queue_drops.fetch_add(1, std::memory_order_relaxed);
+			}
+			g_frame_queue.push(std::move(frame));
 		}
 		g_queue_cv.notify_one();
 	}
@@ -727,20 +794,21 @@ static void on_request_completed(Request *request) {
 static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
 						   uint32_t fps, uint32_t initial_bitrate, uint32_t gop) {
 	// Callback: push encoded H264 directly into GStreamer appsrc
-	auto on_encoded = [&](uint8_t *data, size_t size, int64_t /*ts_us*/,
+	auto on_encoded = [&](uint8_t *data, size_t size, int64_t ts_us,
 						  bool keyframe, uint64_t seq) {
 		// Proves whether the encoder actually produced an IDR, separately from
-		// whether the client ever received one.
+		// whether the client ever received one. Logged against g_encoded_count
+		// rather than `seq`: the latter is the V4L2 CAPTURE buffer's
+		// `sequence` field, which bcm2835-codec never populates (always 0).
+		uint64_t encoded_no = g_encoded_count.fetch_add(1, std::memory_order_relaxed);
 		if (keyframe)
-			std::cout << "[ENC] IDR emitted at frame " << seq << " (" << size
+			std::cout << "[ENC] IDR emitted at frame " << encoded_no << " (" << size
 					  << " bytes)" << std::endl;
-
-		g_encoded_count.fetch_add(1, std::memory_order_relaxed);
 
 		// Latency: encode done
 		{
 			std::lock_guard<std::mutex> lock(g_latency_mutex);
-			auto it = g_encode_entry.find(seq);
+			auto it = g_encode_entry.find(ts_us);
 			if (it != g_encode_entry.end()) {
 				g_encode_latency_ms =
 					std::chrono::duration<double, std::milli>(
@@ -761,6 +829,21 @@ static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
 		memcpy(map.data, data, size);
 		gst_buffer_unmap(buf, &map);
 
+		// Stamp PTS from the sensor exposure time (rebased to the first
+		// valid frame) instead of appsrc's do-timestamp, so encode/queue
+		// jitter doesn't leak into RTP timestamps. SensorTimestamp is
+		// occasionally unavailable during camera warm-up (ts_us == 0 then,
+		// confirmed on-device); skip those rather than rebasing against a
+		// bogus zero, which would show up as one large PTS jump on the next
+		// valid frame.
+		static int64_t first_ts_us = -1;
+		if (ts_us > 0) {
+			if (first_ts_us < 0) first_ts_us = ts_us;
+			GST_BUFFER_PTS(buf) = (GstClockTime)(ts_us - first_ts_us) * GST_USECOND;
+			GST_BUFFER_DTS(buf) = GST_BUFFER_PTS(buf);
+			GST_BUFFER_DURATION(buf) = gst_util_uint64_scale(GST_SECOND, 1, fps);
+		}
+
 		if (keyframe)
 			GST_BUFFER_FLAG_UNSET(buf, GST_BUFFER_FLAG_DELTA_UNIT);
 		else
@@ -775,6 +858,7 @@ static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
 		V4L2H264Encoder enc(width, height, fps, initial_bitrate, stride, gop,
 							on_encoded);
 		enc.start();
+		set_rt_priority("encoder", 40);
 
 		// The first receiver needs an IDR to start decoding, and with a long GOP
 		// the periodic one may be minutes away.
@@ -796,7 +880,7 @@ static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
 			// Stamp encode start
 			{
 				std::lock_guard<std::mutex> lock(g_latency_mutex);
-				g_encode_entry[frame.seq] = std::chrono::steady_clock::now();
+				g_encode_entry[frame.timestamp_us] = std::chrono::steady_clock::now();
 			}
 
 			if (!enc.encode(frame.data.data(), frame.data.size(),
@@ -806,7 +890,7 @@ static void encoder_thread(uint32_t width, uint32_t height, uint32_t stride,
 				// on_encoded -- erase its entry now or it sits in the map
 				// forever.
 				std::lock_guard<std::mutex> lock(g_latency_mutex);
-				g_encode_entry.erase(frame.seq);
+				g_encode_entry.erase(frame.timestamp_us);
 			}
 		}
 
@@ -1033,6 +1117,15 @@ int main(int argc, char *argv[]) {
 	g_running = false;
 	g_queue_cv.notify_all();
 
+	// fifo_reader_thread is blocked in a read-only, blocking open() of the
+	// control FIFO waiting for a writer; it can't observe g_running until
+	// that call returns. Rendezvous with it here so it does -- otherwise it
+	// stays joinable forever and fifo_thread's destructor below calls
+	// std::terminate() on process exit (this was the unconditional
+	// "terminate called without an active exception" on every shutdown).
+	int wake_fd = open(CTRL_FIFO, O_WRONLY);
+	if (wake_fd >= 0) close(wake_fd);
+
 	cam->stop();
 	cam->release();
 	cam_mgr.stop();
@@ -1040,6 +1133,7 @@ int main(int argc, char *argv[]) {
 
 	enc_thread.join();
 	stdin_thread.detach();
+	fifo_thread.join();
 	glib_thread.join();
 
 	gst_element_set_state(g_pipeline, GST_STATE_NULL);
