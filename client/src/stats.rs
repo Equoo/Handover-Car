@@ -25,7 +25,61 @@ pub struct PacketLoss {
     pub num_pushed: u64,
     pub num_duplicates: u64,
     pub avg_jitter: u64,
+    /// Cumulative loss ratio since the pipeline started (jitterbuffer stats,
+    /// never reset). Informational only -- after a long session this barely
+    /// moves for a brief bad patch, since the denominator keeps growing. Do
+    /// not drive control decisions (bitrate/FEC) off this; use
+    /// `Stats::windowed_loss_pct()` instead.
     pub loss_pct: f64,
+}
+
+/// A counter for a boolean-ish event (lost vs received) that reports a
+/// windowed ratio instead of a cumulative one: it decays every `window`
+/// elapsed rather than averaging over the whole session, so a control loop
+/// reading it reacts to *current* conditions regardless of how long the
+/// stream has already been running.
+struct WindowedRatio {
+    hits: AtomicU64,
+    total: AtomicU64,
+    window_start: Mutex<Instant>,
+    ratio_pct: Mutex<f64>,
+}
+
+impl WindowedRatio {
+    fn new() -> Self {
+        Self {
+            hits: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+            window_start: Mutex::new(Instant::now()),
+            ratio_pct: Mutex::new(0.0),
+        }
+    }
+
+    fn note(&self, hits: u64, total: u64) {
+        self.hits.fetch_add(hits, Ordering::Relaxed);
+        self.total.fetch_add(total, Ordering::Relaxed);
+    }
+
+    /// Recomputes the ratio once `window` has elapsed since the last one;
+    /// cheap to call more often than that. A window with no samples at all
+    /// leaves the previous value in place (nothing to conclude either way)
+    /// rather than snapping to 0.
+    fn tick(&self, window: Duration) {
+        let mut start = self.window_start.lock();
+        if start.elapsed() < window {
+            return;
+        }
+        let hits = self.hits.swap(0, Ordering::Relaxed);
+        let total = self.total.swap(0, Ordering::Relaxed);
+        if total > 0 {
+            *self.ratio_pct.lock() = hits as f64 / total as f64 * 100.0;
+        }
+        *start = Instant::now();
+    }
+
+    fn ratio_pct(&self) -> f64 {
+        *self.ratio_pct.lock()
+    }
 }
 
 /// A counter paired with a window start, used to turn "N events happened"
@@ -87,8 +141,20 @@ pub struct Stats {
     /// sample has actually been observed (test not running, or camera not
     /// pointed at the screen yet).
     pub measured_glass_to_glass_ms: Mutex<Option<f64>>,
+    /// Bitrate the adaptive loop would target from link conditions alone,
+    /// before subtracting FEC overhead -- see `AppState::run_adaptive`. Shown
+    /// separately from `target_bitrate` (which is the post-FEC-overhead value
+    /// actually sent to the encoder) so the overlay can tell "the link can
+    /// carry this much" apart from "this much of it is video".
+    pub link_estimate_bitrate: Mutex<u32>,
+    /// FEC overhead percentage the adaptive loop is currently commanding.
+    pub target_fec_pct: Mutex<u8>,
     frames: RateCounter,
     bytes: RateCounter,
+    /// RTP sequence-number gaps observed on the wire, tracked in
+    /// `video.rs`'s recv loop independent of `rtpjitterbuffer`'s own stats
+    /// (see `note_seq`) -- this is what feeds `windowed_loss_pct`.
+    loss_window: WindowedRatio,
 }
 
 impl Stats {
@@ -106,9 +172,35 @@ impl Stats {
             decoder_name: Mutex::new("--"),
             connected_at: Mutex::new(None),
             measured_glass_to_glass_ms: Mutex::new(None),
+            link_estimate_bitrate: Mutex::new(500_000),
+            target_fec_pct: Mutex::new(0),
             frames: RateCounter::new(),
             bytes: RateCounter::new(),
+            loss_window: WindowedRatio::new(),
         }
+    }
+
+    /// Records one packet's worth of raw-wire sequence-number tracking:
+    /// `lost` gaps out of `total` sequence numbers seen (both `0` for a
+    /// duplicate/reordered packet, which is neither a fresh arrival nor a
+    /// loss). Feeds `windowed_loss_pct`, not `PacketLoss` -- see `note()` in
+    /// `video.rs`'s `run()`.
+    pub fn note_seq(&self, lost: u64, total: u64) {
+        self.loss_window.note(lost, total);
+    }
+
+    /// Recomputes `windowed_loss_pct` once `window` has elapsed since the
+    /// last recompute; cheap to call more often than that.
+    pub fn tick_loss_window(&self, window: Duration) {
+        self.loss_window.tick(window);
+    }
+
+    /// Real-time loss ratio over a short, decaying window -- unlike
+    /// `PacketLoss::loss_pct`, this reflects current link conditions
+    /// regardless of how long the session has been running. This is what the
+    /// adaptive bitrate/FEC loop should read.
+    pub fn windowed_loss_pct(&self) -> f64 {
+        self.loss_window.ratio_pct()
     }
 
     pub fn note_decode_latency(&self, ms: f64) {

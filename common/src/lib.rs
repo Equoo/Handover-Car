@@ -83,6 +83,10 @@ pub enum ClientMessage {
         uuid: String,
         packet_id: u16,
         bitrate: u32,
+        /// FEC overhead percentage the client's adaptive loop is currently
+        /// commanding (0-50). Relayed to the slave the same way `bitrate` is:
+        /// stored server-side and echoed back in `ServerToSlave::Pong`.
+        fec_pct: u8,
     },
     Pilot {
         slave_id: String,
@@ -104,6 +108,7 @@ pub enum ServerToSlave {
     Pong {
         packet_id: u16,
         bitrate: u32,
+        fec_pct: u8,
     },
     Pilot(PilotCommand),
 }

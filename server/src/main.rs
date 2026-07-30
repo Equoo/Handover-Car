@@ -25,6 +25,7 @@ struct Slave {
     last_seen: Instant,
     latency: u16,
     bitrate: u32,
+    fec_pct: u8,
     video_thread: AbortHandle,
     // audio_thread: AbortHandle,
     subscriber: Uuid,
@@ -136,6 +137,7 @@ impl AppState {
                 latency,
                 video_thread,
                 bitrate: 1000000,
+                fec_pct: 0,
                 subscriber: Uuid::nil(),
             },
         );
@@ -156,10 +158,12 @@ impl AppState {
             } => {
                 let id = id.as_str().to_string();
                 let mut bitrate: u32 = 1000000;
+                let mut fec_pct: u8 = 0;
 
                 if let Some(slave) = self.slaves.lock().await.get_mut(&id) {
                     slave.latency = latency.into();
                     bitrate = slave.bitrate;
+                    fec_pct = slave.fec_pct;
                     // Cellular NAT rebinds, so the address a slave announces
                     // from changes. Anything we push to it must use the
                     // latest one, not the one it first connected with.
@@ -198,6 +202,7 @@ impl AppState {
                     &Message::ToSlave(ServerToSlave::Pong {
                         packet_id: packet_id.into(),
                         bitrate,
+                        fec_pct,
                     }),
                     PacketType::Unreliable,
                 )?;
@@ -304,6 +309,7 @@ impl AppState {
                 uuid,
                 packet_id,
                 bitrate,
+                fec_pct,
             } => {
                 let clients = self.clients.lock().await;
                 let Some(client) = clients.get(&Uuid::from_str(uuid)?) else {
@@ -317,6 +323,7 @@ impl AppState {
                 let mut latency: u16 = 0;
                 if let Some(slave) = self.slaves.lock().await.get_mut(&client.subscribe) {
                     slave.bitrate = bitrate.into();
+                    slave.fec_pct = (*fec_pct).into();
                     latency = slave.latency;
                 }
                 self.socket.send(

@@ -143,6 +143,7 @@ impl AppState {
                     uuid: self.uuid.lock().to_string(),
                     packet_id,
                     bitrate: *self.stats.target_bitrate.lock(),
+                    fec_pct: *self.stats.target_fec_pct.lock(),
                 })
             },
             || {
@@ -171,40 +172,106 @@ impl AppState {
         )
     }
 
-    async fn run_abr(self: Arc<AppState>) {
-        let mut interval = tokio::time::interval(Duration::from_secs(3));
-        let mut bitrate: u32 = 500_000;
+    /// Adapts both video bitrate (AIMD) and FEC overhead to current link
+    /// conditions, replacing what used to be a bitrate-only `run_abr`.
+    ///
+    /// Both decisions read `Stats::windowed_loss_pct` -- a ratio over a short,
+    /// decaying ~2s window (see `stats.rs`/`video.rs`'s RTP sequence-number
+    /// tracking) -- rather than `Stats::loss` (cumulative jitterbuffer stats
+    /// since the pipeline started). The old code used the cumulative ratio:
+    /// after running an hour, a brief bad patch barely moved it since the
+    /// denominator was already huge, so the bitrate cut lagged the real
+    /// condition of the link by however long the session had been running.
+    /// The windowed ratio reacts to *current* loss regardless of session age.
+    async fn run_adaptive(self: Arc<AppState>) {
+        // Matches the loss-tracking window in `stats.rs`'s `tick_loss_window`
+        // call, so every tick here sees a freshly recomputed ratio.
+        const TICK: Duration = Duration::from_secs(2);
+        // Additive increase expressed per second of real time, not per tick:
+        // a delayed tick (executor stall, GC-style pause) shouldn't silently
+        // slow the ramp, and a fast one shouldn't overshoot it. At the
+        // nominal 2s tick this is the same +25kbps/tick as before.
+        const ADDITIVE_INCREASE_BPS_PER_SEC: f64 = 12_500.0;
+        // Hysteresis for stepping FEC back down: step up immediately on the
+        // first window crossing a threshold, but only step down after this
+        // many consecutive windows below it. Loss on cellular links is
+        // bursty -- flapping the FEC rate is worse than briefly
+        // over-protecting.
+        const CLEAN_STREAK_TO_STEP_DOWN: u32 = 5;
+
+        let mut interval = tokio::time::interval(TICK);
+        let mut link_estimate: u32 = 500_000;
+        let mut fec_pct: u8 = 0;
+        let mut clean_streak: u32 = 0;
+        let mut last_tick = Instant::now();
 
         loop {
             interval.tick().await;
+            let elapsed = last_tick.elapsed();
+            last_tick = Instant::now();
 
-            let losses = *self.stats.loss.lock();
+            let loss_pct = self.stats.windowed_loss_pct();
             let decode_latency = *self.stats.decode_latency.lock();
-            let loss = losses.num_lost as f32 / (losses.num_pushed as f32).max(1f32);
 
-            // AIMD
-            // NOTE: Don't like it because if running for 1 hours and now we having a bad connection we
-            // gonna take a long time against the bitrate go down
-            bitrate = if loss > 0.01 {
-                (bitrate as f64 * 0.6) as u32 // cut 40% on bad loss
-            } else if loss > 0.005 {
-                (bitrate as f64 * 0.75) as u32 // cut 25% on mild loss
+            // AIMD on the link's estimated uplink capacity. FEC overhead is
+            // budgeted out of this separately below -- it never feeds back
+            // into `link_estimate` itself, so enabling FEC doesn't make the
+            // AIMD think the link got worse.
+            link_estimate = if loss_pct > 5.0 {
+                (link_estimate as f64 * 0.6) as u32 // cut 40% on bad loss
+            } else if loss_pct > 2.0 {
+                (link_estimate as f64 * 0.75) as u32 // cut 25% on mild loss
             } else if decode_latency > 10.0 {
-                bitrate // hold if decoder struggling
+                link_estimate // hold if decoder struggling
             } else {
-                bitrate + 25_000 // additive increase
+                link_estimate + (ADDITIVE_INCREASE_BPS_PER_SEC * elapsed.as_secs_f64()) as u32
+            };
+            link_estimate = link_estimate.clamp(100_000, 3_000_000);
+
+            let target_fec: u8 = if loss_pct > 5.0 {
+                30
+            } else if loss_pct > 2.0 {
+                20
+            } else if loss_pct > 0.2 {
+                10
+            } else {
+                0
             };
 
-            bitrate = bitrate.clamp(100_000, 3_000_000);
+            if target_fec > fec_pct {
+                fec_pct = target_fec;
+                clean_streak = 0;
+            } else if target_fec < fec_pct {
+                clean_streak += 1;
+                if clean_streak >= CLEAN_STREAK_TO_STEP_DOWN {
+                    fec_pct = target_fec;
+                    clean_streak = 0;
+                }
+            } else {
+                clean_streak = 0;
+            }
+
+            // FEC overhead must come out of the video bitrate, not on top of
+            // it -- otherwise enabling FEC under loss increases uplink
+            // pressure exactly when the link is struggling. `link_estimate`
+            // is the AIMD's estimate of what the link can carry in total;
+            // this is the slice of it actually left for video once FEC's
+            // share is set aside.
+            let video_bitrate_cmd =
+                (link_estimate as f64 / (1.0 + fec_pct as f64 / 100.0)) as u32;
 
             tracing::info!(
-                "ABR: loss={:.1}% latency={:.1}ms → {}kbps",
-                loss * 100.0,
+                "Adaptive: loss={:.2}% latency={:.1}ms → link={}kbps video={}kbps fec={}%",
+                loss_pct,
                 decode_latency,
-                bitrate / 1000
+                link_estimate / 1000,
+                video_bitrate_cmd / 1000,
+                fec_pct
             );
 
-            *self.stats.target_bitrate.lock() = bitrate;
+            *self.stats.link_estimate_bitrate.lock() = link_estimate;
+            *self.stats.target_bitrate.lock() = video_bitrate_cmd;
+            *self.stats.target_fec_pct.lock() = fec_pct;
         }
     }
 
@@ -253,7 +320,7 @@ impl AppState {
                     let state_clone = self.clone();
                     tokio::spawn(async move { state_clone.announce_loop() });
                     let state_clone = self.clone();
-                    tokio::spawn(async move { state_clone.run_abr().await });
+                    tokio::spawn(async move { state_clone.run_adaptive().await });
                 }
             }
             ArchivedServerToClient::Pong { latency, packet_id } => {
