@@ -98,7 +98,6 @@ impl AppState {
     fn setup_media(self: Arc<AppState>, mode: VideoMode) -> Result<()> {
         let state = self.clone();
         self.queue.submit(async move {
-            info!("Is ");
             let stats_state = state.clone();
             if let Ok(media) = state
                 .retry("media setup", u32::MAX, Duration::from_secs(3), || {
