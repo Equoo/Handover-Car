@@ -1,19 +1,19 @@
 use anyhow::{Context, Result};
 use common::link::PingTracker;
 use common::{
-    ArchivedMessage, ArchivedServerToClient, ArchivedVideoMode, ClientMessage, Message,
-    PacketType, PilotCommand, Socket, SocketEvent, VideoMode,
+    ArchivedMessage, ArchivedServerToClient, ArchivedVideoMode, ClientMessage, Message, PacketType,
+    PilotCommand, Socket, SocketEvent, VideoMode,
 };
 use dotenv::dotenv;
 use egui::ColorImage;
 use gstreamer_app as gst_app;
 use parking_lot::Mutex;
+use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::sync::OnceLock;
 use std::time::Duration;
-use std::env;
 use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
@@ -93,7 +93,10 @@ impl AppState {
     /// continuously and recreate exactly the bitrate spikes the long GOP was
     /// introduced to remove.
     pub fn request_keyframe(&self) {
-        const MIN_INTERVAL: Duration = Duration::from_millis(5000);
+        // Reduced from 5s: under sustained loss the decoder stays broken until
+        // an IDR arrives, and 5s of glitched video is unacceptable for FPV.
+        // 1s still limits burst frequency while allowing faster recovery.
+        const MIN_INTERVAL: Duration = Duration::from_millis(1000);
 
         {
             let mut last = self.last_keyframe_request.lock();
@@ -218,9 +221,9 @@ impl AppState {
             // into `link_estimate` itself, so enabling FEC doesn't make the
             // AIMD think the link got worse.
             link_estimate = if loss_pct > 2.5 {
-                (link_estimate as f64 * 0.6) as u32 // cut 40% on bad loss
+                (link_estimate as f64 * 0.75) as u32 // cut 25% on bad loss
             } else if loss_pct > 1.5 {
-                (link_estimate as f64 * 0.75) as u32 // cut 25% on mild loss
+                (link_estimate as f64 * 0.90) as u32 // cut 10% on mild loss
             } else if decode_latency > 10.0 {
                 link_estimate // hold if decoder struggling
             } else {
@@ -257,8 +260,7 @@ impl AppState {
             // is the AIMD's estimate of what the link can carry in total;
             // this is the slice of it actually left for video once FEC's
             // share is set aside.
-            let video_bitrate_cmd =
-                (link_estimate as f64 / (1.0 + fec_pct as f64 / 100.0)) as u32;
+            let video_bitrate_cmd = (link_estimate as f64 / (1.0 + fec_pct as f64 / 100.0)) as u32;
 
             tracing::info!(
                 "Adaptive: loss={:.2}% latency={:.1}ms → link={}kbps video={}kbps fec={}%",
