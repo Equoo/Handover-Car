@@ -54,7 +54,10 @@ impl App {
                     error!("GST ERROR: {} {:?}", err.error(), err.debug());
                 }
                 MessageView::Warning(w) => {
-                    warn!("GST WARN: {}", w.error());
+                    warn!("GST WARN: {} (src: {:?}, dbg: {:?})",
+                          w.error(),
+                          msg.src().map(|s| s.name()),
+                          w.debug());
                 }
                 MessageView::StateChanged(s) => {
                     info!("State: {:?} -> {:?}", s.old(), s.current());

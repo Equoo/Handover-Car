@@ -48,7 +48,10 @@ fn choose_h264_decoder() -> &'static str {
 /// Copies a `video/x-raw,format=RGBA` buffer into a tightly-packed pixel
 /// vector egui can use directly, accounting for row stride (GStreamer often
 /// pads rows wider than `width * 4` for alignment).
-fn copy_rgba_tight(buffer: &gst::BufferRef, caps: &gst::CapsRef) -> Option<(usize, usize, Vec<u8>)> {
+fn copy_rgba_tight(
+    buffer: &gst::BufferRef,
+    caps: &gst::CapsRef,
+) -> Option<(usize, usize, Vec<u8>)> {
     let info = gst_video::VideoInfo::from_caps(caps).ok()?;
     let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info).ok()?;
 
@@ -183,14 +186,17 @@ impl VideoReceiver for RawRtpUdp {
 
         // Keeps a rolling window of raw RTP packets (media + FEC) so
         // `rtpulpfecdec` below can reach back and recover a lost one. Must sit
-        // upstream of the jitterbuffer (element doc requirement). 220ms is
-        // comfortably more than 3x the jitterbuffer's own 60ms latency, so the
+        // upstream of the jitterbuffer (element doc requirement). 350ms is
+        // comfortably more than 3x the jitterbuffer's own 100ms latency, so the
         // packets needed for a recovery are still in the window by the time
         // the jitterbuffer's lost-event fires at its playout deadline.
         let storage = gst::ElementFactory::make("rtpstorage").build()?;
-        storage.set_property("size-time", 220_000_000u64);
+        storage.set_property("size-time", 250_000_000u64);
 
         let jitter = gst::ElementFactory::make("rtpjitterbuffer").build()?;
+        // 100ms latency buffer: tolerates network jitter during high-motion
+        // scenes where frames are large and packets may arrive out of order.
+        // Lower values cause late-packet drops that break decoding.
         jitter.set_property("latency", 60u32);
         jitter.set_property("drop-on-latency", true);
         jitter.set_property("do-lost", true);
@@ -322,10 +328,9 @@ impl VideoReceiver for RawRtpUdp {
         // negotiate. Bails out before touching the buffer at all when the
         // test isn't running, so this costs nothing during normal driving.
         let state_clone4 = state.clone();
-        caps_filter
-            .static_pad("src")
-            .unwrap()
-            .add_probe(gst::PadProbeType::BUFFER, move |pad, probe_info| {
+        caps_filter.static_pad("src").unwrap().add_probe(
+            gst::PadProbeType::BUFFER,
+            move |pad, probe_info| {
                 if !state_clone4.latency_test.is_enabled() {
                     return gst::PadProbeReturn::Ok;
                 }
@@ -340,7 +345,8 @@ impl VideoReceiver for RawRtpUdp {
                 }
 
                 gst::PadProbeReturn::Ok
-            });
+            },
+        );
 
         let jitter_clone = jitter.clone();
         let state_clone = state.clone();
