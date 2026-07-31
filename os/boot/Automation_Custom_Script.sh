@@ -37,6 +37,6 @@ nmcli connection modify home \
 
 nmcli connection modify home connection.autoconnect yes
 
-usermod -aG video,render dietpi
+usermod -aG video,render,audio,pulse-access dietpi
 
 reboot
