@@ -127,6 +127,11 @@ pub trait VideoReceiver {
 /// `rtpulpfecenc` is configured with.
 const FEC_PT: u32 = 122;
 
+/// Fixed SSRC configured on the streamer's rtph264pay. Using a fixed value
+/// lets us set the correct SSRC in caps before receiving any packets, which
+/// is required for rtpulpfecdec to work correctly.
+const VIDEO_SSRC: u32 = 0x12345678;
+
 /// Raw RTP packets read straight off a UDP socket into an `appsrc`, decoded
 /// by a `rtpstorage` -> `rtpjitterbuffer` -> `rtpulpfecdec` -> depay -> parse
 /// -> decode -> convert chain, and handed to an `appsink` that copies each
@@ -143,10 +148,15 @@ impl VideoReceiver for RawRtpUdp {
         // is read from there by rtpjitterbuffer/rtpulpfecdec regardless of
         // what caps say; pinning `payload` here would just be a stale/wrong
         // hint for the FEC packets.
+        //
+        // Fixed SSRC matching the streamer's rtph264pay configuration. This
+        // lets rtpulpfecdec correctly match FEC packets with media packets.
+        // Without the correct SSRC, FEC recovery silently fails.
         let caps = gst::Caps::builder("application/x-rtp")
             .field("media", "video")
             .field("encoding-name", "H264")
             .field("clock-rate", 90000i32)
+            .field("ssrc", VIDEO_SSRC)
             .build();
 
         let pipeline = gst::Pipeline::default();
