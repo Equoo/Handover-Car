@@ -27,7 +27,7 @@ struct Slave {
     bitrate: u32,
     fec_pct: u8,
     video_thread: AbortHandle,
-    // audio_thread: AbortHandle,
+    audio_thread: AbortHandle,
     subscriber: Uuid,
 }
 
@@ -127,6 +127,11 @@ impl AppState {
             .new_pipesocket(VIDEO_PORT + uniqueid as u16, id.clone())
             .await?;
 
+        let audio_thread = self
+            .clone()
+            .new_pipesocket(AUDIO_PORT + uniqueid as u16, id.clone())
+            .await?;
+
         self.slaves.lock().await.insert(
             id.clone(),
             Slave {
@@ -136,6 +141,7 @@ impl AppState {
                 last_seen: Instant::now(),
                 latency,
                 video_thread,
+                audio_thread,
                 bitrate: 1000000,
                 fec_pct: 0,
                 subscriber: Uuid::nil(),
@@ -390,6 +396,7 @@ impl AppState {
             if let Some(slave) = slaves.remove(&id) {
                 warn!("Slave '{id}' timed out, freeing slot {}", slave.uniqueid);
                 slave.video_thread.abort();
+                slave.audio_thread.abort();
                 self.usedids.lock()[slave.uniqueid as usize] = false;
                 *self.slaves_count.lock() -= 1;
             }

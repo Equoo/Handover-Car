@@ -18,6 +18,7 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::audio::{self, AudioState};
 use crate::latency_test::LatencyTest;
 use crate::stats::Stats;
 use crate::video::{RawRtpUdp, VideoReceiver};
@@ -53,6 +54,8 @@ pub struct AppState {
     /// -- those loops don't depend on which server session we're in, they'd
     /// just duplicate traffic if spawned twice.
     connected: Mutex<bool>,
+    /// Audio receiver state (best-effort, None if audio unavailable).
+    audio: Option<Arc<AudioState>>,
 }
 
 impl AppState {
@@ -69,6 +72,9 @@ impl AppState {
         }
         let socket = Socket::start(0).context("failed to create socket")?;
 
+        // Audio is best-effort: if it fails to initialize, video still works
+        let audio = AudioState::new().map(Arc::new);
+
         Ok(Self {
             socket,
             server,
@@ -82,6 +88,7 @@ impl AppState {
             egui_ctx: OnceLock::new(),
             last_keyframe_request: Mutex::new(None),
             connected: Mutex::new(false),
+            audio,
         })
     }
 
@@ -132,6 +139,19 @@ impl AppState {
                 error!(error = ?e, "video receive loop failed");
             }
         });
+    }
+
+    /// Start audio receiver (best-effort, independent from video).
+    fn start_audio(self: &Arc<AppState>, audio_port: u16) {
+        if let Some(audio) = &self.audio {
+            let audio = audio.clone();
+            let server_ip = self.server.ip();
+            tokio::spawn(async move {
+                if let Err(e) = audio::run_audio_receiver(audio, server_ip, audio_port).await {
+                    warn!(error = ?e, "audio receive loop failed (non-fatal)");
+                }
+            });
+        }
     }
 
     fn announce_loop(&self) -> Result<()> {
@@ -296,7 +316,7 @@ impl AppState {
             ArchivedServerToClient::Connected {
                 uuid,
                 video,
-                audio_port: _,
+                audio_port,
             } => {
                 info!("Connected to the server");
                 *self.uuid.lock() = Uuid::from_str(uuid)?;
@@ -309,6 +329,7 @@ impl AppState {
                     },
                 };
                 self.clone().start_video(mode);
+                self.start_audio(audio_port.into());
 
                 // The stream is already running and its opening IDR is long
                 // gone, so without this we would decode nothing until the GOP
