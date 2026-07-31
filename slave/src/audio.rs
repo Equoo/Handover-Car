@@ -27,7 +27,7 @@ impl AudioSource {
 
     fn spawn_pipeline(server_ip: IpAddr, audio_port: u16) -> Result<Child> {
         // Pipeline: capture from PulseAudio -> convert -> resample -> Opus encode -> RTP -> UDP
-        // - pulsesrc: captures from default PulseAudio source (microphone)
+        // - pulsesrc: captures from PulseAudio source (microphone)
         // - audioconvert/audioresample: ensure correct format for encoder
         // - opusenc: low-latency voice codec
         //   - bitrate=48000: 48kbps is good for voice
@@ -35,8 +35,15 @@ impl AudioSource {
         //   - audio-type=voice: optimize for speech
         // - rtpopuspay: RTP packetization, pt=97 (dynamic payload type)
         // - udpsink: send to server, sync=false for live streaming
+        //
+        // Device can be overridden via AUDIO_DEVICE env var. Find available devices with:
+        //   pactl list sources short
+        let device = std::env::var("AUDIO_DEVICE").unwrap_or_else(|_| {
+            "alsa_input.usb-C-Media_Electronics_Inc._USB_PnP_Sound_Device-00.analog-mono".to_string()
+        });
+
         let pipeline = format!(
-            "pulsesrc ! audioconvert ! audioresample \
+            "pulsesrc device={device} ! audioconvert ! audioresample \
              ! opusenc bitrate=48000 frame-size=10 audio-type=voice \
              ! rtpopuspay pt=97 \
              ! udpsink host={server_ip} port={audio_port} sync=false"
