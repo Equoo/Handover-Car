@@ -9,6 +9,7 @@ use tracing::level_filters::LevelFilter;
 use crate::app::AppState;
 
 mod app;
+mod audio;
 mod charts;
 mod latency_test;
 mod metrics;

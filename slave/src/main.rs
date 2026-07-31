@@ -29,7 +29,9 @@ use common::{
     SlaveMessage, Socket, SocketEvent, VideoMode,
 };
 
+mod audio;
 mod media;
+use crate::audio::AudioSource;
 use crate::media::{RawRtpUdp, StreamerStats, VideoSource};
 
 const SERVER: &str = "server:9500";
@@ -46,6 +48,7 @@ struct AppState {
     // made while holding this, which a sync `parking_lot::Mutex` guard
     // can't safely straddle.
     media: AsyncMutex<Option<RawRtpUdp>>,
+    audio: Mutex<Option<AudioSource>>,
     connected: Mutex<bool>,
     latency: Mutex<Duration>,
     ping: PingTracker,
@@ -74,6 +77,7 @@ impl AppState {
             queue,
             serial: AsyncMutex::new(None),
             media: AsyncMutex::new(None),
+            audio: Mutex::new(None),
             connected: Mutex::new(false),
             latency: Mutex::new(Duration::from_secs(0)),
             ping: PingTracker::new(),
@@ -125,6 +129,13 @@ impl AppState {
         Ok(())
     }
 
+    /// Start audio streaming (best-effort, no retry).
+    /// Audio is independent from video: failures are logged but don't affect video.
+    fn setup_audio(&self, audio_port: u16) {
+        let audio = AudioSource::start(self.server.ip(), audio_port);
+        *self.audio.lock() = audio;
+    }
+
     async fn handle_messages(self: Arc<AppState>, msg: &ArchivedMessage) -> Result<()> {
         let ArchivedMessage::ToSlave(msg) = msg else {
             // A slave only ever legitimately receives messages addressed to it.
@@ -142,10 +153,7 @@ impl AppState {
                 }
             }
 
-            ArchivedServerToSlave::Connected {
-                video,
-                audio_port: _,
-            } => {
+            ArchivedServerToSlave::Connected { video, audio_port } => {
                 if !*self.connected.lock() {
                     info!("We are connected !");
                     *self.connected.lock() = true;
@@ -154,6 +162,8 @@ impl AppState {
                             video_port: video_port.into(),
                         },
                     };
+                    // setup_audio before setup_media: latter takes ownership of self
+                    self.setup_audio(audio_port.into());
                     self.setup_media(mode)?;
                 }
             }
