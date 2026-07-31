@@ -1079,10 +1079,11 @@ int main(int argc, char *argv[]) {
 
   setvbuf(stdout, NULL, _IOLBF, 0);
 
-  // Long GOP by default: keyframes are requested on demand, and this is only
-  // the fallback if a request never arrives.
+  // Shorter fallback GOP: keyframes are requested on demand, but if the
+  // request or the keyframe itself is lost, this caps how long artifacts
+  // persist. 2 seconds balances recovery time vs. bandwidth cost.
   if (!gop_given)
-    gop = fps * 10;
+    gop = fps * 2;
 
   g_bitrate.store(bitrate);
 
