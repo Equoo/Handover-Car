@@ -104,7 +104,14 @@ impl RawRtpUdp {
         on_stats: impl Fn(StreamerStats) + Send + 'static,
     ) -> Result<Child> {
         let mut video = Command::new("./rpicam_stream/build/streamer")
-            .args(["--host", &host.to_string(), "--port", &format!("{port}")])
+            .args([
+                "--host",
+                &host.to_string(),
+                "--port",
+                &format!("{port}"),
+                "--gop",
+                "60",
+            ])
             .stdout(Stdio::piped())
             .spawn()?;
 
