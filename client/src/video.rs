@@ -221,6 +221,28 @@ impl VideoReceiver for RawRtpUdp {
         let internal_storage = storage.property::<gstreamer::glib::Object>("internal-storage");
         fecdec.set_property("storage", &internal_storage);
 
+        // rtpulpfecdec passes ALL packets through (including FEC packets) -
+        // it only uses FEC packets for recovery but doesn't filter them out.
+        // Drop FEC packets here before they reach rtph264depay which can't
+        // handle them (causes "Undefined packet type" warnings).
+        fecdec.static_pad("src").unwrap().add_probe(
+            gst::PadProbeType::BUFFER,
+            move |_, probe_info| {
+                if let Some(buffer) = probe_info.buffer() {
+                    // RTP payload type is in byte 1, lower 7 bits
+                    if let Ok(map) = buffer.map_readable() {
+                        if map.len() >= 2 {
+                            let pt = map[1] & 0x7F;
+                            if pt == FEC_PT as u8 {
+                                return gst::PadProbeReturn::Drop;
+                            }
+                        }
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            },
+        );
+
         let depay = gst::ElementFactory::make("rtph264depay").build()?;
 
         let parse = gst::ElementFactory::make("h264parse").build()?;
