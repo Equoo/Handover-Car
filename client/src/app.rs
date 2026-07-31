@@ -203,7 +203,7 @@ impl AppState {
         const CLEAN_STREAK_TO_STEP_DOWN: u32 = 5;
 
         let mut interval = tokio::time::interval(TICK);
-        let mut link_estimate: u32 = 500_000;
+        let mut link_estimate: u32 = 1_000_000;
         let mut fec_pct: u8 = 0;
         let mut clean_streak: u32 = 0;
         let mut last_tick = Instant::now();
@@ -220,10 +220,10 @@ impl AppState {
             // budgeted out of this separately below -- it never feeds back
             // into `link_estimate` itself, so enabling FEC doesn't make the
             // AIMD think the link got worse.
-            link_estimate = if loss_pct > 2.5 {
-                (link_estimate as f64 * 0.75) as u32 // cut 25% on bad loss
-            } else if loss_pct > 1.5 {
-                (link_estimate as f64 * 0.90) as u32 // cut 10% on mild loss
+            link_estimate = if loss_pct > 5.0 {
+                (link_estimate as f64 * 0.85) as u32 // cut 15% on bad loss
+            } else if loss_pct > 2.5 {
+                (link_estimate as f64 * 0.95) as u32 // cut 5% on mild loss
             } else if decode_latency > 10.0 {
                 link_estimate // hold if decoder struggling
             } else {

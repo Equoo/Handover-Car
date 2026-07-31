@@ -14,8 +14,12 @@ use std::time::Duration;
 use eframe::egui;
 
 use crate::app::AppState;
+use crate::charts::ChartsPanel;
 use crate::latency_test::FLASH_INTERVAL_MS;
 use crate::metrics::{HELP_KEY, HIDE_ALL_KEY, LATENCY_TEST_KEY, METRICS, SHOW_ALL_KEY, Visibility};
+
+/// Key to toggle the statistics charts panel.
+pub const CHARTS_KEY: char = 'o';
 
 fn panel_frame() -> egui::Frame {
     egui::Frame::none()
@@ -35,6 +39,7 @@ fn panel_label(text: impl Into<String>, strong: bool) -> egui::RichText {
 pub struct Overlay {
     visibility: Visibility,
     last_flash_tick: f64,
+    charts: ChartsPanel,
 }
 
 impl Overlay {
@@ -42,18 +47,21 @@ impl Overlay {
         Self {
             visibility: Visibility::new(),
             last_flash_tick: 0.0,
+            charts: ChartsPanel::new(),
         }
     }
 
     /// Call once per frame from `ui.rs`'s `update()`.
     pub fn draw(&mut self, ctx: &egui::Context, state: &Arc<AppState>) {
         self.handle_keyboard(ctx, state);
+        self.charts.tick(&state.stats);
+        self.charts.draw(ctx, &state.stats);
         self.draw_stats_panel(ctx, state);
         self.draw_help_panel(ctx);
         self.draw_flash_layer(ctx, state);
     }
 
-    fn handle_keyboard(&self, ctx: &egui::Context, state: &Arc<AppState>) {
+    fn handle_keyboard(&mut self, ctx: &egui::Context, state: &Arc<AppState>) {
         let chars: Vec<char> = ctx.input(|i| {
             i.events
                 .iter()
@@ -66,9 +74,12 @@ impl Overlay {
         });
 
         for c in chars {
-            if c.to_ascii_lowercase() == LATENCY_TEST_KEY {
+            let key = c.to_ascii_lowercase();
+            if key == LATENCY_TEST_KEY {
                 let enabled = state.latency_test.toggle();
                 ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(enabled));
+            } else if key == CHARTS_KEY {
+                self.charts.toggle();
             } else {
                 self.visibility.handle_key(c);
             }
@@ -109,6 +120,10 @@ impl Overlay {
                         format!(
                             "[{LATENCY_TEST_KEY}] toggle glass-to-glass latency test (flashes screen)"
                         ),
+                        false,
+                    ));
+                    ui.label(panel_label(
+                        format!("[{CHARTS_KEY}] toggle statistics charts panel"),
                         false,
                     ));
                     for metric in METRICS {
