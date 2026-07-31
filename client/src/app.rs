@@ -204,7 +204,10 @@ impl AppState {
 
         let mut interval = tokio::time::interval(TICK);
         let mut link_estimate: u32 = 1_000_000;
-        let mut fec_pct: u8 = 0;
+        // Non-zero baseline: the first loss burst must already have FEC
+        // protection, not trigger a ramp-up that arrives too late. 5% overhead
+        // is ~50kbps at 1Mbps video -- negligible cost for artifact prevention.
+        let mut fec_pct: u8 = 5;
         let mut clean_streak: u32 = 0;
         let mut last_tick = Instant::now();
 
@@ -231,6 +234,8 @@ impl AppState {
             };
             link_estimate = link_estimate.clamp(100_000, 3_000_000);
 
+            // Floor at 5%: dropping to 0% leaves the stream unprotected until
+            // the next loss event triggers a ramp-up, causing visible artifacts.
             let target_fec: u8 = if loss_pct > 5.0 {
                 30
             } else if loss_pct > 2.0 {
@@ -238,7 +243,7 @@ impl AppState {
             } else if loss_pct > 0.2 {
                 10
             } else {
-                0
+                5 // never below 5%
             };
 
             if target_fec > fec_pct {
