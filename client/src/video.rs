@@ -45,13 +45,18 @@ fn choose_h264_decoder() -> &'static str {
     }
 }
 
-/// Copies a `video/x-raw,format=RGBA` buffer into a tightly-packed pixel
-/// vector egui can use directly, accounting for row stride (GStreamer often
-/// pads rows wider than `width * 4` for alignment).
-fn copy_rgba_tight(
-    buffer: &gst::BufferRef,
-    caps: &gst::CapsRef,
-) -> Option<(usize, usize, Vec<u8>)> {
+/// Converts a `video/x-raw,format=RGBA` buffer straight into the `ColorImage`
+/// egui paints, accounting for row stride (GStreamer often pads rows wider
+/// than `width * 4` for alignment).
+///
+/// Builds the `Color32` vector in one pass rather than copying into an
+/// intermediate tightly-packed `Vec<u8>` and converting that: this runs on the
+/// pipeline's streaming thread once per frame, and at 60fps a second full-frame
+/// pass plus its 1.4MB allocation was enough to push that thread past the frame
+/// period (see the `queue` in `build_pipeline` for why that matters). Decoder
+/// output is opaque, so `from_rgb` is equivalent to `from_rgba_unmultiplied`
+/// with alpha 255 and skips the per-pixel premultiply.
+fn frame_to_color_image(buffer: &gst::BufferRef, caps: &gst::CapsRef) -> Option<ColorImage> {
     let info = gst_video::VideoInfo::from_caps(caps).ok()?;
     let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info).ok()?;
 
@@ -60,14 +65,20 @@ fn copy_rgba_tight(
     let stride = frame.plane_stride()[0] as usize;
     let data = frame.plane_data(0).ok()?;
 
-    let mut pixels = Vec::with_capacity(width * height * 4);
+    let mut pixels = Vec::with_capacity(width * height);
     for y in 0..height {
         let start = y * stride;
         let row = data.get(start..start + width * 4)?;
-        pixels.extend_from_slice(row);
+        pixels.extend(
+            row.chunks_exact(4)
+                .map(|p| egui::Color32::from_rgb(p[0], p[1], p[2])),
+        );
     }
 
-    Some((width, height, pixels))
+    Some(ColorImage {
+        size: [width, height],
+        pixels,
+    })
 }
 
 /// Averages a strided subset of an RGBA buffer's pixels into an RGB color.
@@ -197,7 +208,7 @@ impl VideoReceiver for RawRtpUdp {
         // 100ms latency buffer: tolerates network jitter during high-motion
         // scenes where frames are large and packets may arrive out of order.
         // Lower values cause late-packet drops that break decoding.
-        jitter.set_property("latency", 60u32);
+        jitter.set_property("latency", 50u32);
         jitter.set_property("drop-on-latency", true);
         jitter.set_property("do-lost", true);
         // No RTX: there is no feedback session, so a retransmission request can
@@ -247,7 +258,27 @@ impl VideoReceiver for RawRtpUdp {
 
         let parse = gst::ElementFactory::make("h264parse").build()?;
         parse.set_property_from_str("config-interval", "-1");
-        parse.set_property_from_str("update-timecode", "false"); // NOTE: may is wrong
+        parse.set_property_from_str("update-timecode", "false");
+
+        // Thread boundary. Without this every element below runs on the
+        // jitterbuffer's own push task, so the hardware-memory download in
+        // `conv` and the per-frame image build in the appsink callback all
+        // execute on the one thread that also has to drain the jitterbuffer on
+        // schedule. At 30fps that fits in the 33ms frame period; at 60fps it
+        // does not, and because `drop-on-latency` is set the jitterbuffer's
+        // response to its own thread being busy is to *discard packets* --
+        // producing corrupt AUs and motion artifacts while `windowed_loss_pct`
+        // (measured on the wire, in `run()`) still reads 0%.
+        //
+        // Not leaky: dropping an encoded AU here would break the P-frame
+        // reference chain exactly like the packet loss this is meant to
+        // prevent, and it wouldn't be visible to the keyframe-recovery probe
+        // either. A consumer that falls behind should cost bounded latency,
+        // which is observable, rather than silent corruption.
+        let queue = gst::ElementFactory::make("queue").build()?;
+        queue.set_property("max-size-buffers", 8u32);
+        queue.set_property("max-size-bytes", 0u32);
+        queue.set_property("max-size-time", 0u64);
 
         let decoder = choose_h264_decoder();
         *state.stats.decoder_name.lock() = decoder;
@@ -257,6 +288,10 @@ impl VideoReceiver for RawRtpUdp {
         }
 
         let conv = gst::ElementFactory::make("videoconvert").build()?;
+        // Defaults to 1. This element does the decoder-memory download and the
+        // conversion to RGBA; single-threaded it is the widest step on the
+        // frame path at 60fps.
+        conv.set_property("n-threads", 4u32);
 
         let caps_filter = gst::ElementFactory::make("capsfilter").build()?;
         caps_filter.set_property(
@@ -280,6 +315,7 @@ impl VideoReceiver for RawRtpUdp {
             &fecdec,
             &depay,
             &parse,
+            &queue,
             &dec,
             &conv,
             &caps_filter,
@@ -293,6 +329,7 @@ impl VideoReceiver for RawRtpUdp {
             &fecdec,
             &depay,
             &parse,
+            &queue,
             &dec,
             &conv,
             &caps_filter,
@@ -428,8 +465,7 @@ impl VideoReceiver for RawRtpUdp {
                     let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
                     let caps = sample.caps().ok_or(gst::FlowError::Error)?;
 
-                    if let Some((width, height, pixels)) = copy_rgba_tight(buffer, caps) {
-                        let image = ColorImage::from_rgba_unmultiplied([width, height], &pixels);
+                    if let Some(image) = frame_to_color_image(buffer, caps) {
                         *state_video.latest_frame.lock() = Some(image);
                         if let Some(ctx) = state_video.egui_ctx.get() {
                             ctx.request_repaint();
