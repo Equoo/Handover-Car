@@ -214,7 +214,7 @@ impl AppState {
         // a delayed tick (executor stall, GC-style pause) shouldn't silently
         // slow the ramp, and a fast one shouldn't overshoot it. At the
         // nominal 2s tick this is the same +25kbps/tick as before.
-        const ADDITIVE_INCREASE_BPS_PER_SEC: f64 = 12_500.0;
+        const ADDITIVE_INCREASE_BPS_PER_SEC: f64 = 25_000.0;
         // Hysteresis for stepping FEC back down: step up immediately on the
         // first window crossing a threshold, but only step down after this
         // many consecutive windows below it. Loss on cellular links is
@@ -223,7 +223,7 @@ impl AppState {
         const CLEAN_STREAK_TO_STEP_DOWN: u32 = 5;
 
         let mut interval = tokio::time::interval(TICK);
-        let mut link_estimate: u32 = 1_000_000;
+        let mut link_estimate: u32 = 3_000_000;
         // Non-zero baseline: the first loss burst must already have FEC
         // protection, not trigger a ramp-up that arrives too late. 5% overhead
         // is ~50kbps at 1Mbps video -- negligible cost for artifact prevention.
@@ -252,7 +252,7 @@ impl AppState {
             } else {
                 link_estimate + (ADDITIVE_INCREASE_BPS_PER_SEC * elapsed.as_secs_f64()) as u32
             };
-            link_estimate = link_estimate.clamp(100_000, 3_000_000);
+            link_estimate = link_estimate.clamp(500_000, 8_000_000);
 
             // Floor at 5%: dropping to 0% leaves the stream unprotected until
             // the next loss event triggers a ramp-up, causing visible artifacts.
