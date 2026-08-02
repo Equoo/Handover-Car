@@ -3,6 +3,13 @@ systemctl enable --now reverse-ssh
 
 apt update
 
+# Rust via rustup, pas via apt : Trixie livre rustc 1.85, qui comprend
+# l'edition 2024 mais pas encore les let-chains (stables depuis 1.88) que le
+# workspace utilise. L'installeur ajoute lui-meme /root/.cargo/bin au PATH
+# dans /root/.profile (ne pas ecrire $PATH ici : envsubst le remplacerait par
+# la valeur de la machine qui flashe la carte).
+wget -qO- https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable
+
 rm /etc/modprobe.d/dietpi-disable_rpi_camera.conf
 rm /etc/modprobe.d/dietpi-disable_rpi_codec.conf
 sh -c 'cat > /etc/modules-load.d/rpi-camera.conf <<EOF
@@ -37,6 +44,6 @@ nmcli connection modify home \
 
 nmcli connection modify home connection.autoconnect yes
 
-usermod -aG video,render,audio,pulse-access dietpi
+usermod -aG video,render,audio,pulse-access,dialout dietpi
 
 reboot
