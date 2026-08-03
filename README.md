@@ -70,3 +70,7 @@ bash
 sudo tc qdisc replace dev wwan0 root cake bandwidth 5mbit rtt 100ms
 
 Ajuste bandwidth à ta bitrate cible réelle (un peu en dessous de ton max théorique 4G pour laisser de la marge), et rtt selon ta latence mesurée typique.
+
+
+## mosh for better ssh stability
+<https://mosh.org/>

@@ -144,6 +144,7 @@ impl AppState {
 
         match msg {
             ArchivedServerToSlave::Pilot(ArchivedPilotCommand::Input { throttle, steering }) => {
+                debug!("received pilot {} {}", throttle, steering);
                 let line = format!("{:} {:}\n", steering, throttle);
                 let bytes = line.as_bytes();
 
