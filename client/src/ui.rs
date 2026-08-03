@@ -10,6 +10,7 @@ use tracing::{error, info, warn};
 use crate::app::AppState;
 use crate::overlay::Overlay;
 use crate::video::{RawRtpUdp, VideoReceiver};
+use crate::input_handler::InputHandler;
 
 /// eframe (winit) doesn't run a GLib main loop, but `bus.add_watch` below
 /// needs one somewhere to actually dispatch its callback -- GTK used to
@@ -30,6 +31,7 @@ pub struct App {
     // Dropping this removes the bus watch and silently kills GST logging,
     // so it has to live as long as the app does.
     _bus_watch: gst::bus::BusWatchGuard,
+    input_handler: InputHandler,
 }
 
 impl App {
@@ -74,6 +76,7 @@ impl App {
             texture: None,
             overlay: Overlay::new(),
             _bus_watch: bus_watch,
+            input_handler: InputHandler::new(),
         })
     }
 }
@@ -89,6 +92,8 @@ impl eframe::App for App {
                 }
             }
         }
+
+        self.input_handler.update(self.state.clone());
 
         egui::CentralPanel::default()
             .frame(egui::Frame::none())

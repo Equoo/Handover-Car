@@ -24,7 +24,7 @@ use crate::stats::Stats;
 use crate::video::{RawRtpUdp, VideoReceiver};
 
 const SERVER_PORT: u16 = 9500;
-const SLAVE: &str = "FlashMcqueen";
+pub const SLAVE: &str = "FlashMcqueen";
 
 /// How long the client can go without a `ServerClientPong` before it assumes
 /// the server forgot about it (most likely a server restart) and resends
@@ -32,7 +32,7 @@ const SLAVE: &str = "FlashMcqueen";
 const PONG_STALE: Duration = Duration::from_secs(2);
 
 pub struct AppState {
-    socket: Socket,
+    pub socket: Socket,
     pub(crate) server: SocketAddr,
     uuid: Mutex<Uuid>,
     ping: PingTracker,
@@ -90,6 +90,10 @@ impl AppState {
             connected: Mutex::new(false),
             audio,
         })
+    }
+
+    pub fn sendmsg_to_server(&self, msg: &Message, typ: PacketType) -> Result<()> {
+        self.socket.send(&self.server, &msg, typ)
     }
 
     /// Ask the car's encoder for an IDR. Sent reliably: a dropped request

@@ -17,6 +17,7 @@ mod overlay;
 mod stats;
 mod ui;
 mod video;
+mod input_handler;
 
 #[tokio::main]
 async fn main() -> Result<()> {
