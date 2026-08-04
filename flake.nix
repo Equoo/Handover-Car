@@ -11,50 +11,31 @@
       systems = [ "x86_64-linux" "aarch64-linux" ];
       perSystem = { config, self', inputs', pkgs, system, ... }: {
 
-        devShells.default = pkgs.mkShell {
-          packages = with pkgs; [ 
-            pkgconf
+        devShells.default = pkgs.mkShellNoCC rec {
+
+          nativeBuildInputs = with pkgs; [ pkg-config ];
+          buildInputs = with pkgs; [
+            rustup
+
             glib.dev
             gst_all_1.gstreamer.dev
-            glib
-            gst_all_1.gstreamer
-            gst
-            pcre2
-            sysprof
-            libsysprof-capture
-            libunwind
-            elfutils
-            zstd
-            util-linux
-            libselinux
-            libsepol
-            gst_all_1.gst-plugins-base
-            gst_all_1.gst-plugins-good
-            gst_all_1.gst-plugins-bad
-            gst_all_1.gst-plugins-ugly
-            orc
+            gst_all_1.gst-plugins-base.dev
+            systemd.dev
+
             wayland
-            wayland-protocols
             libxkbcommon
-            mesa
-            libGL
             libglvnd
             egl-wayland
-            systemd
+            gst_all_1.gst-plugins-good
+            gst_all_1.gst-plugins-bad
           ];
 
-          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
-            pkgs.wayland
-            pkgs.libxkbcommon
-            pkgs.mesa
-            pkgs.libglvnd
-            pkgs.egl-wayland
-          ];
+          RUSTC_VERSION = "stable";
 
+          LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath (buildInputs ++ nativeBuildInputs);
         };
 
       };
 
     };
 }
-
