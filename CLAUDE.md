@@ -21,9 +21,16 @@ vidéo FPV (First Person View) faible latence.
 
 ### Réseau — le point le plus critique
 - **CGNAT** : en 5G/4G grand public, la Pi n'a **pas d'IP publique joignable**.
-  Connexion directe impossible. Solutions retenues :
-  - VPN mesh **Tailscale** ou **ZeroTier** (WireGuard) — le plus simple ;
-  - ou **WebRTC** avec serveur **TURN** (STUN/TURN gère aussi la traversée NAT).
+  Connexion directe impossible d'emblée — l'adresse doit être *découverte*.
+  **Résolu** : mini-ICE maison dans `common/src/transport.rs` (voir
+  `docs/network-paths.md`). Le serveur sert de rendez-vous et de relais ; les
+  deux pairs sondent en parallèle chaque candidat (adresses locales, adresse
+  publique réfléchie) et basculent sur le chemin direct dès qu'il répond, avec
+  retour au relais instantané s'il meurt. Tailscale/ZeroTier et WebRTC+TURN
+  restent des alternatives, mais ne sont plus nécessaires.
+- **IPv6** : les opérateurs FR donnent souvent une v6 *non NATée* au modem. Si
+  le poste pilote a aussi de l'IPv6, le cas « difficile » CGNAT redevient un
+  simple candidat host, sans aucun trou à percer.
 - **Latence** : viser un réalisme ~20-50 ms RTT en 5G FR, avec jitter et pics.
   Pilotable mais pas au niveau d'un lien RC classique.
 - **Contrôle en UDP** (ou data channel WebRTC), **jamais en TCP** (le
@@ -120,8 +127,26 @@ caméra + encodage matériel + pipeline et mesurer la latence de base « propre 
 **Ensuite** ajouter Tailscale, **puis** la 5G — ainsi quand la latence grimpe on
 sait que c'est le réseau, pas le pipeline.
 
+## Bloc traité : sélection de chemin réseau
+Vidéo, audio et commandes de pilotage partagent **un seul socket UDP** par
+pair, taggé par canal (1 octet) — donc **un seul trou NAT percé sert tout**.
+Trois types de chemin, du plus rapide au plus sûr : *host* (LAN ou IPv6
+routable), *reflexive* (percé via le relais), *relay* (le VPS, toujours
+fonctionnel). Le relais est actif dès le premier paquet ; le direct ne prend le
+relais qu'une fois qu'il a réellement répondu à une sonde. Détails, schéma
+d'établissement et pièges dans **`docs/network-paths.md`**.
+
+Le RTP de la Pi passe par `127.0.0.1` (`slave/src/pump.rs`) avant de sortir :
+sinon les paquets partiraient du socket de `udpsink`, qui n'a percé aucun trou.
+Coût : une copie loopback. Gain : bascule de chemin instantanée, sans
+redémarrer l'encodeur (donc sans réouverture caméra).
+
+L'overlay client affiche le chemin actif (touche `i`) — utile pour la démarche
+de validation ci-dessus : on voit si la latence vient du réseau ou du pipeline.
+
 ## Blocs suivants (pas encore traités)
 - Chaîne de contrôle : Pi ↔ Arduino (série/UART) ↔ ESC + servo direction, avec
-  le watchdog failsafe.
-- Architecture réseau complète (Tailscale vs WebRTC+TURN, signaling).
+  le watchdog failsafe. **Le watchdog reste à faire côté Arduino** — d'autant
+  plus important maintenant que les commandes passent en direct : la perte du
+  chemin direct est attendue (handover cellulaire), pas exceptionnelle.
 - Alimentation détaillée & intégration physique (thermique, montage).
