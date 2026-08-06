@@ -1,12 +1,9 @@
 use std::io::{BufRead, BufReader, Error, ErrorKind, Result};
-use std::net::IpAddr;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
-use tracing::{debug, info, warn};
-
-use common::VideoMode;
+use tracing::{info, warn};
 
 /// One `[LATENCY]` line parsed from the streamer's stdout, printed every ~2s.
 #[derive(Debug, Clone, Copy)]
@@ -17,17 +14,15 @@ pub struct StreamerStats {
     pub bitrate_bps: u32,
 }
 
-/// Where slave-side video production goes for a given `VideoMode` -- the
-/// server negotiates the mode, `slave/src/main.rs` only ever calls through
-/// this trait, and the concrete backend is picked once at `start`. Only one
-/// backend exists today (`RawRtpUdp`, matching `VideoMode::RawRtpUdp`); a
-/// future one (e.g. WebRTC) is a new impl, not a rewrite of the call sites.
+/// Slave-side video production. `slave/src/main.rs` only ever calls through
+/// this trait, so the concrete backend is picked once at `start`. Only one
+/// backend exists today (`RpicamStreamer`); a future one (e.g. WebRTC) is a
+/// new impl, not a rewrite of the call sites.
+///
+/// `rtp_port` is on loopback, not on the network: where the RTP actually goes
+/// is the transport's decision and changes mid-stream. See `pump.rs`.
 pub trait VideoSource: Sized {
-    fn start(
-        mode: &VideoMode,
-        server_ip: IpAddr,
-        on_stats: impl Fn(StreamerStats) + Send + 'static,
-    ) -> Result<Self>;
+    fn start(rtp_port: u16, on_stats: impl Fn(StreamerStats) + Send + 'static) -> Result<Self>;
 
     /// Ask the encoder for an IDR keyframe.
     async fn request_keyframe(&self) -> Result<()>;
@@ -62,25 +57,17 @@ fn extract_after(line: &str, marker: &str) -> Option<f32> {
     rest[..end].parse::<f32>().ok()
 }
 
-/// Video over raw RTP packets sent directly to the server's relay port --
-/// exec's the C++ streamer, which talks straight to the Pi's hardware H.264
-/// encoder. This is `VideoMode::RawRtpUdp`'s slave-side implementation.
-pub struct RawRtpUdp {
+/// The C++ streamer subprocess, which talks straight to the Pi's hardware
+/// H.264 encoder and emits RTP. Retuned live through a control FIFO rather
+/// than restarted, since a restart costs a full camera re-open.
+pub struct RpicamStreamer {
     video: Child,
 }
 
-impl VideoSource for RawRtpUdp {
-    fn start(
-        mode: &VideoMode,
-        server_ip: IpAddr,
-        on_stats: impl Fn(StreamerStats) + Send + 'static,
-    ) -> Result<Self> {
-        let video_port = match mode {
-            VideoMode::RawRtpUdp { video_port } => *video_port,
-        };
-
+impl VideoSource for RpicamStreamer {
+    fn start(rtp_port: u16, on_stats: impl Fn(StreamerStats) + Send + 'static) -> Result<Self> {
         Ok(Self {
-            video: Self::start_video(server_ip, video_port, on_stats)?,
+            video: Self::start_video(rtp_port, on_stats)?,
         })
     }
 
@@ -97,16 +84,12 @@ impl VideoSource for RawRtpUdp {
     }
 }
 
-impl RawRtpUdp {
-    fn start_video(
-        host: IpAddr,
-        port: u16,
-        on_stats: impl Fn(StreamerStats) + Send + 'static,
-    ) -> Result<Child> {
+impl RpicamStreamer {
+    fn start_video(port: u16, on_stats: impl Fn(StreamerStats) + Send + 'static) -> Result<Child> {
         let mut video = Command::new("./rpicam_stream/build/streamer")
             .args([
                 "--host",
-                &host.to_string(),
+                "127.0.0.1",
                 "--port",
                 &format!("{port}"),
                 "--gop",

@@ -2,12 +2,14 @@ use std::{collections::HashMap, env, net::SocketAddr, str::FromStr, sync::Arc, t
 
 use anyhow::{Context, Result, bail};
 
+use common::transport::{channel, parse_register, register_ack_body};
 use common::{
-    ArchivedClientMessage, ArchivedMessage, ArchivedPilotCommand, ArchivedSlaveMessage,
-    CommonError, Message, PacketType, PilotCommand, ServerToClient, ServerToSlave, Socket,
-    SocketEvent, VideoMode,
+    ArchivedClientMessage, ArchivedMessage, ArchivedPilotCommand, ArchivedSlaveMessage, Candidate,
+    CommonError, Message, PacketType, PilotCommand, Role, ServerToClient, ServerToSlave,
+    SessionToken, Socket, SocketEvent, TransportConfig,
 };
 use parking_lot::Mutex;
+use rkyv::rancor::Error as RkyvError;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::{net::UdpSocket, task::AbortHandle, time::Instant};
 use tracing::{debug, error, info, level_filters::LevelFilter, warn};
@@ -15,8 +17,11 @@ use uuid::Uuid;
 
 const SLAVES_LIMIT: u8 = 16;
 const MAIN_PORT: u16 = 9500;
-const VIDEO_PORT: u16 = 9600; // - 9616
-const AUDIO_PORT: u16 = 9700; // - 9716
+/// One relay port per slave (9600 - 9615). Video, audio and pilot input all
+/// share it: they share one socket on each peer too, so that a single punched
+/// NAT mapping serves every stream, and the relay is just the fallback
+/// destination for that same socket.
+const RELAY_PORT: u16 = 9600;
 
 struct Slave {
     name: String,
@@ -26,8 +31,13 @@ struct Slave {
     latency: u16,
     bitrate: u32,
     fec_pct: u8,
-    video_thread: AbortHandle,
-    audio_thread: AbortHandle,
+    relay_thread: AbortHandle,
+    /// Shared secret both sides must present to register with this session's
+    /// relay and to have their probes answered by the other peer.
+    token: SessionToken,
+    /// Latest data-plane candidates this car advertised, kept so a client that
+    /// subscribes later doesn't have to wait for the next republish.
+    candidates: Vec<Candidate>,
     subscriber: Uuid,
 }
 
@@ -39,6 +49,7 @@ struct Client {
     uuid: Uuid,
     addr: SocketAddr,
     subscribe: String,
+    candidates: Vec<Candidate>,
 }
 
 struct AppState {
@@ -75,33 +86,90 @@ impl AppState {
         i as u8
     }
 
-    async fn new_pipesocket(self: Arc<AppState>, port: u16, id: String) -> Result<AbortHandle> {
-        debug!("New pipesocket on port {port} for {id}");
+    /// The fallback path for one session's data plane: a two-party pipe that
+    /// forwards whatever one side sends to the other.
+    ///
+    /// It learns both addresses from `REGISTER` packets rather than being told
+    /// them, because neither side knows its own public address and both move
+    /// on their own -- cellular NAT rebinds the car, and the client's home NAT
+    /// expires mappings. Re-registering every second is what keeps this
+    /// current, and the ack it sends back is also how each peer discovers the
+    /// public address it must advertise for hole punching. That makes this
+    /// port the session's STUN server as well as its TURN server.
+    ///
+    /// Everything that is not a registration is forwarded blind. The relay
+    /// never parses media, and probes never come here at all -- those go
+    /// peer-to-peer by definition.
+    async fn new_relay(
+        self: Arc<AppState>,
+        port: u16,
+        id: String,
+        token: SessionToken,
+    ) -> Result<AbortHandle> {
+        debug!("New relay on port {port} for {id}");
         let socket = UdpSocket::bind(format!("0.0.0.0:{port}"))
             .await
-            .with_context(|| format!("failed to bind pipesocket on port {port} for {id}"))?;
+            .with_context(|| format!("failed to bind relay on port {port} for {id}"))?;
 
         Ok(tokio::spawn(async move {
-            let mut last_addr: Option<SocketAddr> = None;
+            let mut slave_addr: Option<SocketAddr> = None;
+            let mut client_addr: Option<SocketAddr> = None;
             let mut buf = [0; 1 << 18];
+
             loop {
                 let (size, addr) = match socket.recv_from(&mut buf).await {
                     Ok(v) => v,
                     Err(e) => {
-                        warn!(error = ?e, "pipesocket {port} recv failed for {id}, dropping packet");
+                        warn!(error = ?e, "relay {port} recv failed for {id}, dropping packet");
                         continue;
                     }
                 };
+                if size < 1 {
+                    continue;
+                }
 
-                if size != 1 {
-                    if let Some(addr) = last_addr
-                        && let Err(e) = socket.send_to(&buf[..size], addr).await
-                    {
-                        warn!(error = ?e, "pipesocket {port} relay to {addr} failed for {id}");
+                if buf[0] == channel::REGISTER {
+                    let (role, echo) = match parse_register(&buf[1..size], &token) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            debug!(error = ?e, "relay {port} rejected a registration from {addr}");
+                            continue;
+                        }
+                    };
+
+                    let slot = match role {
+                        Role::Slave => &mut slave_addr,
+                        Role::Client => &mut client_addr,
+                    };
+                    if *slot != Some(addr) {
+                        info!("Relay {port} ({id}): {role:?} side is now {addr}");
+                        *slot = Some(addr);
                     }
+
+                    let mut ack = Vec::with_capacity(1 + 43);
+                    ack.push(channel::REGISTER_ACK);
+                    ack.extend_from_slice(&register_ack_body(&token, echo, addr));
+                    if let Err(e) = socket.send_to(&ack, addr).await {
+                        debug!(error = ?e, "relay {port} ack to {addr} failed");
+                    }
+                    continue;
+                }
+
+                // Forward to whichever side didn't send it. An unregistered
+                // source is silently dropped: without a registration there is
+                // no way to tell which half of the session it claims to be.
+                let dst = if Some(addr) == slave_addr {
+                    client_addr
+                } else if Some(addr) == client_addr {
+                    slave_addr
                 } else {
-                    last_addr = Some(addr);
-                    debug!("Client from {addr} subscribe pipesocket {port} of {id}");
+                    continue;
+                };
+
+                if let Some(dst) = dst
+                    && let Err(e) = socket.send_to(&buf[..size], dst).await
+                {
+                    warn!(error = ?e, "relay {port} forward to {dst} failed for {id}");
                 }
             }
         })
@@ -113,7 +181,7 @@ impl AppState {
         id: String,
         addr: SocketAddr,
         latency: u16,
-    ) -> Result<(u16, u16)> {
+    ) -> Result<TransportConfig> {
         if *self.slaves_count.lock() == SLAVES_LIMIT {
             bail!("slaves limit reach");
         }
@@ -122,14 +190,15 @@ impl AppState {
         self.usedids.lock()[uniqueid as usize] = true;
         *self.slaves_count.lock() += 1;
 
-        let video_thread = self
-            .clone()
-            .new_pipesocket(VIDEO_PORT + uniqueid as u16, id.clone())
-            .await?;
+        // Random per session rather than derived from the slave id: it gates
+        // both relay registration and the peer-to-peer probes, so anything
+        // guessable would let a third party point the car's video at itself.
+        let token: SessionToken = *Uuid::new_v4().as_bytes();
+        let relay_port = RELAY_PORT + uniqueid as u16;
 
-        let audio_thread = self
+        let relay_thread = self
             .clone()
-            .new_pipesocket(AUDIO_PORT + uniqueid as u16, id.clone())
+            .new_relay(relay_port, id.clone(), token)
             .await?;
 
         self.slaves.lock().await.insert(
@@ -140,15 +209,16 @@ impl AppState {
                 last_addr: addr,
                 last_seen: Instant::now(),
                 latency,
-                video_thread,
-                audio_thread,
+                relay_thread,
+                token,
+                candidates: Vec::new(),
                 bitrate: 1000000,
                 fec_pct: 0,
                 subscriber: Uuid::nil(),
             },
         );
 
-        Ok((VIDEO_PORT + uniqueid as u16, AUDIO_PORT + uniqueid as u16))
+        Ok(TransportConfig { relay_port, token })
     }
 
     async fn handle_slave_message(
@@ -186,19 +256,52 @@ impl AppState {
                         )?;
                     }
 
-                    let (video_port, audio_port) = self
+                    let transport = self
                         .clone()
                         .new_slave(id.clone(), addr, latency.into())
                         .await?;
 
                     self.socket.send(
                         &addr,
-                        &Message::ToSlave(ServerToSlave::Connected {
-                            video: VideoMode::RawRtpUdp { video_port },
-                            audio_port,
-                        }),
+                        &Message::ToSlave(ServerToSlave::Connected { transport }),
                         PacketType::Reliable,
                     )?;
+
+                    // Re-link whichever client was already subscribed to this
+                    // id. The `Slave` record is brand new -- the car restarted,
+                    // or a tunnel outran `SLAVE_EXPIRY` -- so its `subscriber`
+                    // would otherwise stay unset until the client resubscribed,
+                    // and the client only does that when the *server* goes
+                    // quiet, not when the car does. Left unset, stats and
+                    // candidates both stop flowing towards a client that is
+                    // still perfectly happy.
+                    let waiting = self
+                        .clients
+                        .lock()
+                        .await
+                        .values()
+                        .find(|c| c.subscribe == id)
+                        .map(|c| (c.uuid, c.addr, c.candidates.clone()));
+
+                    if let Some((uuid, client_addr, client_candidates)) = waiting {
+                        if let Some(slave) = self.slaves.lock().await.get_mut(&id) {
+                            slave.subscriber = uuid;
+                        }
+                        info!("Re-linked slave '{id}' to its waiting client {client_addr}");
+
+                        // Hand each side the other's last known candidates so
+                        // punching restarts now rather than at whatever point
+                        // one of the two addresses happens to change.
+                        if !client_candidates.is_empty() {
+                            self.socket.send(
+                                &addr,
+                                &Message::ToSlave(ServerToSlave::PeerCandidates {
+                                    candidates: client_candidates,
+                                }),
+                                PacketType::Reliable,
+                            )?;
+                        }
+                    }
 
                     info!("Connection established with slave '{id}'");
                 }
@@ -235,6 +338,28 @@ impl AppState {
                     )?;
                 }
             }
+            ArchivedSlaveMessage::Candidates { id, candidates } => {
+                let candidates: Vec<Candidate> = rkyv::deserialize::<_, RkyvError>(candidates)
+                    .context("failed to deserialize slave candidates")?;
+                debug!("Slave '{id}' advertises {} candidate(s)", candidates.len());
+
+                let subscriber = {
+                    let mut slaves = self.slaves.lock().await;
+                    let Some(slave) = slaves.get_mut(id.as_ref()) else {
+                        return Ok(());
+                    };
+                    slave.candidates = candidates.clone();
+                    slave.subscriber
+                };
+
+                if let Some(client) = self.clients.lock().await.get(&subscriber) {
+                    self.socket.send(
+                        &client.addr,
+                        &Message::ToClient(ServerToClient::PeerCandidates { candidates }),
+                        PacketType::Reliable,
+                    )?;
+                }
+            }
             // Not wired up to anything yet on the receiving end.
             ArchivedSlaveMessage::Error { .. } | ArchivedSlaveMessage::Location { .. } => {}
         }
@@ -254,6 +379,7 @@ impl AppState {
                     uuid: id,
                     addr,
                     subscribe: slave_id.to_string(),
+                    candidates: Vec::new(),
                 };
 
                 debug!("Trying to subscribe to {slave_id}");
@@ -266,15 +392,52 @@ impl AppState {
                         &addr,
                         &Message::ToClient(ServerToClient::Connected {
                             uuid: id.to_string(),
-                            video: VideoMode::RawRtpUdp {
-                                video_port: VIDEO_PORT + slave.uniqueid as u16,
+                            transport: TransportConfig {
+                                relay_port: RELAY_PORT + slave.uniqueid as u16,
+                                token: slave.token,
                             },
-                            audio_port: AUDIO_PORT + slave.uniqueid as u16,
                         }),
                         PacketType::Reliable,
                     )?;
 
+                    // The car has usually been announcing for a while by now,
+                    // so its candidates already exist. Sending them with the
+                    // handshake rather than waiting for the next republish is
+                    // what lets punching start immediately instead of a couple
+                    // of seconds into the session.
+                    if !slave.candidates.is_empty() {
+                        self.socket.send(
+                            &addr,
+                            &Message::ToClient(ServerToClient::PeerCandidates {
+                                candidates: slave.candidates.clone(),
+                            }),
+                            PacketType::Reliable,
+                        )?;
+                    }
+
                     info!("{addr} connected and suscribed to {slave_id}");
+                }
+            }
+            ArchivedClientMessage::Candidates { uuid, candidates } => {
+                let candidates: Vec<Candidate> = rkyv::deserialize::<_, RkyvError>(candidates)
+                    .context("failed to deserialize client candidates")?;
+                debug!("Client advertises {} candidate(s)", candidates.len());
+
+                let subscribe = {
+                    let mut clients = self.clients.lock().await;
+                    let Some(client) = clients.get_mut(&Uuid::from_str(uuid)?) else {
+                        return Ok(());
+                    };
+                    client.candidates = candidates.clone();
+                    client.subscribe.clone()
+                };
+
+                if let Some(slave) = self.slaves.lock().await.get(&subscribe) {
+                    self.socket.send(
+                        &slave.last_addr,
+                        &Message::ToSlave(ServerToSlave::PeerCandidates { candidates }),
+                        PacketType::Reliable,
+                    )?;
                 }
             }
             ArchivedClientMessage::Pilot { slave_id, cmd } => {
@@ -395,8 +558,7 @@ impl AppState {
         for id in stale {
             if let Some(slave) = slaves.remove(&id) {
                 warn!("Slave '{id}' timed out, freeing slot {}", slave.uniqueid);
-                slave.video_thread.abort();
-                slave.audio_thread.abort();
+                slave.relay_thread.abort();
                 self.usedids.lock()[slave.uniqueid as usize] = false;
                 *self.slaves_count.lock() -= 1;
             }

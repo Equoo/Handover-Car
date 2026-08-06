@@ -1,5 +1,4 @@
-use std::io::{BufRead, BufReader, Error, ErrorKind, Result};
-use std::net::IpAddr;
+use std::io::{BufRead, BufReader, Error, Result};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -34,7 +33,7 @@ impl AudioSource {
     /// Start the audio capture and streaming pipeline.
     /// Best-effort: returns None if audio can't be set up at all (e.g. no
     /// GStreamer on the system).
-    pub fn start(server_ip: IpAddr, audio_port: u16) -> Option<Self> {
+    pub fn start(rtp_port: u16) -> Option<Self> {
         if let Err(e) = Command::new("gst-launch-1.0")
             .arg("--version")
             .stdout(Stdio::null())
@@ -59,9 +58,9 @@ impl AudioSource {
             child: child.clone(),
         };
 
-        thread::spawn(move || supervise(server_ip, audio_port, device, stop, child));
+        thread::spawn(move || supervise(rtp_port, device, stop, child));
 
-        info!("Audio streaming started on port {audio_port}");
+        info!("Audio streaming into the data plane via 127.0.0.1:{rtp_port}");
         Some(source)
     }
 
@@ -128,8 +127,7 @@ fn resolve_device() -> Option<String> {
 
 /// Keeps one `gst-launch-1.0` alive for as long as the `AudioSource` lives.
 fn supervise(
-    server_ip: IpAddr,
-    audio_port: u16,
+    rtp_port: u16,
     device: Option<String>,
     stop: Arc<AtomicBool>,
     child_slot: Arc<Mutex<Option<Child>>>,
@@ -139,7 +137,7 @@ fn supervise(
     while !stop.load(Ordering::Relaxed) {
         let started = Instant::now();
 
-        match spawn_pipeline(server_ip, audio_port, device.as_deref()) {
+        match spawn_pipeline(rtp_port, device.as_deref()) {
             Ok(mut child) => {
                 // Taken before the child is published so `stop()` can never
                 // race us for it; gst-launch blocks on a full stderr pipe, so
@@ -218,7 +216,7 @@ fn wait_for_exit(
     }
 }
 
-fn spawn_pipeline(server_ip: IpAddr, audio_port: u16, device: Option<&str>) -> Result<Child> {
+fn spawn_pipeline(rtp_port: u16, device: Option<&str>) -> Result<Child> {
     // Pipeline: capture from PulseAudio -> convert -> resample -> Opus encode -> RTP -> UDP
     // - pulsesrc: captures from PulseAudio source (microphone), see `resolve_device`
     // - audioconvert/audioresample: ensure correct format for encoder
@@ -227,32 +225,52 @@ fn spawn_pipeline(server_ip: IpAddr, audio_port: u16, device: Option<&str>) -> R
     //   - frame-size=10: 10ms frames for low latency
     //   - audio-type=voice: optimize for speech
     // - rtpopuspay: RTP packetization, pt=97 (dynamic payload type)
-    // - udpsink: send to server, sync=false for live streaming
+    // - udpsink: hands RTP to this process's loopback pump (see pump.rs), which
+    //   forwards it over whichever path the transport currently has selected;
+    //   sync=false for live streaming
     //
-    // Quoted device name: gst-launch tokenizes the pipeline string itself, so
-    // an unquoted name containing a space would be parsed as a new element.
-    let src = match device {
-        Some(device) => format!("pulsesrc device=\"{device}\""),
-        None => "pulsesrc".to_string(),
-    };
-
-    let pipeline = format!(
-        "{src} ! audioconvert ! audioresample \
-         ! opusenc bitrate=48000 frame-size=10 audio-type=voice \
-         ! rtpopuspay pt=97 \
-         ! udpsink host={server_ip} port={audio_port} sync=false"
+    // One argv element per pipeline token, rather than the whole description
+    // as a single argument. gst-launch-1.0 1.28 rejects the single-string form
+    // outright -- `gst-launch-1.0 -q "fakesrc ! fakesink"` is a syntax error
+    // there while the split form is accepted -- so the pipeline died on spawn
+    // and the car was silently mute.
+    //
+    // The device name keeps its quotes *inside* its own element: older
+    // gst-launch joins argv with spaces before parsing, and an unquoted name
+    // containing a space would be read there as the start of a new element.
+    // Quoted-within-one-element parses correctly under both behaviours.
+    let mut args: Vec<String> = vec!["-q".to_string(), "pulsesrc".to_string()];
+    if let Some(device) = device {
+        args.push(format!("device=\"{device}\""));
+    }
+    args.extend(
+        [
+            "!",
+            "audioconvert",
+            "!",
+            "audioresample",
+            "!",
+            "opusenc",
+            "bitrate=48000",
+            "frame-size=10",
+            "audio-type=voice",
+            "!",
+            "rtpopuspay",
+            "pt=97",
+            "!",
+            "udpsink",
+            "host=127.0.0.1",
+            "sync=false",
+        ]
+        .map(String::from),
     );
+    args.push(format!("port={rtp_port}"));
 
     Command::new("gst-launch-1.0")
-        .args(["-q", &pipeline])
+        .args(&args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| {
-            Error::new(
-                ErrorKind::Other,
-                format!("failed to spawn gst-launch-1.0: {e}"),
-            )
-        })
+        .map_err(|e| Error::other(format!("failed to spawn gst-launch-1.0: {e}")))
 }

@@ -28,6 +28,7 @@ pub enum MetricId {
     WindowedLoss,
     FecPct,
     Decoder,
+    Path,
     Uptime,
 }
 
@@ -167,6 +168,15 @@ pub const METRICS: &[MetricDef] = &[
         format: |s| format!("Decoder: {}", *s.decoder_name.lock()),
     },
     MetricDef {
+        id: MetricId::Path,
+        key: 'i',
+        label: "Active network path (direct vs relayed) and its RTT",
+        format: |s| match *s.path_rtt_ms.lock() {
+            Some(ms) => format!("Path: {} ({})", *s.path.lock(), fmt_ms(ms)),
+            None => format!("Path: {}", *s.path.lock()),
+        },
+    },
+    MetricDef {
         id: MetricId::Uptime,
         key: 'u',
         label: "Session uptime",
@@ -194,6 +204,9 @@ const DEFAULT_ENABLED: &[MetricId] = &[
     MetricId::RtpLoss,
     MetricId::WindowedLoss,
     MetricId::FecPct,
+    // On by default: which path is carrying the session explains more about a
+    // sudden latency change than any other single number here.
+    MetricId::Path,
 ];
 
 /// Which metrics are currently shown in the overlay. Purely a UI-side

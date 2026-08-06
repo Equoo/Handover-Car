@@ -149,6 +149,10 @@ pub struct Stats {
     pub link_estimate_bitrate: Mutex<u32>,
     /// FEC overhead percentage the adaptive loop is currently commanding.
     pub target_fec_pct: Mutex<u8>,
+    /// Which path the data plane is currently using and how fast it is, as
+    /// reported by `common::transport` -- e.g. `direct/host 192.168.1.42:41234`.
+    pub path: Mutex<String>,
+    pub path_rtt_ms: Mutex<Option<f64>>,
     frames: RateCounter,
     bytes: RateCounter,
     /// RTP sequence-number gaps observed on the wire, tracked in
@@ -174,6 +178,8 @@ impl Stats {
             measured_glass_to_glass_ms: Mutex::new(None),
             link_estimate_bitrate: Mutex::new(500_000),
             target_fec_pct: Mutex::new(0),
+            path: Mutex::new("connecting".to_string()),
+            path_rtt_ms: Mutex::new(None),
             frames: RateCounter::new(),
             bytes: RateCounter::new(),
             loss_window: WindowedRatio::new(),

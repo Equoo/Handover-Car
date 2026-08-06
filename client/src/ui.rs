@@ -9,7 +9,7 @@ use tracing::{error, info, warn};
 
 use crate::app::AppState;
 use crate::overlay::Overlay;
-use crate::video::{RawRtpUdp, VideoReceiver};
+use crate::video::{RtpVideo, VideoReceiver};
 use crate::input_handler::InputHandler;
 
 /// eframe (winit) doesn't run a GLib main loop, but `bus.add_watch` below
@@ -45,7 +45,7 @@ impl App {
 
         spawn_glib_main_loop();
 
-        let (pipeline, appsrc) = RawRtpUdp::build_pipeline(state.clone())?;
+        let (pipeline, appsrc) = RtpVideo::build_pipeline(state.clone())?;
         pipeline.set_state(gst::State::Playing)?;
         *state.appsrc.lock() = Some(appsrc);
 
