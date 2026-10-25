@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use common::VideoMode;
 use egui::ColorImage;
 use gstreamer::Registry;
 use gstreamer::glib::object::{Cast, ObjectExt};
@@ -11,9 +10,8 @@ use gstreamer_video::prelude::*;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::net::UdpSocket;
 use tokio::time::Instant;
-use tracing::{debug, info, warn};
+use tracing::{info, warn};
 
 use crate::app::AppState;
 use crate::stats::PacketLoss;
@@ -117,22 +115,21 @@ fn sample_average_color(buffer: &gst::BufferRef, caps: &gst::CapsRef) -> Option<
     (n > 0).then_some([(r_sum / n) as u8, (g_sum / n) as u8, (b_sum / n) as u8])
 }
 
-/// How the client receives and decodes video for a given `VideoMode`. Only
-/// one mode is implemented today (`RawRtpUdp`, below); a future mode (e.g.
-/// WebRTC) is a new impl of this trait, not a rewrite of `ui.rs`/`app.rs`'s
-/// call sites.
+/// How the client decodes incoming video. Only one implementation exists
+/// today (`RtpVideo`, below); a future one (e.g. WebRTC) is a new impl of this
+/// trait, not a rewrite of `ui.rs`/`app.rs`'s call sites.
 pub trait VideoReceiver {
     /// Builds the pipeline and starts it decoding into `state.latest_frame`
     /// (picked up by `ui.rs`'s `update()` loop each repaint). Called once at
-    /// app creation -- before the server (and so the negotiated `VideoMode`)
-    /// is known, with a single mode implemented there's nothing to select
-    /// yet, but this is the seam a mode-aware choice would hook into.
+    /// app creation, before the server hands over a transport config.
     fn build_pipeline(state: Arc<AppState>) -> Result<(gst::Pipeline, gst_app::AppSrc)>;
 
-    /// Receives video over the network per `mode` and pushes it into
-    /// `state.appsrc`. Runs until a fatal setup error occurs; per-packet
-    /// errors are logged and skipped, not propagated.
-    async fn run(state: Arc<AppState>, mode: VideoMode) -> Result<()>;
+    /// Feeds one RTP packet, already stripped of its data-plane channel tag,
+    /// into the pipeline. Called from the transport's receive thread for every
+    /// video packet, whichever path it arrived on. Per-packet errors are
+    /// logged and skipped, never propagated: one corrupt packet must not be
+    /// able to end video for the session.
+    fn push_rtp(state: &AppState, packet: &[u8]);
 }
 
 /// Payload type carrying `rtpulpfecenc`/`rtpulpfecdec` FEC packets, distinct
@@ -146,14 +143,17 @@ const FEC_PT: u32 = 122;
 /// is required for rtpulpfecdec to work correctly.
 const VIDEO_SSRC: u32 = 0x12345678;
 
-/// Raw RTP packets read straight off a UDP socket into an `appsrc`, decoded
-/// by a `rtpstorage` -> `rtpjitterbuffer` -> `rtpulpfecdec` -> depay -> parse
-/// -> decode -> convert chain, and handed to an `appsink` that copies each
-/// frame into `state.latest_frame` for `ui.rs` to paint. This is
-/// `VideoMode::RawRtpUdp`'s client-side implementation.
-pub struct RawRtpUdp;
+/// Raw RTP packets pushed into an `appsrc`, decoded by a `rtpstorage` ->
+/// `rtpjitterbuffer` -> `rtpulpfecdec` -> depay -> parse -> decode -> convert
+/// chain, and handed to an `appsink` that copies each frame into
+/// `state.latest_frame` for `ui.rs` to paint.
+///
+/// Where the packets came from is not this module's business: the transport
+/// picks the path and hands over payloads, so a mid-session switch between a
+/// direct and a relayed path is invisible here.
+pub struct RtpVideo;
 
-impl VideoReceiver for RawRtpUdp {
+impl VideoReceiver for RtpVideo {
     // for NVDEC: need 4:2:0, not 4:4:4
     fn build_pipeline(state: Arc<AppState>) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
         // No `payload` field: FEC packets (see rtpulpfecenc/dec below) share
@@ -483,21 +483,8 @@ impl VideoReceiver for RawRtpUdp {
         }
     }
 
-    async fn run(state: Arc<AppState>, mode: VideoMode) -> Result<()> {
-        let VideoMode::RawRtpUdp { video_port: port } = mode;
-
-        let socket = UdpSocket::bind("0.0.0.0:0").await?;
-        let subscribe_addr = format!("{}:{port}", state.server.ip());
-        debug!("Send to {subscribe_addr}");
-        socket.send_to(&[1], &subscribe_addr).await?;
-
-        // Re-sent periodically rather than once: the server's pipesocket
-        // only remembers our address for as long as it keeps receiving
-        // packets, and NAT rebinding on our end can silently invalidate the
-        // mapping it learned. Without this a stale subscription would go
-        // unnoticed until the app is restarted.
-        let mut resubscribe = tokio::time::interval(Duration::from_secs(2));
-        resubscribe.tick().await; // first tick fires immediately; we already subscribed above
+    fn push_rtp(state: &AppState, packet: &[u8]) {
+        state.stats.note_bytes(packet.len());
 
         // Raw-wire RTP sequence number tracking, independent of
         // `rtpjitterbuffer`'s own stats (see `Stats::note_seq`/
@@ -506,67 +493,48 @@ impl VideoReceiver for RawRtpUdp {
         // as media (RFC 5109), so this is the same loss the jitterbuffer
         // itself would observe, just measured before any pipeline element
         // gets a chance to recover or reorder it.
-        let mut last_seq: Option<u16> = None;
-
-        let mut buffer = [0u8; 1 << 18];
-        loop {
-            tokio::select! {
-                _ = resubscribe.tick() => {
-                    if let Err(e) = socket.send_to(&[1], &subscribe_addr).await {
-                        warn!(error = ?e, "video resubscribe failed");
-                    }
-                }
-                result = socket.recv_from(&mut buffer) => {
-                    let (size, _) = match result {
-                        Ok(v) => v,
-                        Err(e) => {
-                            warn!(error = ?e, "video recv failed, dropping packet");
-                            continue;
-                        }
-                    };
-                    state.stats.note_bytes(size);
-
-                    if size >= 4 {
-                        let seq = u16::from_be_bytes([buffer[2], buffer[3]]);
-                        if let Some(prev) = last_seq {
-                            let diff = seq.wrapping_sub(prev);
-                            // diff == 0: duplicate, not a fresh arrival.
-                            // diff < 0x8000: forward progress; diff-1 sequence
-                            // numbers in between never arrived.
-                            // diff >= 0x8000: seq is behind prev (a reordered
-                            // or late packet) -- its gap, if any, was already
-                            // counted when the higher sequence number came in.
-                            if diff != 0 && diff < 0x8000 {
-                                state.stats.note_seq((diff - 1) as u64, diff as u64);
-                            }
-                        }
-                        last_seq = Some(seq);
-                    }
-
-                    let pushed = (|| -> Result<()> {
-                        let mut gst_buffer = gst::Buffer::with_size(size)
-                            .context("failed to allocate gst buffer")?;
-                        gst_buffer
-                            .get_mut()
-                            .context("gst buffer unexpectedly shared")?
-                            .copy_from_slice(0, &buffer[..size])
-                            .map_err(|_| anyhow::anyhow!("buffer too small for received packet"))?;
-
-                        if let Some(appsrc) = state.appsrc.lock().as_mut() {
-                            appsrc.push_buffer(gst_buffer)?;
-                        }
-                        Ok(())
-                    })();
-
-                    // A single corrupted/oversized packet or a transient
-                    // pipeline hiccup must not kill the receive loop -- that
-                    // would mean permanent video loss for the rest of the
-                    // session (see docs/latency-optimization.md).
-                    if let Err(e) = pushed {
-                        warn!(error = ?e, "dropping video packet");
-                    }
+        if packet.len() >= 4 {
+            let seq = u16::from_be_bytes([packet[2], packet[3]]);
+            let mut last_seq = state.last_video_seq.lock();
+            if let Some(prev) = *last_seq {
+                let diff = seq.wrapping_sub(prev);
+                // diff == 0: duplicate, not a fresh arrival.
+                // diff < 0x8000: forward progress; diff-1 sequence numbers in
+                // between never arrived.
+                // diff >= 0x8000: seq is behind prev (a reordered or late
+                // packet) -- its gap, if any, was already counted when the
+                // higher sequence number came in.
+                //
+                // A path switch does not perturb this: the sequence space is
+                // the streamer's, and both paths carry the same one.
+                if diff != 0 && diff < 0x8000 {
+                    state.stats.note_seq((diff - 1) as u64, diff as u64);
                 }
             }
+            *last_seq = Some(seq);
+        }
+
+        let pushed = (|| -> Result<()> {
+            let mut gst_buffer =
+                gst::Buffer::with_size(packet.len()).context("failed to allocate gst buffer")?;
+            gst_buffer
+                .get_mut()
+                .context("gst buffer unexpectedly shared")?
+                .copy_from_slice(0, packet)
+                .map_err(|_| anyhow::anyhow!("buffer too small for received packet"))?;
+
+            if let Some(appsrc) = state.appsrc.lock().as_mut() {
+                appsrc.push_buffer(gst_buffer)?;
+            }
+            Ok(())
+        })();
+
+        // A single corrupted/oversized packet or a transient pipeline hiccup
+        // must not propagate -- on the transport's receive thread that would
+        // mean permanent video loss for the rest of the session (see
+        // docs/latency-optimization.md).
+        if let Err(e) = pushed {
+            warn!(error = ?e, "dropping video packet");
         }
     }
 }

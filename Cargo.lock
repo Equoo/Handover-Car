@@ -676,6 +676,7 @@ dependencies = [
  "gstreamer-video",
  "num-traits",
  "parking_lot",
+ "rkyv",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -748,6 +749,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
+ "if-addrs",
  "laminar",
  "parking_lot",
  "rkyv",
@@ -1944,6 +1946,16 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3437,6 +3449,7 @@ dependencies = [
  "anyhow",
  "common",
  "parking_lot",
+ "rkyv",
  "tokio",
  "tokio-serial",
  "tracing",
@@ -4000,6 +4013,7 @@ version = "1.21.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b672338555252d43fd2240c714dc444b8c6fb0a5c5335e65a07bba7742735ddb"
 dependencies = [
+ "getrandom 0.4.3",
  "js-sys",
  "wasm-bindgen",
 ]
