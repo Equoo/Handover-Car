@@ -1,0 +1,7 @@
+[Unit]
+Description=WWAN connectivity watchdog
+After=ModemManager.service wwan-connect.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/wwan-watchdog.sh

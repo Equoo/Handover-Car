@@ -1,147 +1,119 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
+use eframe::egui;
 use gstreamer as gst;
-use gstreamer::glib::object::ObjectExt;
 use gstreamer::prelude::*;
 use gstreamer::{Message, MessageView};
-use gtk::{Application, ApplicationWindow};
-use gtk::{Box as GtkBox, Label, Orientation, Overlay, prelude::*};
 use std::sync::Arc;
+use std::thread;
 use tracing::{error, info, warn};
 
 use crate::app::AppState;
-use crate::video::build_video;
+use crate::overlay::Overlay;
+use crate::video::{RawRtpUdp, VideoReceiver};
+use crate::input_handler::InputHandler;
 
-fn window_run(win: &ApplicationWindow, sink: &gst::Element, state: Arc<AppState>) {
-    let pipeline = build_video(sink, state.clone()).unwrap();
-
-    pipeline.set_state(gst::State::Playing).unwrap();
-
-    let bus = pipeline.bus().unwrap();
-    bus.add_watch(move |_, msg: &Message| {
-        match msg.view() {
-            MessageView::Error(err) => {
-                error!("GST ERROR: {} {:?}", err.error(), err.debug());
-            }
-            MessageView::Warning(w) => {
-                warn!("GST WARN: {}", w.error());
-            }
-            MessageView::StateChanged(s) => {
-                info!("State: {:?} -> {:?}", s.old(), s.current());
-            }
-            MessageView::Eos(_) => warn!("GST Receive EOS"),
-            _ => {}
-        }
-        glib::ControlFlow::Continue
-    })
-    .unwrap();
-
-    win.connect_close_request(move |_| {
-        pipeline.set_state(gstreamer::State::Null).unwrap();
-        glib::Propagation::Proceed
+/// eframe (winit) doesn't run a GLib main loop, but `bus.add_watch` below
+/// needs one somewhere to actually dispatch its callback -- GTK used to
+/// provide that for free via `Application::run()`. Spawned once and left
+/// running for the process lifetime; nothing else in this app needs GLib's
+/// loop directly.
+fn spawn_glib_main_loop() {
+    thread::spawn(|| {
+        glib::MainLoop::new(None, false).run();
     });
 }
 
-pub fn build(app: &Application, state: Arc<AppState>) -> Result<()> {
-    let window = ApplicationWindow::builder()
-        .application(app)
-        .title("Rc car client")
-        .default_width(1280)
-        .default_height(720)
-        .build();
+pub struct App {
+    state: Arc<AppState>,
+    pipeline: gst::Pipeline,
+    texture: Option<egui::TextureHandle>,
+    overlay: Overlay,
+    // Dropping this removes the bus watch and silently kills GST logging,
+    // so it has to live as long as the app does.
+    _bus_watch: gst::bus::BusWatchGuard,
+    input_handler: InputHandler,
+}
 
-    let sink = gst::ElementFactory::make("gtk4paintablesink").build()?;
-    sink.set_property("sync", false);
-    sink.set_property("async", false);
-    sink.set_property("qos", true);
-    let paintable: gtk::gdk::Paintable = sink.property("paintable");
-    let picture = gtk::Picture::for_paintable(&paintable);
+impl App {
+    pub fn new(cc: &eframe::CreationContext<'_>, state: Arc<AppState>) -> Result<Self> {
+        // Read by the appsink callback in `video.rs` to request a repaint
+        // the moment a new frame lands.
+        state
+            .egui_ctx
+            .set(cc.egui_ctx.clone())
+            .map_err(|_| anyhow::anyhow!("egui context already set"))?;
 
-    {
-        let overlay = Overlay::new();
-        let stats_box = GtkBox::new(Orientation::Vertical, 5);
-        stats_box.set_halign(gtk::Align::End);
-        stats_box.set_valign(gtk::Align::Start);
-        stats_box.set_margin_top(10);
-        stats_box.set_margin_end(10);
+        spawn_glib_main_loop();
 
-        let fps_label = Label::new(Some("FPS: --"));
-        let decode_label = Label::new(Some("Decode latency: --"));
-        let client_label = Label::new(Some("client ping: --"));
-        let slave_label = Label::new(Some("Slave ping: --"));
-        let loss_label = Label::new(Some(""));
-        let bitrate_label = Label::new(Some("Bitrate: --"));
+        let (pipeline, appsrc) = RawRtpUdp::build_pipeline(state.clone())?;
+        pipeline.set_state(gst::State::Playing)?;
+        *state.appsrc.lock() = Some(appsrc);
 
-        stats_box.append(&fps_label);
-        stats_box.append(&slave_label);
-        stats_box.append(&client_label);
-        stats_box.append(&decode_label);
-        stats_box.append(&loss_label);
-        stats_box.append(&bitrate_label);
-
-        let css_provider = gtk::CssProvider::new();
-        css_provider.load_from_data(
-            "box {
-                background-color: rgba(0, 0, 0, 0.7);
-                border-radius: 10px;
-                padding: 15px;
+        let bus = pipeline.bus().context("pipeline has no bus")?;
+        let bus_watch = bus.add_watch(move |_, msg: &Message| {
+            match msg.view() {
+                MessageView::Error(err) => {
+                    error!("GST ERROR: {} {:?}", err.error(), err.debug());
+                }
+                MessageView::Warning(w) => {
+                    warn!("GST WARN: {} (src: {:?}, dbg: {:?})",
+                          w.error(),
+                          msg.src().map(|s| s.name()),
+                          w.debug());
+                }
+                MessageView::StateChanged(s) => {
+                    info!("State: {:?} -> {:?}", s.old(), s.current());
+                }
+                MessageView::Eos(_) => warn!("GST Receive EOS"),
+                _ => {}
             }
-            label {
-                color: white;
-                font-size: 16px;
-                font-weight: bold;
-                font-family: monospace;
-            }",
-        );
-
-        gtk::style_context_add_provider_for_display(
-            &gdk::Display::default().unwrap(),
-            &css_provider,
-            gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
-        );
-        overlay.add_overlay(&stats_box);
-        overlay.set_child(Some(&picture));
-
-        window.set_child(Some(&overlay));
-
-        let bitrate_clone = bitrate_label.clone();
-        let decode_clone = decode_label.clone();
-        let slave_clone = slave_label.clone();
-        let loss_clone = loss_label.clone();
-        let client_clone = client_label.clone();
-        let state_clone = state.clone();
-        glib::timeout_add_local(std::time::Duration::from_millis(100), move || {
-            // fps_label_clone.set_text(&format!("FPS: {:.1}", stats.fps));
-            bitrate_clone.set_text(&format!("Bitrate: {}", *state_clone.bitrate.lock()));
-            decode_clone.set_text(&format!(
-                "Decode latency: {:.3}ms",
-                *state_clone.decode_latency.lock()
-            ));
-            slave_clone.set_text(&format!(
-                "Slave ping: {}ms",
-                *state_clone.slave_latency.lock()
-            ));
-            client_clone.set_text(&format!(
-                "Client ping: {}ms",
-                *state_clone.client_latency.lock()
-            ));
-            {
-                let loss = state_clone.loss.lock();
-                loss_clone.set_text(&format!(
-                    "RTP loss: {}/{} ({:.1}%)",
-                    loss.num_lost,
-                    loss.num_lost + loss.num_pushed,
-                    loss.loss_pct
-                ));
-            }
-            // bitrate_label_clone.set_text(&format!(
-            //     "Bitrate: {:.1} Mbps",
-            //     stats.bitrate as f64 / 1_000_000.0
-            // ));
             glib::ControlFlow::Continue
-        });
+        })?;
+
+        Ok(Self {
+            state,
+            pipeline,
+            texture: None,
+            overlay: Overlay::new(),
+            _bus_watch: bus_watch,
+            input_handler: InputHandler::new(),
+        })
+    }
+}
+
+impl eframe::App for App {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(image) = self.state.latest_frame.lock().take() {
+            match &mut self.texture {
+                Some(tex) => tex.set(image, egui::TextureOptions::LINEAR),
+                None => {
+                    self.texture =
+                        Some(ctx.load_texture("video", image, egui::TextureOptions::LINEAR));
+                }
+            }
+        }
+
+        self.input_handler.update(self.state.clone());
+
+        egui::CentralPanel::default()
+            .frame(egui::Frame::none())
+            .show(ctx, |ui| {
+                let available = ui.available_size();
+                match &self.texture {
+                    Some(tex) => {
+                        ui.add(egui::Image::new(tex).fit_to_exact_size(available));
+                    }
+                    None => {
+                        ui.centered_and_justified(|ui| ui.label("Waiting for video..."));
+                    }
+                }
+
+            });
+
+        self.overlay.draw(ctx, &self.state);
     }
 
-    window.connect_realize(move |win| window_run(win, &sink, state.clone()));
-    window.present();
-    Ok(())
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        let _ = self.pipeline.set_state(gst::State::Null);
+    }
 }

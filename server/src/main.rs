@@ -1,34 +1,39 @@
-use std::process::{Child, Command, Stdio};
-use std::time::{Duration, SystemTime};
-use std::{collections::HashMap, env, net::SocketAddr, str::FromStr, sync::Arc};
+use std::{collections::HashMap, env, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result, bail};
 
-use common::{ArchivedMessage, CommonError, Message, PacketType, Socket, SocketEvent};
+use common::{
+    ArchivedClientMessage, ArchivedMessage, ArchivedPilotCommand, ArchivedSlaveMessage,
+    CommonError, Message, PacketType, PilotCommand, ServerToClient, ServerToSlave, Socket,
+    SocketEvent, VideoMode,
+};
 use parking_lot::Mutex;
-use rkyv::{Archived, api::low::deserialize, rancor::Error};
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::{net::UdpSocket, task::AbortHandle, time::Instant};
-use tracing::{debug, error, field::debug, info, level_filters::LevelFilter, warn};
+use tracing::{debug, error, info, level_filters::LevelFilter, warn};
 use uuid::Uuid;
 
 const SLAVES_LIMIT: u8 = 16;
 const MAIN_PORT: u16 = 9500;
-const IN_VIDEO_PORT: u16 = 9600; // - 9616
-const OUT_VIDEO_PORT: u16 = 9700; // - 9716
-const AUDIO_PORT: u16 = 9800; // - 9816
+const VIDEO_PORT: u16 = 9600; // - 9616
+const AUDIO_PORT: u16 = 9700; // - 9716
 
 struct Slave {
     name: String,
     uniqueid: u8,
     last_addr: SocketAddr,
-    last_ping: SystemTime,
+    last_seen: Instant,
     latency: u16,
     bitrate: u32,
-    video_relay: Child,
-    // audio_thread: AbortHandle,
+    fec_pct: u8,
+    video_thread: AbortHandle,
+    audio_thread: AbortHandle,
     subscriber: Uuid,
 }
+
+/// How long a slave can go without a `SlaveAnnounce` (sent every 100ms)
+/// before the server treats it as gone and frees its slot.
+const SLAVE_EXPIRY: Duration = Duration::from_secs(5);
 
 struct Client {
     uuid: Uuid,
@@ -72,16 +77,27 @@ impl AppState {
 
     async fn new_pipesocket(self: Arc<AppState>, port: u16, id: String) -> Result<AbortHandle> {
         debug!("New pipesocket on port {port} for {id}");
+        let socket = UdpSocket::bind(format!("0.0.0.0:{port}"))
+            .await
+            .with_context(|| format!("failed to bind pipesocket on port {port} for {id}"))?;
+
         Ok(tokio::spawn(async move {
-            let socket = UdpSocket::bind(format!("0.0.0.0:{port}")).await.unwrap();
             let mut last_addr: Option<SocketAddr> = None;
+            let mut buf = [0; 1 << 18];
             loop {
-                let mut buf = [0; 1 << 18];
-                let (size, addr) = socket.recv_from(&mut buf).await.unwrap();
+                let (size, addr) = match socket.recv_from(&mut buf).await {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!(error = ?e, "pipesocket {port} recv failed for {id}, dropping packet");
+                        continue;
+                    }
+                };
 
                 if size != 1 {
-                    if let Some(addr) = last_addr {
-                        socket.send_to(&buf[..size], addr).await.unwrap();
+                    if let Some(addr) = last_addr
+                        && let Err(e) = socket.send_to(&buf[..size], addr).await
+                    {
+                        warn!(error = ?e, "pipesocket {port} relay to {addr} failed for {id}");
                     }
                 } else {
                     last_addr = Some(addr);
@@ -103,15 +119,18 @@ impl AppState {
         }
 
         let uniqueid = self.uniqueid();
-        let video_port_a = IN_VIDEO_PORT + uniqueid as u16;
-        let video_port_b = OUT_VIDEO_PORT + uniqueid as u16;
+        self.usedids.lock()[uniqueid as usize] = true;
+        *self.slaves_count.lock() += 1;
 
-        let video_relay = Command::new("srt-live-transmit")
-            .arg(format!("srt://0.0.0.0:{video_port_a}?mode=listener"))
-            .arg(format!("srt://0.0.0.0:{video_port_b}?mode=listener"))
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .spawn()?;
+        let video_thread = self
+            .clone()
+            .new_pipesocket(VIDEO_PORT + uniqueid as u16, id.clone())
+            .await?;
+
+        let audio_thread = self
+            .clone()
+            .new_pipesocket(AUDIO_PORT + uniqueid as u16, id.clone())
+            .await?;
 
         self.slaves.lock().await.insert(
             id.clone(),
@@ -119,43 +138,50 @@ impl AppState {
                 name: id,
                 uniqueid,
                 last_addr: addr,
-                last_ping: SystemTime::now(),
+                last_seen: Instant::now(),
                 latency,
-                video_relay,
+                video_thread,
+                audio_thread,
                 bitrate: 1000000,
+                fec_pct: 0,
                 subscriber: Uuid::nil(),
             },
         );
 
-        Ok((video_port_a, AUDIO_PORT + uniqueid as u16))
+        Ok((VIDEO_PORT + uniqueid as u16, AUDIO_PORT + uniqueid as u16))
     }
 
-    async fn handle_messages(
+    async fn handle_slave_message(
         self: &Arc<AppState>,
         addr: SocketAddr,
-        msg: &ArchivedMessage,
+        msg: &ArchivedSlaveMessage,
     ) -> Result<()> {
         match msg {
-            ArchivedMessage::SlaveAnnounce {
+            ArchivedSlaveMessage::Announce {
                 id,
                 latency,
                 packet_id,
             } => {
                 let id = id.as_str().to_string();
                 let mut bitrate: u32 = 1000000;
+                let mut fec_pct: u8 = 0;
 
                 if let Some(slave) = self.slaves.lock().await.get_mut(&id) {
                     slave.latency = latency.into();
                     bitrate = slave.bitrate;
-
-                    slave.last_ping = SystemTime::now();
+                    fec_pct = slave.fec_pct;
+                    // Cellular NAT rebinds, so the address a slave announces
+                    // from changes. Anything we push to it must use the
+                    // latest one, not the one it first connected with.
+                    slave.last_addr = addr;
+                    slave.last_seen = Instant::now();
                 } else {
                     if *self.slaves_count.lock() == SLAVES_LIMIT {
                         self.socket.send(
                             &addr,
-                            &Message::ServerError {
+                            &Message::ToSlave(ServerToSlave::Error {
                                 err: CommonError::SlaveLimit,
-                            },
+                            }),
                             PacketType::Reliable,
                         )?;
                     }
@@ -167,10 +193,10 @@ impl AppState {
 
                     self.socket.send(
                         &addr,
-                        &Message::ServerSlaveConnected {
-                            video_port,
+                        &Message::ToSlave(ServerToSlave::Connected {
+                            video: VideoMode::RawRtpUdp { video_port },
                             audio_port,
-                        },
+                        }),
                         PacketType::Reliable,
                     )?;
 
@@ -179,14 +205,50 @@ impl AppState {
 
                 self.socket.send(
                     &addr,
-                    &Message::ServerPong {
+                    &Message::ToSlave(ServerToSlave::Pong {
                         packet_id: packet_id.into(),
                         bitrate,
-                    },
+                        fec_pct,
+                    }),
                     PacketType::Unreliable,
                 )?;
             }
-            ArchivedMessage::MasterSubscribe { slave_id } => {
+            ArchivedSlaveMessage::Stats {
+                id,
+                capture_latency_ms,
+                encode_latency_ms,
+                total_latency_ms,
+                bitrate_bps,
+            } => {
+                if let Some(slave) = self.slaves.lock().await.get(id.as_ref())
+                    && let Some(client) = self.clients.lock().await.get(&slave.subscriber)
+                {
+                    self.socket.send(
+                        &client.addr,
+                        &Message::ToClient(ServerToClient::SlaveStats {
+                            capture_latency_ms: capture_latency_ms.into(),
+                            encode_latency_ms: encode_latency_ms.into(),
+                            total_latency_ms: total_latency_ms.into(),
+                            bitrate_bps: bitrate_bps.into(),
+                        }),
+                        PacketType::Unreliable,
+                    )?;
+                }
+            }
+            // Not wired up to anything yet on the receiving end.
+            ArchivedSlaveMessage::Error { .. } | ArchivedSlaveMessage::Location { .. } => {}
+        }
+
+        Ok(())
+    }
+
+    async fn handle_client_message(
+        self: &Arc<AppState>,
+        addr: SocketAddr,
+        msg: &ArchivedClientMessage,
+    ) -> Result<()> {
+        match msg {
+            ArchivedClientMessage::Subscribe { slave_id } => {
                 let id = Uuid::from_u128_le(self.starttime.elapsed().as_millis());
                 let cl = Client {
                     uuid: id,
@@ -202,88 +264,99 @@ impl AppState {
 
                     self.socket.send(
                         &addr,
-                        &Message::ServerClientConnected {
+                        &Message::ToClient(ServerToClient::Connected {
                             uuid: id.to_string(),
-                            video_port: OUT_VIDEO_PORT + slave.uniqueid as u16,
+                            video: VideoMode::RawRtpUdp {
+                                video_port: VIDEO_PORT + slave.uniqueid as u16,
+                            },
                             audio_port: AUDIO_PORT + slave.uniqueid as u16,
-                        },
+                        }),
                         PacketType::Reliable,
                     )?;
 
                     info!("{addr} connected and suscribed to {slave_id}");
                 }
             }
-            ArchivedMessage::MasterInput {
-                slave_id,
-                throttle: _,
-                steering: _,
-            } => {
-                if let Some(slave) = self.slaves.lock().await.get(slave_id.as_ref())
-                    && let Some(client) = self.clients.lock().await.get(&slave.subscriber)
-                {
-                    self.socket.send(
-                        &client.addr,
-                        &deserialize::<Message, Error>(msg)?, // Note: This is really ugly
+            ArchivedClientMessage::Pilot { slave_id, cmd } => {
+                let slave_addr = self
+                    .slaves
+                    .lock()
+                    .await
+                    .get(slave_id.as_ref())
+                    .map(|s| s.last_addr);
+
+                let Some(slave_addr) = slave_addr else {
+                    return Ok(());
+                };
+
+                // Forwarded to the car -- the server never inspects the
+                // payload beyond picking a packet type for it.
+                let (cmd, packet_type) = match cmd {
+                    ArchivedPilotCommand::Input { throttle, steering } => (
+                        PilotCommand::Input {
+                            throttle: throttle.into(),
+                            steering: steering.into(),
+                        },
                         PacketType::Unreliable,
-                    )?;
-                }
+                    ),
+                    ArchivedPilotCommand::KeyframeRequest => {
+                        debug!("Keyframe requested for {slave_id}");
+                        (PilotCommand::KeyframeRequest, PacketType::Reliable)
+                    }
+                };
+
+                self.socket.send(
+                    &slave_addr,
+                    &Message::ToSlave(ServerToSlave::Pilot(cmd)),
+                    packet_type,
+                )?;
             }
-            ArchivedMessage::MasterAnnounce {
+            ArchivedClientMessage::Announce {
                 uuid,
                 packet_id,
                 bitrate,
+                fec_pct,
             } => {
+                let clients = self.clients.lock().await;
+                let Some(client) = clients.get(&Uuid::from_str(uuid)?) else {
+                    // Unknown uuid -- most likely the server restarted and
+                    // lost this client's registration. Staying silent (rather
+                    // than replying with a hollow pong) lets the client
+                    // detect the gap and resubscribe.
+                    return Ok(());
+                };
+
                 let mut latency: u16 = 0;
-                if let Some(client) = self.clients.lock().await.get(&Uuid::from_str(uuid)?)
-                    && let Some(slave) = self.slaves.lock().await.get_mut(&client.subscribe)
-                {
+                if let Some(slave) = self.slaves.lock().await.get_mut(&client.subscribe) {
                     slave.bitrate = bitrate.into();
+                    slave.fec_pct = (*fec_pct).into();
                     latency = slave.latency;
                 }
                 self.socket.send(
                     &addr,
-                    &Message::ServerClientPong {
+                    &Message::ToClient(ServerToClient::Pong {
                         latency,
                         packet_id: packet_id.into(),
-                    },
+                    }),
                     PacketType::Unreliable,
                 )?;
             }
-            _ => {}
-        };
+        }
 
         Ok(())
     }
 
-    async fn ping_check(self: &Arc<AppState>) -> Result<()> {
-        let now = SystemTime::now();
-
-        let expired_keys: Vec<_> = {
-            let mut slaves = self.slaves.lock().await;
-            slaves
-                .iter_mut()
-                .filter(|(_, slave)| {
-                    now.duration_since(slave.last_ping)
-                        .map(|d| d > Duration::from_secs(1))
-                        .unwrap_or(false)
-                })
-                .map(|(key, slave)| {
-                    let _ = slave.video_relay.kill();
-                    let _ = slave.video_relay.wait();
-
-                    key.clone()
-                })
-                .collect()
-        };
-
-        if !expired_keys.is_empty() {
-            let mut slaves = self.slaves.lock().await;
-            for key in expired_keys {
-                info!("Lost connection with slave '{key}'");
-                slaves.remove(&key);
-            }
+    async fn handle_messages(
+        self: &Arc<AppState>,
+        addr: SocketAddr,
+        msg: &ArchivedMessage,
+    ) -> Result<()> {
+        match msg {
+            ArchivedMessage::Slave(msg) => self.handle_slave_message(addr, msg).await,
+            ArchivedMessage::Client(msg) => self.handle_client_message(addr, msg).await,
+            // The server only ever sends these, never receives them.
+            ArchivedMessage::ToSlave(_) | ArchivedMessage::ToClient(_) => Ok(()),
         }
-        Ok(())
     }
 
     async fn fetch_packets(self: &Arc<AppState>) -> Result<()> {
@@ -304,10 +377,30 @@ impl AppState {
                 self.handle_messages(packet.addr(), msg).await?;
             }
         }
-
-        self.ping_check().await?;
-
         Ok(())
+    }
+
+    /// Drops slaves that have gone quiet for longer than `SLAVE_EXPIRY`,
+    /// freeing their id slot and stopping their video relay task. Without
+    /// this a slave that drops off the network for good keeps its slot (and
+    /// a pipesocket task relaying to nobody) forever.
+    async fn sweep_stale_slaves(self: &Arc<AppState>) {
+        let mut slaves = self.slaves.lock().await;
+        let stale: Vec<String> = slaves
+            .iter()
+            .filter(|(_, s)| s.last_seen.elapsed() > SLAVE_EXPIRY)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        for id in stale {
+            if let Some(slave) = slaves.remove(&id) {
+                warn!("Slave '{id}' timed out, freeing slot {}", slave.uniqueid);
+                slave.video_thread.abort();
+                slave.audio_thread.abort();
+                self.usedids.lock()[slave.uniqueid as usize] = false;
+                *self.slaves_count.lock() -= 1;
+            }
+        }
     }
 }
 
@@ -315,6 +408,15 @@ async fn run() -> Result<()> {
     let state = Arc::new(AppState::new()?);
 
     info!("Listening on 0.0.0.0:{MAIN_PORT}.");
+
+    let sweep_state = state.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(1));
+        loop {
+            interval.tick().await;
+            sweep_state.sweep_stale_slaves().await;
+        }
+    });
 
     // let state_clone = state.clone();
     // let receive_thread = tokio::spawn(async move {
@@ -335,10 +437,9 @@ async fn run() -> Result<()> {
     // });
 
     loop {
-        state
-            .fetch_packets()
-            .await
-            .context("packets fetching failed")?;
+        if let Err(e) = state.fetch_packets().await {
+            error!(error = ?e, "packet fetching failed, dropping packet");
+        }
     }
     // let _ = tokio::try_join!(setup_thread, announce_thread, receive_thread)?;
     // Ok(())

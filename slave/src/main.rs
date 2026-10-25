@@ -1,6 +1,5 @@
 use anyhow::Context;
 use anyhow::Result;
-use anyhow::bail;
 use common::PacketType;
 use common::asyncqueue::AsyncQueue;
 use parking_lot::Mutex;
@@ -12,10 +11,8 @@ use std::net::ToSocketAddrs;
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex as AsyncMutex;
-use tokio::time::Instant;
 use tokio::time::sleep;
 use tokio::time::timeout;
 use tokio_serial::SerialPortBuilderExt;
@@ -26,10 +23,16 @@ use tracing::info;
 use tracing::level_filters::LevelFilter;
 use tracing::warn;
 
-use common::{ArchivedMessage, Message, Socket, SocketEvent};
+use common::link::PingTracker;
+use common::{
+    ArchivedMessage, ArchivedPilotCommand, ArchivedServerToSlave, ArchivedVideoMode, Message,
+    SlaveMessage, Socket, SocketEvent, VideoMode,
+};
 
+mod audio;
 mod media;
-use crate::media::Media;
+use crate::audio::AudioSource;
+use crate::media::{RawRtpUdp, StreamerStats, VideoSource};
 
 const SERVER: &str = "server:9500";
 const SERIAL_PORT: &str = "/dev/ttyUSB0";
@@ -41,11 +44,14 @@ struct AppState {
     server: SocketAddr,
     queue: AsyncQueue<()>,
     serial: AsyncMutex<Option<SerialStream>>,
-    media: Mutex<Option<Media>>,
+    // Async mutex: `request_keyframe`/`set_bitrate` are async trait calls
+    // made while holding this, which a sync `parking_lot::Mutex` guard
+    // can't safely straddle.
+    media: AsyncMutex<Option<RawRtpUdp>>,
+    audio: Mutex<Option<AudioSource>>,
     connected: Mutex<bool>,
     latency: Mutex<Duration>,
-    last_ping: Mutex<Instant>,
-    announce_id: Mutex<u16>,
+    ping: PingTracker,
 }
 
 impl AppState {
@@ -70,11 +76,11 @@ impl AppState {
             server,
             queue,
             serial: AsyncMutex::new(None),
-            media: Mutex::new(None),
+            media: AsyncMutex::new(None),
+            audio: Mutex::new(None),
             connected: Mutex::new(false),
             latency: Mutex::new(Duration::from_secs(0)),
-            last_ping: Mutex::new(Instant::now()),
-            announce_id: Mutex::new(0),
+            ping: PingTracker::new(),
         })
     }
 
@@ -93,30 +99,52 @@ impl AppState {
         Ok(())
     }
 
-    fn setup_media(self: Arc<AppState>, video_port: u16, audio_port: u16) -> Result<()> {
+    fn setup_media(self: Arc<AppState>, mode: VideoMode) -> Result<()> {
         let state = self.clone();
         self.queue.submit(async move {
-            info!("Is ");
+            let stats_state = state.clone();
             if let Ok(media) = state
                 .retry("media setup", u32::MAX, Duration::from_secs(3), || {
                     debug!("Trying to setup MEDIA");
-                    Media::start_stream(video_port, audio_port)
+                    let stats_state = stats_state.clone();
+                    RawRtpUdp::start(&mode, stats_state.server.ip(), move |stats: StreamerStats| {
+                        let _ = stats_state.socket.send(
+                            &stats_state.server,
+                            &Message::Slave(SlaveMessage::Stats {
+                                id: stats_state.id.clone(),
+                                capture_latency_ms: stats.capture_latency_ms,
+                                encode_latency_ms: stats.encode_latency_ms,
+                                total_latency_ms: stats.total_latency_ms,
+                                bitrate_bps: stats.bitrate_bps,
+                            }),
+                            PacketType::Unreliable,
+                        );
+                    })
                 })
                 .await
             {
-                *state.media.lock() = Some(media);
+                *state.media.lock().await = Some(media);
             }
         });
         Ok(())
     }
 
+    /// Start audio streaming (best-effort, no retry).
+    /// Audio is independent from video: failures are logged but don't affect video.
+    fn setup_audio(&self, audio_port: u16) {
+        let audio = AudioSource::start(self.server.ip(), audio_port);
+        *self.audio.lock() = audio;
+    }
+
     async fn handle_messages(self: Arc<AppState>, msg: &ArchivedMessage) -> Result<()> {
+        let ArchivedMessage::ToSlave(msg) = msg else {
+            // A slave only ever legitimately receives messages addressed to it.
+            return Ok(());
+        };
+
         match msg {
-            ArchivedMessage::MasterInput {
-                slave_id: _,
-                throttle,
-                steering,
-            } => {
+            ArchivedServerToSlave::Pilot(ArchivedPilotCommand::Input { throttle, steering }) => {
+                debug!("received pilot {} {}", throttle, steering);
                 let line = format!("{:} {:}\n", steering, throttle);
                 let bytes = line.as_bytes();
 
@@ -126,28 +154,43 @@ impl AppState {
                 }
             }
 
-            ArchivedMessage::ServerSlaveConnected {
-                video_port,
-                audio_port,
-            } => {
+            ArchivedServerToSlave::Connected { video, audio_port } => {
                 if !*self.connected.lock() {
                     info!("We are connected !");
                     *self.connected.lock() = true;
-                    self.setup_media(video_port.into(), audio_port.into())?;
+                    let mode = match video {
+                        ArchivedVideoMode::RawRtpUdp { video_port } => VideoMode::RawRtpUdp {
+                            video_port: video_port.into(),
+                        },
+                    };
+                    // setup_audio before setup_media: latter takes ownership of self
+                    self.setup_audio(audio_port.into());
+                    self.setup_media(mode)?;
                 }
-                //     bail!("Connection to server failed caused by '{what}'");
             }
 
-            ArchivedMessage::ServerPong { packet_id, bitrate } => {
-                let packet_id: u16 = packet_id.into();
-                if packet_id == *self.announce_id.lock() {
-                    *self.latency.lock() = self.last_ping.lock().elapsed();
-                }
-                if self.media.lock().is_some() {
-                    fs::write("/tmp/streamer_ctrl", format!("{}\n", bitrate)).await?;
+            ArchivedServerToSlave::Pilot(ArchivedPilotCommand::KeyframeRequest) => {
+                if let Some(media) = self.media.lock().await.as_ref() {
+                    debug!("Keyframe requested by client");
+                    media.request_keyframe().await?;
                 }
             }
-            _ => {}
+
+            ArchivedServerToSlave::Pong {
+                packet_id,
+                bitrate,
+                fec_pct,
+            } => {
+                if let Some(rtt) = self.ping.note_pong(packet_id.into()) {
+                    *self.latency.lock() = rtt;
+                }
+                if let Some(media) = self.media.lock().await.as_ref() {
+                    media.set_bitrate(bitrate.into()).await?;
+                    media.set_fec((*fec_pct).into()).await?;
+                }
+            }
+
+            ArchivedServerToSlave::Error { .. } => {}
         };
 
         Ok(())
@@ -179,31 +222,29 @@ impl AppState {
     }
 
     fn announce_loop(&self) -> Result<()> {
-        loop {
-            *self.last_ping.lock() = Instant::now();
-            *self.announce_id.lock() += 1;
-
-            self.socket.send(
-                &self.server,
-                &Message::SlaveAnnounce {
+        common::link::run_announce_loop(
+            &self.socket,
+            &self.server,
+            &self.ping,
+            Duration::from_millis(100),
+            |packet_id| {
+                Message::Slave(SlaveMessage::Announce {
                     id: self.id.clone(),
                     latency: self.latency.lock().as_millis() as u16,
-                    packet_id: *self.announce_id.lock(),
-                },
-                PacketType::Unreliable,
-            )?;
-
-            std::thread::sleep(Duration::from_millis(100));
-        }
+                    packet_id,
+                })
+            },
+            || {},
+        )
     }
 
     async fn send_err(&self, err: String) -> Result<()> {
         self.socket.send(
             &self.server,
-            &Message::SlaveError {
+            &Message::Slave(SlaveMessage::Error {
                 id: self.id.clone(),
                 err,
-            },
+            }),
             PacketType::Reliable,
         )
     }
@@ -246,18 +287,15 @@ async fn run() -> Result<()> {
 
     let state_clone = state.clone();
     let receive_thread = tokio::spawn(async move {
-        let mut res: Result<()>;
+        // A single malformed/unexpected packet must never take this loop
+        // down: on the car, that means losing the control link and the
+        // server connection with no way to recover short of a process
+        // restart, while a cellular blip is a certainty, not an edge case.
         loop {
-            res = state_clone
-                .clone()
-                .fetch_packets()
-                .await
-                .context("packets fetching failed");
-            if res.is_err() {
-                break;
+            if let Err(e) = state_clone.clone().fetch_packets().await {
+                error!(error = ?e, "packet fetching failed, dropping packet");
             }
         }
-        res
     });
 
     let state_clone = state.clone();

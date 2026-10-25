@@ -1,0 +1,12 @@
+[Unit]
+Description=WWAN connection via ModemManager
+After=ModemManager.service modem-disable-sleep.service
+Requires=ModemManager.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/wwan-connect.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
