@@ -5,6 +5,9 @@ use anyhow::{Context, Result};
 
 pub mod asyncqueue;
 pub mod link;
+pub mod transport;
+
+pub use transport::{Candidate, CandidateKind, Role, SessionToken, TransportConfig};
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
 #[rkyv(compare(PartialEq), derive(Debug))]
@@ -31,16 +34,29 @@ pub enum PilotCommand {
     KeyframeRequest,
 }
 
-/// How video gets from a car to a client, negotiated through the connect
-/// handshake rather than assumed by each binary independently. Only one mode
-/// is implemented today; this is the seam a second one (e.g. WebRTC) would
-/// plug into without touching the handshake shape again.
-#[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Clone, Copy)]
-#[rkyv(compare(PartialEq), derive(Debug))]
-pub enum VideoMode {
-    /// Raw RTP packets sent directly to the server's per-slave relay port,
-    /// which blindly forwards them to whichever client last subscribed.
-    RawRtpUdp { video_port: u16 },
+/// Wire form of `PilotCommand::Input` on the data plane, where it rides the
+/// same path-selected socket as video rather than the server-relayed control
+/// channel (`transport::channel::INPUT`).
+///
+/// Hand-rolled rather than rkyv: the payload lands at a one-byte offset into
+/// the receive buffer, past the channel tag, so an archived type's alignment
+/// requirement would not be met. Four fixed bytes need no alignment, no
+/// validation pass and no allocation, which suits a message sent every frame.
+pub fn encode_input(throttle: i16, steering: i16) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    out[..2].copy_from_slice(&throttle.to_be_bytes());
+    out[2..].copy_from_slice(&steering.to_be_bytes());
+    out
+}
+
+pub fn decode_input(bytes: &[u8]) -> Option<(i16, i16)> {
+    if bytes.len() < 4 {
+        return None;
+    }
+    Some((
+        i16::from_be_bytes([bytes[0], bytes[1]]),
+        i16::from_be_bytes([bytes[2], bytes[3]]),
+    ))
 }
 
 /// Sent by a car (slave) to the server.
@@ -51,6 +67,13 @@ pub enum SlaveMessage {
         id: String,
         latency: u16,
         packet_id: u16,
+    },
+    /// Addresses this car's data-plane socket might be reachable at, for the
+    /// server to pass on to its subscriber. Re-sent whenever the set changes
+    /// -- on cellular the public address moves on its own.
+    Candidates {
+        id: String,
+        candidates: Vec<Candidate>,
     },
     Error {
         id: String,
@@ -92,6 +115,12 @@ pub enum ClientMessage {
         slave_id: String,
         cmd: PilotCommand,
     },
+    /// This client's own data-plane candidates, forwarded to the car it is
+    /// subscribed to. Mirror of `SlaveMessage::Candidates`.
+    Candidates {
+        uuid: String,
+        candidates: Vec<Candidate>,
+    },
 }
 
 /// Sent by the server to a car (slave).
@@ -99,8 +128,14 @@ pub enum ClientMessage {
 #[rkyv(compare(PartialEq), derive(Debug))]
 pub enum ServerToSlave {
     Connected {
-        video: VideoMode,
-        audio_port: u16,
+        transport: TransportConfig,
+    },
+    /// The subscribed client's candidates. Arrives repeatedly, not once: both
+    /// sides republish whenever their address set changes, and a car that
+    /// misses the update keeps punching at an address the client's NAT no
+    /// longer maps.
+    PeerCandidates {
+        candidates: Vec<Candidate>,
     },
     Error {
         err: CommonError,
@@ -119,8 +154,11 @@ pub enum ServerToSlave {
 pub enum ServerToClient {
     Connected {
         uuid: String,
-        video: VideoMode,
-        audio_port: u16,
+        transport: TransportConfig,
+    },
+    /// The subscribed car's candidates. See `ServerToSlave::PeerCandidates`.
+    PeerCandidates {
+        candidates: Vec<Candidate>,
     },
     Pong {
         latency: u16,

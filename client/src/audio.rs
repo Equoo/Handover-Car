@@ -2,14 +2,14 @@ use anyhow::{Context, Result};
 use gstreamer::prelude::*;
 use gstreamer::{self as gst, MessageView};
 use gstreamer_app as gst_app;
-use std::net::IpAddr;
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tokio::net::UdpSocket;
-use tracing::{debug, error, info, warn};
+use tracing::{error, info, warn};
 
 /// Audio receiver state. Manages the GStreamer pipeline that decodes
 /// incoming Opus audio and plays it through the system audio output.
+///
+/// Packets are fed in by the transport's receive thread (see
+/// `AppState::setup_transport`), which shares one socket with video and pilot
+/// input -- there is no audio-specific socket or subscription any more.
 pub struct AudioState {
     pipeline: gst::Pipeline,
     appsrc: gst_app::AppSrc,
@@ -124,73 +124,5 @@ impl AudioState {
 impl Drop for AudioState {
     fn drop(&mut self) {
         let _ = self.pipeline.set_state(gst::State::Null);
-    }
-}
-
-/// Run the audio receiver loop. Connects to the server's audio pipesocket
-/// and pushes incoming RTP packets to the audio pipeline.
-pub async fn run_audio_receiver(
-    audio: Arc<AudioState>,
-    server_ip: IpAddr,
-    audio_port: u16,
-) -> Result<()> {
-    let socket = UdpSocket::bind("0.0.0.0:0").await?;
-    let subscribe_addr = format!("{server_ip}:{audio_port}");
-    debug!("Subscribing to audio at {subscribe_addr}");
-    socket.send_to(&[1], &subscribe_addr).await?;
-
-    // Resubscribe periodically like video does
-    let mut resubscribe = tokio::time::interval(Duration::from_secs(2));
-    resubscribe.tick().await;
-
-    // Silence has two very different causes -- nothing reaching us over the
-    // network, or a local pipeline that isn't rendering what it receives --
-    // and they need fixes at opposite ends of the link. Counting arrivals here
-    // is what tells them apart.
-    let mut received: u64 = 0;
-    let mut last_report = Instant::now();
-    let mut warned_silent = false;
-
-    let mut buffer = [0u8; 2048]; // Opus packets are small
-    loop {
-        tokio::select! {
-            _ = resubscribe.tick() => {
-                if let Err(e) = socket.send_to(&[1], &subscribe_addr).await {
-                    warn!(error = ?e, "audio resubscribe failed");
-                }
-
-                if received == 0 && !warned_silent && last_report.elapsed() > Duration::from_secs(5)
-                {
-                    warned_silent = true;
-                    warn!(
-                        "No audio packet received from {subscribe_addr} after 5s -- \
-                         the car isn't sending, or the server isn't relaying port {audio_port}"
-                    );
-                }
-            }
-            result = socket.recv_from(&mut buffer) => {
-                let (size, _) = match result {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(error = ?e, "audio recv failed, dropping packet");
-                        continue;
-                    }
-                };
-
-                if received == 0 {
-                    info!("First audio packet received ({size} bytes)");
-                }
-                received += 1;
-                if last_report.elapsed() > Duration::from_secs(10) {
-                    debug!("Audio: {received} packets received");
-                    last_report = Instant::now();
-                }
-
-                // Best-effort: log errors but don't kill the loop
-                if let Err(e) = audio.push_packet(&buffer[..size]) {
-                    warn!(error = ?e, "dropping audio packet");
-                }
-            }
-        }
     }
 }

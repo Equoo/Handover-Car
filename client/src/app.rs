@@ -1,13 +1,15 @@
 use anyhow::{Context, Result};
 use common::link::PingTracker;
+use common::transport::{Role, Transport, TransportConfig, channel};
 use common::{
-    ArchivedMessage, ArchivedServerToClient, ArchivedVideoMode, ClientMessage, Message, PacketType,
-    PilotCommand, Socket, SocketEvent, VideoMode,
+    ArchivedMessage, ArchivedServerToClient, Candidate, ClientMessage, Message, PacketType,
+    PilotCommand, Socket, SocketEvent,
 };
 use dotenv::dotenv;
 use egui::ColorImage;
 use gstreamer_app as gst_app;
 use parking_lot::Mutex;
+use rkyv::rancor::Error as RkyvError;
 use std::env;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
@@ -18,10 +20,10 @@ use tokio::time::Instant;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
-use crate::audio::{self, AudioState};
+use crate::audio::AudioState;
 use crate::latency_test::LatencyTest;
 use crate::stats::Stats;
-use crate::video::{RawRtpUdp, VideoReceiver};
+use crate::video::{RtpVideo, VideoReceiver};
 
 const SERVER_PORT: u16 = 9500;
 pub const SLAVE: &str = "FlashMcqueen";
@@ -56,6 +58,15 @@ pub struct AppState {
     connected: Mutex<bool>,
     /// Audio receiver state (best-effort, None if audio unavailable).
     audio: Option<Arc<AudioState>>,
+    /// The path-selected data plane carrying video, audio and pilot input.
+    /// `None` until the server's `Connected` hands over the relay port and
+    /// session token.
+    pub transport: Mutex<Option<Arc<Transport>>>,
+    /// Sequence number of the last video packet accepted, for the raw-wire
+    /// loss tracking in `video.rs`. Lives here rather than in the receive
+    /// loop because the transport's receive thread is shared by every
+    /// channel and owns no per-stream state of its own.
+    pub last_video_seq: Mutex<Option<u16>>,
 }
 
 impl AppState {
@@ -89,11 +100,9 @@ impl AppState {
             last_keyframe_request: Mutex::new(None),
             connected: Mutex::new(false),
             audio,
+            transport: Mutex::new(None),
+            last_video_seq: Mutex::new(None),
         })
-    }
-
-    pub fn sendmsg_to_server(&self, msg: &Message, typ: PacketType) -> Result<()> {
-        self.socket.send(&self.server, &msg, typ)
     }
 
     /// Ask the car's encoder for an IDR. Sent reliably: a dropped request
@@ -133,28 +142,79 @@ impl AppState {
         }
     }
 
-    /// Spawns the network-receive side of whichever `VideoReceiver` backend
-    /// handles `mode`. The pipeline itself (`RawRtpUdp::build_pipeline`) was
-    /// already built at window creation, before `mode` was known -- see
-    /// `video::VideoReceiver` for why.
-    fn start_video(self: Arc<AppState>, mode: VideoMode) {
-        tokio::spawn(async move {
-            if let Err(e) = RawRtpUdp::run(self.clone(), mode).await {
-                error!(error = ?e, "video receive loop failed");
-            }
-        });
+    /// Brings up the data plane: one socket carrying video, audio and pilot
+    /// input, pointed at whichever path is currently fastest.
+    ///
+    /// The decode pipelines were already built at window creation (see
+    /// `video::VideoReceiver`), so this only has to start feeding them. The
+    /// relay path works immediately, meaning video flows before any punching
+    /// has been attempted -- a direct path only ever takes over from something
+    /// already working.
+    fn setup_transport(self: &Arc<AppState>, config: TransportConfig) -> Result<()> {
+        let relay = SocketAddr::new(self.server.ip(), config.relay_port);
+
+        // A resubscribe re-delivers `Connected`, so this runs again on a link
+        // that is already up. Re-homing the existing socket keeps its threads,
+        // its NAT mapping and the decode pipelines feeding off it; rebinding
+        // would leak the old receive thread and start punching from scratch.
+        if let Some(transport) = self.transport.lock().as_ref() {
+            transport.reconfigure(relay, config.token);
+            return Ok(());
+        }
+
+        let transport = Transport::bind(Role::Client, relay, config.token)
+            .context("failed to bind the data-plane socket")?;
+
+        let dispatch_state = self.clone();
+        let candidate_state = self.clone();
+        transport.start(
+            move |tag, payload| match tag {
+                channel::VIDEO => RtpVideo::push_rtp(&dispatch_state, payload),
+                channel::AUDIO => {
+                    // Best-effort, as it has always been: a failing audio
+                    // pipeline must never disturb video.
+                    if let Some(audio) = &dispatch_state.audio
+                        && let Err(e) = audio.push_packet(payload)
+                    {
+                        warn!(error = ?e, "dropping audio packet");
+                    }
+                }
+                _ => {}
+            },
+            move |candidates| candidate_state.publish_candidates(candidates),
+        );
+
+        *self.transport.lock() = Some(transport);
+        Ok(())
     }
 
-    /// Start audio receiver (best-effort, independent from video).
-    fn start_audio(self: &Arc<AppState>, audio_port: u16) {
-        if let Some(audio) = &self.audio {
-            let audio = audio.clone();
-            let server_ip = self.server.ip();
-            tokio::spawn(async move {
-                if let Err(e) = audio::run_audio_receiver(audio, server_ip, audio_port).await {
-                    warn!(error = ?e, "audio receive loop failed (non-fatal)");
-                }
-            });
+    /// Tells the server where this client can be reached, for it to pass on
+    /// to the car. Sent reliably: a dropped candidate list is a direct path
+    /// that never gets tried, and the next send only happens if the address
+    /// set changes again.
+    fn publish_candidates(&self, candidates: Vec<Candidate>) {
+        debug!("Publishing {} candidate(s)", candidates.len());
+        if let Err(e) = self.socket.send(
+            &self.server,
+            &Message::Client(ClientMessage::Candidates {
+                uuid: self.uuid.lock().to_string(),
+                candidates,
+            }),
+            PacketType::Reliable,
+        ) {
+            warn!(error = ?e, "failed to publish candidates");
+        }
+    }
+
+    /// Sends a pilot set-point over the data plane, so it takes the same
+    /// (often direct) path as video instead of detouring through the server.
+    /// Silently dropped when the transport isn't up yet: the car's watchdog
+    /// treats a gap as "no command", which is the correct reading.
+    pub fn send_input(&self, throttle: i16, steering: i16) {
+        if let Some(transport) = self.transport.lock().as_ref()
+            && let Err(e) = transport.send(channel::INPUT, &common::encode_input(throttle, steering))
+        {
+            warn!(error = ?e, "failed to send pilot input");
         }
     }
 
@@ -306,6 +366,26 @@ impl AppState {
         }
     }
 
+    /// Mirrors the transport's current path into `Stats` for the overlay.
+    /// Polled rather than pushed so the transport stays free of any dependency
+    /// on the client's stats types, and because a label that updates four
+    /// times a second is as live as a human can read.
+    async fn poll_path(self: Arc<AppState>) {
+        let mut interval = tokio::time::interval(Duration::from_millis(250));
+        loop {
+            interval.tick().await;
+            let snapshot = self
+                .transport
+                .lock()
+                .as_ref()
+                .map(|t| (t.route_label(), t.rtt_ms()));
+            if let Some((label, rtt)) = snapshot {
+                *self.stats.path.lock() = label;
+                *self.stats.path_rtt_ms.lock() = rtt;
+            }
+        }
+    }
+
     async fn handle_messages(
         self: &Arc<AppState>,
         _addr: SocketAddr,
@@ -317,23 +397,15 @@ impl AppState {
         };
 
         match msg {
-            ArchivedServerToClient::Connected {
-                uuid,
-                video,
-                audio_port,
-            } => {
+            ArchivedServerToClient::Connected { uuid, transport } => {
                 info!("Connected to the server");
                 *self.uuid.lock() = Uuid::from_str(uuid)?;
                 *self.last_pong.lock() = Instant::now();
                 self.stats.mark_connected();
 
-                let mode = match video {
-                    ArchivedVideoMode::RawRtpUdp { video_port } => VideoMode::RawRtpUdp {
-                        video_port: video_port.into(),
-                    },
-                };
-                self.clone().start_video(mode);
-                self.start_audio(audio_port.into());
+                let config: TransportConfig = rkyv::deserialize::<_, RkyvError>(transport)
+                    .context("failed to deserialize the transport config")?;
+                self.setup_transport(config)?;
 
                 // The stream is already running and its opening IDR is long
                 // gone, so without this we would decode nothing until the GOP
@@ -353,6 +425,16 @@ impl AppState {
                     tokio::spawn(async move { state_clone.announce_loop() });
                     let state_clone = self.clone();
                     tokio::spawn(async move { state_clone.run_adaptive().await });
+                    let state_clone = self.clone();
+                    tokio::spawn(async move { state_clone.poll_path().await });
+                }
+            }
+
+            ArchivedServerToClient::PeerCandidates { candidates } => {
+                let candidates: Vec<Candidate> = rkyv::deserialize::<_, RkyvError>(candidates)
+                    .context("failed to deserialize peer candidates")?;
+                if let Some(transport) = self.transport.lock().as_ref() {
+                    transport.set_peer_candidates(&candidates);
                 }
             }
             ArchivedServerToClient::Pong { latency, packet_id } => {
