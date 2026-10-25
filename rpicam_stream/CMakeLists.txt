@@ -4,6 +4,19 @@ project(streamer CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Without CMAKE_BUILD_TYPE, CMake passes no -O flag at all -- i.e. -O0. That is
+# not a neutral default here: the capture callback memcpy's a full YUV420 frame
+# (518 KB at 720x480) into the encoder queue on every frame, and on a Pi 4 an
+# unoptimised build spends that time out of the frame period. Default to
+# Release; an explicit -DCMAKE_BUILD_TYPE=<type> on the command line still wins.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING
+        "Build type (Debug, Release, RelWithDebInfo, MinSizeRel)" FORCE)
+    set_property(CACHE CMAKE_BUILD_TYPE PROPERTY STRINGS
+        Debug Release RelWithDebInfo MinSizeRel)
+endif()
+message(STATUS "streamer build type: ${CMAKE_BUILD_TYPE}")
+
 find_package(PkgConfig REQUIRED)
 
 pkg_check_modules(GST      REQUIRED gstreamer-1.0)

@@ -1,19 +1,23 @@
-
-use std::sync::Arc;
-use std::{env, thread};
+use std::env;
 use std::str::FromStr;
+use std::sync::Arc;
 
-use gtk::prelude::*;
-use gtk::{Application, ApplicationWindow};
-use anyhow::{Context, Result, bail};
-use tracing::{error, info, warn};
+use anyhow::Result;
+use tracing::error;
 use tracing::level_filters::LevelFilter;
 
 use crate::app::AppState;
 
 mod app;
+mod audio;
+mod charts;
+mod latency_test;
+mod metrics;
+mod overlay;
+mod stats;
 mod ui;
 mod video;
+mod input_handler;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -23,44 +27,36 @@ async fn main() -> Result<()> {
         )
         .init();
 
-    gtk::init().unwrap();
-    gstreamer::init().unwrap();
+    gstreamer::init()?;
 
-    let app = Application::builder()
-        .application_id("com.rc.client")
-        .build();
+    let state = Arc::new(AppState::new()?);
 
-
-    // let (tx, mut rx) = mpsc::channel::<AppEvent>(32);
-    let state = Arc::new(AppState::new().unwrap());
-
-    // let tx_clone = tx.clone();
+    // Networking/control logic runs on tokio, independent of the UI's own
+    // (winit-driven) event loop below.
     let state_clone = state.clone();
-    app.connect_activate(move |app| {
-        if let Err(e) = ui::build(app, state_clone.clone()) { // , tx_clone.clone()
-            error!(error = ?e, "ui building fatal error");
-            app.quit();
-        }
-    });
-
-    // Spawn tokio task for async work (networking, controls, etc.)
     tokio::spawn(async move {
-        if let Err(e) = app::run(state).await {
+        if let Err(e) = app::run(state_clone).await {
             error!(error = ?e, "fatal error");
-            // app_clone.quit();
         }
-        // while let Some(event) = rx.recv().await {
-        //     match event {
-        //         AppEvent::FrameStats { latency_ms } => {
-        //             info!("latency: {}ms", latency_ms);
-        //         }
-        //         AppEvent::Error(e) => {
-        //             error!("async error: {}", e);
-        //         }
-        //     }
-        // }
     });
 
-    app.run();
+    let native_options = eframe::NativeOptions {
+        viewport: eframe::egui::ViewportBuilder::default().with_inner_size([1280.0, 720.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "Rc car client",
+        native_options,
+        Box::new(move |cc| match ui::App::new(cc, state) {
+            Ok(app) => Ok(Box::new(app) as Box<dyn eframe::App>),
+            Err(e) => {
+                error!(error = ?e, "ui building fatal error");
+                Err(format!("{e:?}").into())
+            }
+        }),
+    )
+    .map_err(|e| anyhow::anyhow!("eframe run failed: {e}"))?;
+
     Ok(())
 }

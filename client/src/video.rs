@@ -1,33 +1,22 @@
-use anyhow::{Error, Result};
+use anyhow::{Context, Result};
+use common::VideoMode;
+use egui::ColorImage;
 use gstreamer::Registry;
 use gstreamer::glib::object::{Cast, ObjectExt};
 use gstreamer::prelude::*;
-use gstreamer::{self as gst, element_error};
+use gstreamer::{self as gst};
 use gstreamer_app as gst_app;
+use gstreamer_video as gst_video;
+use gstreamer_video::prelude::*;
 use parking_lot::Mutex;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::net::UdpSocket;
 use tokio::time::Instant;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use derive_more::derive::{Display, Error};
-
-#[derive(Debug, Display, Error)]
-#[display("Received error from {src}: {error} (debug: {debug:?})")]
-struct ErrorMessage {
-    src: glib::GString,
-    error: glib::Error,
-    debug: Option<glib::GString>,
-}
-
-use crate::app::{AppState, ema_average};
-
-#[derive(Clone, Copy)]
-pub struct PacketLoss {
-    pub num_lost: u64,
-    pub num_pushed: u64,
-    pub loss_pct: f64,
-}
+use crate::app::AppState;
+use crate::stats::PacketLoss;
 
 fn choose_h264_decoder() -> &'static str {
     let registry = Registry::get();
@@ -56,74 +45,528 @@ fn choose_h264_decoder() -> &'static str {
     }
 }
 
-// for NVDEC: need 4:2:0, not 4:4:4
-pub fn build_video(sink: &gst::Element, state: Arc<AppState>) -> Result<gst::Pipeline> {
-    let pipeline = gst::Pipeline::default();
+/// Converts a `video/x-raw,format=RGBA` buffer straight into the `ColorImage`
+/// egui paints, accounting for row stride (GStreamer often pads rows wider
+/// than `width * 4` for alignment).
+///
+/// Builds the `Color32` vector in one pass rather than copying into an
+/// intermediate tightly-packed `Vec<u8>` and converting that: this runs on the
+/// pipeline's streaming thread once per frame, and at 60fps a second full-frame
+/// pass plus its 1.4MB allocation was enough to push that thread past the frame
+/// period (see the `queue` in `build_pipeline` for why that matters). Decoder
+/// output is opaque, so `from_rgb` is equivalent to `from_rgba_unmultiplied`
+/// with alpha 255 and skips the per-pixel premultiply.
+fn frame_to_color_image(buffer: &gst::BufferRef, caps: &gst::CapsRef) -> Option<ColorImage> {
+    let info = gst_video::VideoInfo::from_caps(caps).ok()?;
+    let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info).ok()?;
 
-    let port = *state.video_port.lock();
-    let src = gst::ElementFactory::make("srtsrc")
-        .property(
-            "uri",
-            format!("srt://{}:{}?mode=caller", state.server.ip(), port),
-        )
-        .property("latency", 20i32) // ms, tune per earlier discussion
-        .build()?;
+    let width = frame.width() as usize;
+    let height = frame.height() as usize;
+    let stride = frame.plane_stride()[0] as usize;
+    let data = frame.plane_data(0).ok()?;
 
-    let tsdemux = gst::ElementFactory::make("tsdemux").build()?;
-
-    let parse = gst::ElementFactory::make("h264parse").build()?;
-    parse.set_property_from_str("config-interval", "-1");
-    parse.set_property_from_str("update-timecode", "false"); // NOTE: may is wrong
-
-    let decoder = choose_h264_decoder();
-    let dec = gst::ElementFactory::make(decoder).build()?;
-    if decoder == "avdec_h264" {
-        dec.set_property_from_str("lowres", "0");
+    let mut pixels = Vec::with_capacity(width * height);
+    for y in 0..height {
+        let start = y * stride;
+        let row = data.get(start..start + width * 4)?;
+        pixels.extend(
+            row.chunks_exact(4)
+                .map(|p| egui::Color32::from_rgb(p[0], p[1], p[2])),
+        );
     }
 
-    let conv = gst::ElementFactory::make("videoconvert").build()?;
+    Some(ColorImage {
+        size: [width, height],
+        pixels,
+    })
+}
 
-    let caps_filter = gst::ElementFactory::make("capsfilter").build()?;
-    caps_filter.set_property(
-        "caps",
-        gst::Caps::builder("video/x-raw")
-            .field("format", "BGRx")
-            .build(),
-    );
+/// Averages a strided subset of an RGBA buffer's pixels into an RGB color.
+/// Used only by the latency test (see `latency_test.rs`): a solid-color
+/// frame doesn't need every pixel sampled to get an accurate average, so
+/// this stays cheap even at 720p and up.
+fn sample_average_color(buffer: &gst::BufferRef, caps: &gst::CapsRef) -> Option<[u8; 3]> {
+    const STEP: usize = 8;
 
-    pipeline.add_many([&src, &tsdemux, &parse, &dec, &conv, &caps_filter, sink])?;
-    src.link(&tsdemux)?;
-    gst::Element::link_many([&parse, &dec, &conv, &caps_filter, sink])?;
+    let info = gst_video::VideoInfo::from_caps(caps).ok()?;
+    let frame = gst_video::VideoFrameRef::from_buffer_ref_readable(buffer, &info).ok()?;
 
-    tsdemux.connect_pad_added(move |_, src_pad| {
-        let sink_pad = parse.static_pad("sink").unwrap();
-        if sink_pad.is_linked() {
-            return;
+    let width = frame.width() as usize;
+    let height = frame.height() as usize;
+    let stride = frame.plane_stride()[0] as usize;
+    let data = frame.plane_data(0).ok()?;
+
+    let (mut r_sum, mut g_sum, mut b_sum, mut n) = (0u64, 0u64, 0u64, 0u64);
+    let mut y = 0;
+    while y < height {
+        let Some(row) = data.get(y * stride..) else {
+            break;
+        };
+        let mut x = 0;
+        while x * 4 + 2 < row.len() && x < width {
+            let px = x * 4;
+            r_sum += row[px] as u64;
+            g_sum += row[px + 1] as u64;
+            b_sum += row[px + 2] as u64;
+            n += 1;
+            x += STEP;
         }
-        if let Err(e) = src_pad.link(&sink_pad) {
-            eprintln!("[GST] failed to link tsdemux pad: {e:?}");
+        y += STEP;
+    }
+
+    (n > 0).then_some([(r_sum / n) as u8, (g_sum / n) as u8, (b_sum / n) as u8])
+}
+
+/// How the client receives and decodes video for a given `VideoMode`. Only
+/// one mode is implemented today (`RawRtpUdp`, below); a future mode (e.g.
+/// WebRTC) is a new impl of this trait, not a rewrite of `ui.rs`/`app.rs`'s
+/// call sites.
+pub trait VideoReceiver {
+    /// Builds the pipeline and starts it decoding into `state.latest_frame`
+    /// (picked up by `ui.rs`'s `update()` loop each repaint). Called once at
+    /// app creation -- before the server (and so the negotiated `VideoMode`)
+    /// is known, with a single mode implemented there's nothing to select
+    /// yet, but this is the seam a mode-aware choice would hook into.
+    fn build_pipeline(state: Arc<AppState>) -> Result<(gst::Pipeline, gst_app::AppSrc)>;
+
+    /// Receives video over the network per `mode` and pushes it into
+    /// `state.appsrc`. Runs until a fatal setup error occurs; per-packet
+    /// errors are logged and skipped, not propagated.
+    async fn run(state: Arc<AppState>, mode: VideoMode) -> Result<()>;
+}
+
+/// Payload type carrying `rtpulpfecenc`/`rtpulpfecdec` FEC packets, distinct
+/// from the video payload (96, set by `rtph264pay` in streamer.cpp) so both
+/// can share one RTP flow/SSRC. Must match the `pt` the streamer's
+/// `rtpulpfecenc` is configured with.
+const FEC_PT: u32 = 122;
+
+/// Fixed SSRC configured on the streamer's rtph264pay. Using a fixed value
+/// lets us set the correct SSRC in caps before receiving any packets, which
+/// is required for rtpulpfecdec to work correctly.
+const VIDEO_SSRC: u32 = 0x12345678;
+
+/// Raw RTP packets read straight off a UDP socket into an `appsrc`, decoded
+/// by a `rtpstorage` -> `rtpjitterbuffer` -> `rtpulpfecdec` -> depay -> parse
+/// -> decode -> convert chain, and handed to an `appsink` that copies each
+/// frame into `state.latest_frame` for `ui.rs` to paint. This is
+/// `VideoMode::RawRtpUdp`'s client-side implementation.
+pub struct RawRtpUdp;
+
+impl VideoReceiver for RawRtpUdp {
+    // for NVDEC: need 4:2:0, not 4:4:4
+    fn build_pipeline(state: Arc<AppState>) -> Result<(gst::Pipeline, gst_app::AppSrc)> {
+        // No `payload` field: FEC packets (see rtpulpfecenc/dec below) share
+        // this flow with a different payload type (122) than the video
+        // payload (96). The actual per-packet PT lives in the RTP header and
+        // is read from there by rtpjitterbuffer/rtpulpfecdec regardless of
+        // what caps say; pinning `payload` here would just be a stale/wrong
+        // hint for the FEC packets.
+        //
+        // Fixed SSRC matching the streamer's rtph264pay configuration. This
+        // lets rtpulpfecdec correctly match FEC packets with media packets.
+        // Without the correct SSRC, FEC recovery silently fails.
+        let caps = gst::Caps::builder("application/x-rtp")
+            .field("media", "video")
+            .field("encoding-name", "H264")
+            .field("clock-rate", 90000i32)
+            .field("ssrc", VIDEO_SSRC)
+            .build();
+
+        let pipeline = gst::Pipeline::default();
+        let src = gst::ElementFactory::make("appsrc").name("source").build()?;
+        src.set_property("caps", &caps);
+        src.set_property("is-live", true);
+        src.set_property("format", gst::Format::Time);
+        // Bound the internal queue and drop the *oldest* packets on overflow
+        // ("downstream" leak direction). 256 packets is generous enough to
+        // never bite in normal operation, small enough that a stalled decoder
+        // can't accumulate seconds of stale video. Late/missing packets past
+        // the jitterbuffer deadline are dropped there anyway.
+        src.set_property("max-buffers", 256u64);
+        src.set_property("max-bytes", 0u64);
+        src.set_property_from_str("leaky-type", "downstream");
+        // Required: rtpjitterbuffer uses buffer PTS as packet *arrival* time
+        // for skew/jitter estimation (media timing comes from the RTP header
+        // timestamps, not from PTS). Cost: tokio scheduling delay between
+        // kernel receipt and recv_from() return is indistinguishable from
+        // network jitter. Accepted -- the fix, if avg-jitter ever shows it
+        // matters, is kernel receive timestamps (SO_TIMESTAMPNS) mapped onto
+        // the pipeline clock, not removing do-timestamp.
+        src.set_property("do-timestamp", true);
+
+        // Keeps a rolling window of raw RTP packets (media + FEC) so
+        // `rtpulpfecdec` below can reach back and recover a lost one. Must sit
+        // upstream of the jitterbuffer (element doc requirement). 350ms is
+        // comfortably more than 3x the jitterbuffer's own 100ms latency, so the
+        // packets needed for a recovery are still in the window by the time
+        // the jitterbuffer's lost-event fires at its playout deadline.
+        let storage = gst::ElementFactory::make("rtpstorage").build()?;
+        storage.set_property("size-time", 250_000_000u64);
+
+        let jitter = gst::ElementFactory::make("rtpjitterbuffer").build()?;
+        // 100ms latency buffer: tolerates network jitter during high-motion
+        // scenes where frames are large and packets may arrive out of order.
+        // Lower values cause late-packet drops that break decoding.
+        jitter.set_property("latency", 50u32);
+        jitter.set_property("drop-on-latency", true);
+        jitter.set_property("do-lost", true);
+        // No RTX: there is no feedback session, so a retransmission request can
+        // never be answered, and the RTX timers only add up to rtx-retry-period
+        // of gap-hold delay on every loss. With do-lost=true the jitterbuffer
+        // still fires its lost timer at the playout deadline (latency-bound),
+        // which is what emits GstRTPPacketLost -- used below by the FEC decoder
+        // and the keyframe-recovery probe. Real loss accounting for the
+        // adaptive bitrate/FEC loop doesn't depend on this at all -- see the
+        // RTP sequence-number tracking in `run()`.
+        jitter.set_property("do-retransmission", false);
+
+        // Attempts to recover a lost packet from `storage` the moment the
+        // jitterbuffer's lost event reaches it; on success it injects the
+        // reconstructed packet and swallows the event before it reaches the
+        // keyframe-recovery probe below, on failure it forwards the event
+        // unchanged. `storage` takes the internal storage *object*, not the
+        // `rtpstorage` element itself.
+        let fecdec = gst::ElementFactory::make("rtpulpfecdec").build()?;
+        fecdec.set_property("pt", FEC_PT);
+        let internal_storage = storage.property::<gstreamer::glib::Object>("internal-storage");
+        fecdec.set_property("storage", &internal_storage);
+
+        // rtpulpfecdec passes ALL packets through (including FEC packets) -
+        // it only uses FEC packets for recovery but doesn't filter them out.
+        // Drop FEC packets here before they reach rtph264depay which can't
+        // handle them (causes "Undefined packet type" warnings).
+        fecdec.static_pad("src").unwrap().add_probe(
+            gst::PadProbeType::BUFFER,
+            move |_, probe_info| {
+                if let Some(buffer) = probe_info.buffer() {
+                    // RTP payload type is in byte 1, lower 7 bits
+                    if let Ok(map) = buffer.map_readable() {
+                        if map.len() >= 2 {
+                            let pt = map[1] & 0x7F;
+                            if pt == FEC_PT as u8 {
+                                return gst::PadProbeReturn::Drop;
+                            }
+                        }
+                    }
+                }
+                gst::PadProbeReturn::Ok
+            },
+        );
+
+        let depay = gst::ElementFactory::make("rtph264depay").build()?;
+
+        let parse = gst::ElementFactory::make("h264parse").build()?;
+        parse.set_property_from_str("config-interval", "-1");
+        parse.set_property_from_str("update-timecode", "false");
+
+        // Thread boundary. Without this every element below runs on the
+        // jitterbuffer's own push task, so the hardware-memory download in
+        // `conv` and the per-frame image build in the appsink callback all
+        // execute on the one thread that also has to drain the jitterbuffer on
+        // schedule. At 30fps that fits in the 33ms frame period; at 60fps it
+        // does not, and because `drop-on-latency` is set the jitterbuffer's
+        // response to its own thread being busy is to *discard packets* --
+        // producing corrupt AUs and motion artifacts while `windowed_loss_pct`
+        // (measured on the wire, in `run()`) still reads 0%.
+        //
+        // Not leaky: dropping an encoded AU here would break the P-frame
+        // reference chain exactly like the packet loss this is meant to
+        // prevent, and it wouldn't be visible to the keyframe-recovery probe
+        // either. A consumer that falls behind should cost bounded latency,
+        // which is observable, rather than silent corruption.
+        let queue = gst::ElementFactory::make("queue").build()?;
+        queue.set_property("max-size-buffers", 8u32);
+        queue.set_property("max-size-bytes", 0u32);
+        queue.set_property("max-size-time", 0u64);
+
+        let decoder = choose_h264_decoder();
+        *state.stats.decoder_name.lock() = decoder;
+        let dec = gst::ElementFactory::make(decoder).build()?;
+        if decoder == "avdec_h264" {
+            dec.set_property_from_str("lowres", "0");
         }
-    });
 
-    let entry_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
-    let entry_clone = entry_time.clone();
-    dec.static_pad("sink")
-        .unwrap()
-        .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-            *entry_clone.lock() = Some(Instant::now());
-            gst::PadProbeReturn::Ok
-        });
+        let conv = gst::ElementFactory::make("videoconvert").build()?;
+        // Defaults to 1. This element does the decoder-memory download and the
+        // conversion to RGBA; single-threaded it is the widest step on the
+        // frame path at 60fps.
+        conv.set_property("n-threads", 4u32);
 
-    let state_clone2 = state.clone();
-    dec.static_pad("src")
-        .unwrap()
-        .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
-            if let Some(t) = *entry_time.lock() {
-                let mut decode_latency = state_clone2.decode_latency.lock();
-                *decode_latency = ema_average(*decode_latency, t.elapsed().as_secs_f64() * 1000f64);
+        let caps_filter = gst::ElementFactory::make("capsfilter").build()?;
+        caps_filter.set_property(
+            "caps",
+            gst::Caps::builder("video/x-raw")
+                .field("format", "RGBA")
+                .build(),
+        );
+
+        let appsink_elem = gst::ElementFactory::make("appsink").build()?;
+        appsink_elem.set_property("sync", false);
+        // Live display: always show the newest frame, drop anything older
+        // that piles up rather than presenting stale video.
+        appsink_elem.set_property("max-buffers", 1u32);
+        appsink_elem.set_property("drop", true);
+
+        pipeline.add_many([
+            &src,
+            &storage,
+            &jitter,
+            &fecdec,
+            &depay,
+            &parse,
+            &queue,
+            &dec,
+            &conv,
+            &caps_filter,
+            &appsink_elem,
+        ])?;
+
+        gst::Element::link_many([
+            &src,
+            &storage,
+            &jitter,
+            &fecdec,
+            &depay,
+            &parse,
+            &queue,
+            &dec,
+            &conv,
+            &caps_filter,
+            &appsink_elem,
+        ])?;
+
+        let entry_time: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
+        let entry_clone = entry_time.clone();
+        dec.static_pad("sink")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                *entry_clone.lock() = Some(Instant::now());
+                gst::PadProbeReturn::Ok
+            });
+
+        let state_clone2 = state.clone();
+        dec.static_pad("src")
+            .unwrap()
+            .add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+                if let Some(t) = *entry_time.lock() {
+                    state_clone2
+                        .stats
+                        .note_decode_latency(t.elapsed().as_secs_f64() * 1000f64);
+                }
+                state_clone2.stats.note_frame();
+                gst::PadProbeReturn::Ok
+            });
+
+        // Placed on `fecdec`'s src pad, not `jitter`'s: a lost event that FEC
+        // recovered is swallowed by `fecdec` and never reaches this point, so
+        // an IDR is only requested for loss FEC couldn't fix. Left on the
+        // jitterbuffer's pad, every recovered packet would still cost an IDR
+        // burst and FEC would buy nothing on the uplink.
+        let srcpad = fecdec.static_pad("src").unwrap();
+        let state_clone3 = state.clone();
+        srcpad.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_pad, info| {
+            if let Some(gst::PadProbeData::Event(ev)) = &info.data
+                // Only the jitterbuffer's own loss notification, not any
+                // custom event that happens to pass this pad. A lost packet
+                // breaks the P-frame chain: everything after it decodes
+                // against a reference the encoder and decoder no longer agree
+                // on. Only an IDR resets that.
+                && ev.type_() == gst::EventType::CustomDownstream
+                && ev.structure().is_some_and(|s| s.name() == "GstRTPPacketLost")
+            {
+                state_clone3.request_keyframe();
             }
             gst::PadProbeReturn::Ok
         });
 
-    Ok(pipeline)
+        // Feeds the camera-on-screen latency test (see `latency_test.rs`).
+        // Sampled after `caps_filter` rather than off the decoder directly,
+        // since that's the one point in the pipeline where the format is
+        // guaranteed `RGBA` instead of whatever the decoder happened to
+        // negotiate. Bails out before touching the buffer at all when the
+        // test isn't running, so this costs nothing during normal driving.
+        let state_clone4 = state.clone();
+        caps_filter.static_pad("src").unwrap().add_probe(
+            gst::PadProbeType::BUFFER,
+            move |pad, probe_info| {
+                if !state_clone4.latency_test.is_enabled() {
+                    return gst::PadProbeReturn::Ok;
+                }
+
+                if let Some(rgb) = probe_info
+                    .buffer()
+                    .zip(pad.current_caps())
+                    .and_then(|(buffer, caps)| sample_average_color(buffer, &caps))
+                    && let Some(rtt_ms) = state_clone4.latency_test.observe_frame_color(rgb)
+                {
+                    state_clone4.stats.note_measured_glass_to_glass(rtt_ms);
+                }
+
+                gst::PadProbeReturn::Ok
+            },
+        );
+
+        let jitter_clone = jitter.clone();
+        let state_clone = state.clone();
+        tokio::spawn(async move {
+            // Polled fast because this drives keyframe recovery, not just the
+            // stats overlay: every tick spent here is time the picture stays
+            // broken after a loss.
+            loop {
+                tokio::time::sleep(Duration::from_millis(250)).await;
+
+                // Also drives the fps/received-bitrate rate counters and the
+                // windowed loss ratio: each only actually recomputes once its
+                // own window has elapsed, so polling them here more often than
+                // that is free.
+                state_clone.stats.tick_rates();
+                state_clone.stats.tick_loss_window(Duration::from_secs(2));
+
+                let jitter_stats = jitter_clone.property::<gst::Structure>("stats");
+                // num-lost/loss_pct below are cumulative jitterbuffer stats,
+                // shown in the overlay for reference only -- see
+                // `Stats::windowed_loss_pct` for the ratio the adaptive
+                // bitrate/FEC loop actually acts on.
+                // num-late: packets that did arrive, just after the
+                // jitterbuffer's playout deadline, so they were dropped anyway
+                // -- a different failure mode (buffer too tight vs. real loss).
+                let num_lost = jitter_stats.get::<u64>("num-lost").unwrap_or(0);
+                let num_late = jitter_stats.get::<u64>("num-late").unwrap_or(0);
+                let num_pushed = jitter_stats.get::<u64>("num-pushed").unwrap_or(0);
+                let num_duplicates = jitter_stats.get::<u64>("num-duplicates").unwrap_or(0);
+                let avg_jitter = jitter_stats.get::<u64>("avg-jitter").unwrap_or(0);
+                let loss_pct = if num_pushed > 0 {
+                    num_lost as f64 / (num_lost + num_pushed) as f64 * 100.0
+                } else {
+                    0.0
+                };
+
+                *state_clone.stats.loss.lock() = PacketLoss {
+                    num_lost,
+                    num_late,
+                    num_pushed,
+                    num_duplicates,
+                    avg_jitter,
+                    loss_pct,
+                };
+            }
+        });
+
+        let appsink = appsink_elem
+            .dynamic_cast::<gst_app::AppSink>()
+            .map_err(|_| anyhow::anyhow!("dynamic cast of appsink failed"))?;
+
+        let state_video = state.clone();
+        appsink.set_callbacks(
+            gst_app::AppSinkCallbacks::builder()
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gst::FlowError::Eos)?;
+                    let buffer = sample.buffer().ok_or(gst::FlowError::Error)?;
+                    let caps = sample.caps().ok_or(gst::FlowError::Error)?;
+
+                    if let Some(image) = frame_to_color_image(buffer, caps) {
+                        *state_video.latest_frame.lock() = Some(image);
+                        if let Some(ctx) = state_video.egui_ctx.get() {
+                            ctx.request_repaint();
+                        }
+                    }
+
+                    Ok(gst::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+
+        match src.dynamic_cast::<gst_app::AppSrc>() {
+            Ok(appsrc_casted) => Ok((pipeline, appsrc_casted)),
+            Err(_) => anyhow::bail!("Dynamic cast of appsrc failed"),
+        }
+    }
+
+    async fn run(state: Arc<AppState>, mode: VideoMode) -> Result<()> {
+        let VideoMode::RawRtpUdp { video_port: port } = mode;
+
+        let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        let subscribe_addr = format!("{}:{port}", state.server.ip());
+        debug!("Send to {subscribe_addr}");
+        socket.send_to(&[1], &subscribe_addr).await?;
+
+        // Re-sent periodically rather than once: the server's pipesocket
+        // only remembers our address for as long as it keeps receiving
+        // packets, and NAT rebinding on our end can silently invalidate the
+        // mapping it learned. Without this a stale subscription would go
+        // unnoticed until the app is restarted.
+        let mut resubscribe = tokio::time::interval(Duration::from_secs(2));
+        resubscribe.tick().await; // first tick fires immediately; we already subscribed above
+
+        // Raw-wire RTP sequence number tracking, independent of
+        // `rtpjitterbuffer`'s own stats (see `Stats::note_seq`/
+        // `windowed_loss_pct`). Counts gaps across the combined media+FEC
+        // flow -- FEC packets share the same per-SSRC sequence-number space
+        // as media (RFC 5109), so this is the same loss the jitterbuffer
+        // itself would observe, just measured before any pipeline element
+        // gets a chance to recover or reorder it.
+        let mut last_seq: Option<u16> = None;
+
+        let mut buffer = [0u8; 1 << 18];
+        loop {
+            tokio::select! {
+                _ = resubscribe.tick() => {
+                    if let Err(e) = socket.send_to(&[1], &subscribe_addr).await {
+                        warn!(error = ?e, "video resubscribe failed");
+                    }
+                }
+                result = socket.recv_from(&mut buffer) => {
+                    let (size, _) = match result {
+                        Ok(v) => v,
+                        Err(e) => {
+                            warn!(error = ?e, "video recv failed, dropping packet");
+                            continue;
+                        }
+                    };
+                    state.stats.note_bytes(size);
+
+                    if size >= 4 {
+                        let seq = u16::from_be_bytes([buffer[2], buffer[3]]);
+                        if let Some(prev) = last_seq {
+                            let diff = seq.wrapping_sub(prev);
+                            // diff == 0: duplicate, not a fresh arrival.
+                            // diff < 0x8000: forward progress; diff-1 sequence
+                            // numbers in between never arrived.
+                            // diff >= 0x8000: seq is behind prev (a reordered
+                            // or late packet) -- its gap, if any, was already
+                            // counted when the higher sequence number came in.
+                            if diff != 0 && diff < 0x8000 {
+                                state.stats.note_seq((diff - 1) as u64, diff as u64);
+                            }
+                        }
+                        last_seq = Some(seq);
+                    }
+
+                    let pushed = (|| -> Result<()> {
+                        let mut gst_buffer = gst::Buffer::with_size(size)
+                            .context("failed to allocate gst buffer")?;
+                        gst_buffer
+                            .get_mut()
+                            .context("gst buffer unexpectedly shared")?
+                            .copy_from_slice(0, &buffer[..size])
+                            .map_err(|_| anyhow::anyhow!("buffer too small for received packet"))?;
+
+                        if let Some(appsrc) = state.appsrc.lock().as_mut() {
+                            appsrc.push_buffer(gst_buffer)?;
+                        }
+                        Ok(())
+                    })();
+
+                    // A single corrupted/oversized packet or a transient
+                    // pipeline hiccup must not kill the receive loop -- that
+                    // would mean permanent video loss for the rest of the
+                    // session (see docs/latency-optimization.md).
+                    if let Err(e) = pushed {
+                        warn!(error = ?e, "dropping video packet");
+                    }
+                }
+            }
+        }
+    }
 }

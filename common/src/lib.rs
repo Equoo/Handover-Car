@@ -4,6 +4,7 @@ use crossbeam_channel::{Receiver, Sender};
 use anyhow::{Context, Result};
 
 pub mod asyncqueue;
+pub mod link;
 
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
 #[rkyv(compare(PartialEq), derive(Debug))]
@@ -12,57 +13,134 @@ pub enum CommonError {
     SlaveNotFound
 }
 
+/// Steering/throttle or a keyframe request. The server never inspects this,
+/// only forwards it verbatim from the driver's client to the car -- so it's
+/// shared by both `ClientMessage` (what the server receives) and
+/// `ServerToSlave` (what the server re-sends).
 #[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
 #[rkyv(compare(PartialEq), derive(Debug))]
-pub enum Message {
-    ServerSlaveConnected {
-        video_port: u16,
-        audio_port: u16,
+pub enum PilotCommand {
+    Input {
+        throttle: i16,
+        steering: i16,
     },
-    ServerClientConnected {
-        uuid: String,
-        video_port: u16,
-        audio_port: u16
-    },
-    ServerError {
-        err: CommonError,
-    },
-    ServerPong {
-        packet_id: u16,
-        bitrate: u32
-    },
-    ServerClientPong {
-        latency: u16,
-        packet_id: u16,
-    },
-    SlaveAnnounce {
+    /// Ask the slave's encoder for an IDR. With a long GOP nothing else
+    /// produces one, so a receiver that has lost sync stays corrupted until
+    /// this arrives -- hence its own variant rather than folded into the
+    /// periodic input message.
+    KeyframeRequest,
+}
+
+/// How video gets from a car to a client, negotiated through the connect
+/// handshake rather than assumed by each binary independently. Only one mode
+/// is implemented today; this is the seam a second one (e.g. WebRTC) would
+/// plug into without touching the handshake shape again.
+#[derive(Archive, Deserialize, Serialize, Debug, PartialEq, Clone, Copy)]
+#[rkyv(compare(PartialEq), derive(Debug))]
+pub enum VideoMode {
+    /// Raw RTP packets sent directly to the server's per-slave relay port,
+    /// which blindly forwards them to whichever client last subscribed.
+    RawRtpUdp { video_port: u16 },
+}
+
+/// Sent by a car (slave) to the server.
+#[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
+#[rkyv(compare(PartialEq), derive(Debug))]
+pub enum SlaveMessage {
+    Announce {
         id: String,
         latency: u16,
         packet_id: u16,
     },
-    SlaveError {
+    Error {
         id: String,
         err: String,
     },
-    SlaveLocation {
+    Location {
         id: String,
         latitude: f32,
         altitude: f32,
     },
-    MasterSubscribe {
+    /// Encoder-side pipeline stats parsed from the streamer's own stdout
+    /// (capture/encode timings + the bitrate it's actually applying).
+    Stats {
+        id: String,
+        capture_latency_ms: f32,
+        encode_latency_ms: f32,
+        total_latency_ms: f32,
+        bitrate_bps: u32,
+    },
+}
+
+/// Sent by a driver's client to the server.
+#[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
+#[rkyv(compare(PartialEq), derive(Debug))]
+pub enum ClientMessage {
+    Subscribe {
         slave_id: String,
     },
-    MasterInput {
-        slave_id: String,
-        throttle: i16,
-        steering: i16,
-    },
-    MasterAnnounce {
+    Announce {
         uuid: String,
         packet_id: u16,
-        bitrate: u32
+        bitrate: u32,
+        /// FEC overhead percentage the client's adaptive loop is currently
+        /// commanding (0-50). Relayed to the slave the same way `bitrate` is:
+        /// stored server-side and echoed back in `ServerToSlave::Pong`.
+        fec_pct: u8,
     },
-    Disconnect {}
+    Pilot {
+        slave_id: String,
+        cmd: PilotCommand,
+    },
+}
+
+/// Sent by the server to a car (slave).
+#[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
+#[rkyv(compare(PartialEq), derive(Debug))]
+pub enum ServerToSlave {
+    Connected {
+        video: VideoMode,
+        audio_port: u16,
+    },
+    Error {
+        err: CommonError,
+    },
+    Pong {
+        packet_id: u16,
+        bitrate: u32,
+        fec_pct: u8,
+    },
+    Pilot(PilotCommand),
+}
+
+/// Sent by the server to a driver's client.
+#[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
+#[rkyv(compare(PartialEq), derive(Debug))]
+pub enum ServerToClient {
+    Connected {
+        uuid: String,
+        video: VideoMode,
+        audio_port: u16,
+    },
+    Pong {
+        latency: u16,
+        packet_id: u16,
+    },
+    SlaveStats {
+        capture_latency_ms: f32,
+        encode_latency_ms: f32,
+        total_latency_ms: f32,
+        bitrate_bps: u32,
+    },
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug, PartialEq)]
+#[rkyv(compare(PartialEq), derive(Debug))]
+pub enum Message {
+    Slave(SlaveMessage),
+    Client(ClientMessage),
+    ToSlave(ServerToSlave),
+    ToClient(ServerToClient),
 }
 
 pub type Packet = laminar::Packet;
