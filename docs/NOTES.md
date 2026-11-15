@@ -1,0 +1,157 @@
+Dietpi conf:
+DEBIAN 13 Trixie
+--Downcloacking: power saving mode (v -2)--
+--cpu-governor: cpu save--
+safe overcloak
+
+Network:
+use setup_network
+
+SSH:
+`sudo nano /etc/ssh/sshd_config`
+
+```
+GatewayPorts clientspecified
+```
+
+setup ssh key
+add reverse-ssh.service
+
+Camera driver:
+Doc:
+<https://spotpear.com/index.php/index/study/detail/id/754.html>
+
+For rpicam needed default imx462
+
+The control scripts needed GPIO CONNECTION and 32bit libs:
+sudo dpkg --add-architecture armhf
+sudo apt update
+sudo apt install libc6:armhf libstdc++6:armhf
+
+PWM SIGNALS:
+throtle:  993 (backward) - 1486 1487 1492 - 1986 (forward) in pulses
+direction:   1087 - 1480 - 1880
+
+sudo apt install -y modemmanager network-manager usb-modeswitch
+
+remove ifupdown conf in /etc/network/interfaces
+
+echo -e "AT\r" | sudo tee /dev/ttyUSB2
+echo -e "AT+QCFG="usbnet",2\r" | sudo tee /dev/ttyUSB2
+echo -e "AT+CFUN=1,1\r" | sudo tee /dev/ttyUSB2
+
+sudo systemctl enable --now ModemManager
+mmcli -L
+
+-> For checking state
+
+## mmcli -m 0
+
+## journalctl -u ModemManager -f
+
+sudo nmcli connection add type gsm ifname "*" con-name "4g-rm500u" apn "sl2sfr"
+sudo nmcli connection modify 4g-rm500u connection.autoconnect yes
+sudo nmcli connection up 4g-rm500u
+
+if authentication
+sudo nmcli connection modify 4g-rm500u gsm.username "user" gsm.password "pass"
+
+nmcli connection show 4g-rm500u
+
+mmcli -m 0 --signal-setup=5
+mmcli -m 0 --signal-get
+mmcli -m 0 --location-get
+
+1. Bufferbloat (cake/fq_codel) sur wwan0
+
+Comme discuté, important vu ton adaptive bitrate :
+
+bash
+sudo tc qdisc replace dev wwan0 root cake bandwidth 5mbit rtt 100ms
+
+Ajuste bandwidth à ta bitrate cible réelle (un peu en dessous de ton max théorique 4G pour laisser de la marge), et rtt selon ta latence mesurée typique.
+
+## mosh for better ssh stability
+
+<https://mosh.org/>
+
+GCC (Google Congestion Control) : l’algorithme de WebRTC, la référence pour la vidéo temps réel.
+SCReAM : un algorithme conçu par Ericsson pour la vidéo sur réseau mobile, très proche de ton cas.
+Bandwidth estimation (BWE) : l’étape qui estime le débit disponible avant de régler l’encodeur.
+
+## Pi setup notes
+
+These are our own notes from setting up the Pi. They're rough, but they're what we actually follow.
+
+**OS.** DietPi on Debian 13 (Trixie), "safe" overclock. Flash the card, then `os/setup.sh` copies the boot config and services onto it.
+
+**SSH.** In `/etc/ssh/sshd_config`:
+
+```
+GatewayPorts clientspecified
+```
+
+Set up an SSH key and add `reverse-ssh.service`. [mosh](https://mosh.org/) makes the remote session a lot more stable.
+
+**Camera.** Driver doc: <https://spotpear.com/index.php/index/study/detail/id/754.html>. rpicam needs the default imx462.
+
+**32-bit libs** (the control scripts needed them):
+
+```sh
+sudo dpkg --add-architecture armhf
+sudo apt update
+sudo apt install libc6:armhf libstdc++6:armhf
+```
+
+**PWM values**, in microseconds:
+
+```
+throttle:  993 (backward) - 1486 1487 1492 (neutral) - 1986 (forward)
+steering:  1087 - 1480 - 1880
+```
+
+**Modem.**
+
+```sh
+sudo apt install -y modemmanager network-manager usb-modeswitch
+```
+
+Remove the ifupdown conf in `/etc/network/interfaces`, then:
+
+```sh
+echo -e "AT\r" | sudo tee /dev/ttyUSB2
+echo -e "AT+QCFG="usbnet",2\r" | sudo tee /dev/ttyUSB2
+echo -e "AT+CFUN=1,1\r" | sudo tee /dev/ttyUSB2
+
+sudo systemctl enable --now ModemManager
+mmcli -L
+```
+
+To check its state: `mmcli -m 0` and `journalctl -u ModemManager -f`.
+
+```sh
+sudo nmcli connection add type gsm ifname "*" con-name "4g-rm500u" apn "sl2sfr"
+sudo nmcli connection modify 4g-rm500u connection.autoconnect yes
+sudo nmcli connection up 4g-rm500u
+
+# if the operator wants authentication
+sudo nmcli connection modify 4g-rm500u gsm.username "user" gsm.password "pass"
+
+nmcli connection show 4g-rm500u
+```
+
+Signal and location:
+
+```sh
+mmcli -m 0 --signal-setup=5
+mmcli -m 0 --signal-get
+mmcli -m 0 --location-get
+```
+
+**Bufferbloat.** Worth doing since the bitrate adapts:
+
+```sh
+sudo tc qdisc replace dev wwan0 root cake bandwidth 5mbit rtt 100ms
+```
+
+Set `bandwidth` a bit under what the uplink can really do, and `rtt` to the latency you usually measure.
