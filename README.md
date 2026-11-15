@@ -40,7 +40,7 @@ On the mobile network, nobody from outside can reach the car. It’s like a hote
 
 That works, but every picture and every turn of the wheel then takes a detour, which added 15 to 30 ms each way for us. So once the two sides have met at the server, they also look for a direct road to each other (local addresses, IPv6, or a hole punched through the NAT). As soon as one answers, they switch to it. The server path stays ready the whole time, so when the direct one drops, for example when the car moves from one phone mast to another, the video doesn't even restart.
 
-Video, sound and controls all share a single UDP socket on each side, so one working path carries everything. The details are in [docs/network-paths.md](docs/network-paths.md).
+Video, sound and controls all share a single UDP socket on each side, so one working path carries everything.
 
 ### What's in the repo
 
