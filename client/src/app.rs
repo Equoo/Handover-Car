@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2026 David Derny
+// SPDX-FileCopyrightText: 2026 Handover contributors (see AUTHORS)
+//
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 use anyhow::{Context, Result};
 use common::link::PingTracker;
 use common::transport::{Role, Transport, TransportConfig, channel};

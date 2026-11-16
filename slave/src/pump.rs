@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2026 David Derny
+// SPDX-FileCopyrightText: 2026 Handover contributors (see AUTHORS)
+//
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 //! Loopback intake for the two local RTP producers -- the camera streamer
 //! subprocess and the audio `gst-launch` -- feeding whatever path the
 //! transport currently has selected.

@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2026 David Derny
+// SPDX-FileCopyrightText: 2026 Handover contributors (see AUTHORS)
+//
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 //! End-to-end exercise of the data plane against a stand-in relay.
 //!
 //! Two transports, one relay, no camera and no server: enough to prove the

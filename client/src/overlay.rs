@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2026 David Derny
+// SPDX-FileCopyrightText: 2026 Handover contributors (see AUTHORS)
+//
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 //! The on-screen stats panel, help panel, and camera-on-screen latency-test
 //! flash layer, all drawn as part of `ui.rs`'s `update()` loop rather than as
 //! a separate widget tree (egui is immediate-mode: there's nothing to build

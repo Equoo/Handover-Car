@@ -1,3 +1,8 @@
+# SPDX-FileCopyrightText: 2026 David Derny
+# SPDX-FileCopyrightText: 2026 Handover contributors (see AUTHORS)
+#
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 cmake_minimum_required(VERSION 3.16)
 project(streamer CXX)
 

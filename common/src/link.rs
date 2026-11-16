@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2026 David Derny
+// SPDX-FileCopyrightText: 2026 Handover contributors (see AUTHORS)
+//
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 //! Shared plumbing for the "announce" pattern used by both the slave and the
 //! client: send a small ping-carrying message to the server at a fixed
 //! cadence, then match the matching pong back up to measure round-trip

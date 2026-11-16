@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2026 David Derny
+// SPDX-FileCopyrightText: 2026 Handover contributors (see AUTHORS)
+//
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 //! All the numbers the UI can show, gathered in one place so `app.rs` and
 //! `video.rs` stay focused on networking/pipeline logic instead of also
 //! being the place where "what does the overlay display" lives.

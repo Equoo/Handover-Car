@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2026 David Derny
+// SPDX-FileCopyrightText: 2026 Handover contributors (see AUTHORS)
+//
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 //! A best-effort "glass-to-glass" latency measurement: flash the screen
 //! through a fixed color palette and detect those same colors coming back
 //! through the fully decoded video once the car's camera is pointed at this

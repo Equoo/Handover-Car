@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2026 David Derny
+// SPDX-FileCopyrightText: 2026 Handover contributors (see AUTHORS)
+//
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 use std::io::{BufRead, BufReader, Error, ErrorKind, Result};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;

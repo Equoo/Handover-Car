@@ -1,3 +1,8 @@
+// SPDX-FileCopyrightText: 2026 David Derny
+// SPDX-FileCopyrightText: 2026 Handover contributors (see AUTHORS)
+//
+// SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+
 //! Runtime path selection for the latency-critical data plane.
 //!
 //! Video, audio and pilot input all share one UDP socket per peer, tagged with
