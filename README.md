@@ -109,3 +109,6 @@ The hardest part is probably the build itself. It's a small RC car with a 3D-pri
 ## What's next
 
 The software does its job on a body that was never meant to carry it. So first, a proper build, where every part and every antenna has its place and the camera stops shaking. After that, it's time to see how far the phone network can take it.
+
+---
+*Licensed under PolyForm Noncommercial 1.0.0*
